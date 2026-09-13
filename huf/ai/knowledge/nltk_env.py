@@ -49,6 +49,12 @@ def ensure_writable_nltk_data() -> None:
 	Source indexing outright (the caller falls through to the normal
 	LlamaIndex/NLTK error handling if the underlying files turn out to be
 	unreadable for some other reason).
+
+	`_DONE` is only set once the setup has actually finished. This module is
+	imported at package import time, which can happen before a site is
+	initialised (e.g. a worker or console preloading `huf.ai`). Marking it done
+	on that failure would leave the whole process on the hardlinked files, so
+	callers that run inside a site context (the chunker) call this again.
 	"""
 	global _DONE
 	if _DONE:
@@ -60,16 +66,19 @@ def ensure_writable_nltk_data() -> None:
 		_DONE = True
 		return
 
+	if not getattr(frappe.local, "site", None):
+		# The private copy lives under the site; retry once a site is set.
+		return
+
 	try:
 		bundled_root = _find_bundled_nltk_cache()
-		if bundled_root is None:
-			return
-
-		if not _has_multiply_linked_file(bundled_root):
+		if bundled_root is None or not _has_multiply_linked_file(bundled_root):
 			# Nothing to work around in this environment.
+			_DONE = True
 			return
 
-		private_root = frappe.utils.get_site_path("private", "files", "nltk_data")
+		# Absolute: get_site_path() is relative to the sites dir (the CWD).
+		private_root = os.path.abspath(frappe.utils.get_site_path("private", "files", "nltk_data"))
 		if not _is_populated(private_root, bundled_root):
 			shutil.rmtree(private_root, ignore_errors=True)
 			shutil.copytree(bundled_root, private_root, copy_function=shutil.copy)
@@ -80,13 +89,12 @@ def ensure_writable_nltk_data() -> None:
 
 		if private_root not in nltk.data.path:
 			nltk.data.path.insert(0, private_root)
+		_DONE = True
 	except Exception:
 		frappe.log_error(
 			title="Knowledge NLTK Data Setup Error",
 			message=frappe.get_traceback(),
 		)
-	finally:
-		_DONE = True
 
 
 def _find_bundled_nltk_cache():
