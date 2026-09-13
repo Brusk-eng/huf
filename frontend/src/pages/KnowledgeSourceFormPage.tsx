@@ -49,6 +49,8 @@ import { linkKnowledgeToAgent } from '../services/agentApi';
 export { KnowledgeSourceFormPage };
 export default KnowledgeSourceFormPage;
 
+const SOURCE_STATUS_POLL_MS = 3000;
+
 function mapDocToFormValues(doc: Partial<KnowledgeSourceDoc>): KnowledgeSourceFormValues {
   return {
     source_name: doc.source_name || '',
@@ -354,7 +356,7 @@ function KnowledgeSourceFormPage() {
     setRebuilding(true);
     try {
       await rebuildIndex(id);
-      toast.success('Rebuild started. Refresh to check progress.');
+      toast.success('Rebuild started');
       await loadSource(id);
     } catch (error) {
       const msg = getFrappeErrorMessage(error);
@@ -377,11 +379,25 @@ function KnowledgeSourceFormPage() {
     }
   };
 
-  const handleSourceChanged = async () => {
-    if (id && !isNew) {
-      await loadSource(id);
+  // Refreshes status data only, so unsaved form edits are kept.
+  const refreshSourceStatus = useCallback(async () => {
+    if (!id || isNew) return;
+    try {
+      setSourceDoc(await getKnowledgeSource(id));
+    } catch (error) {
+      console.error('Error refreshing knowledge source status:', error);
     }
-  };
+  }, [id, isNew]);
+
+  const sourceInProgress = ['Pending', 'Indexing', 'Rebuilding'].includes(sourceDoc?.status ?? '');
+
+  useEffect(() => {
+    if (!sourceInProgress) return;
+    const timer = window.setInterval(() => {
+      void refreshSourceStatus();
+    }, SOURCE_STATUS_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [sourceInProgress, refreshSourceStatus]);
 
   const handleCancel = () => {
     navigate(-1);
@@ -442,7 +458,7 @@ function KnowledgeSourceFormPage() {
             open={inputsModalOpen}
             onOpenChange={setInputsModalOpen}
             knowledgeSource={id}
-            onSourceChanged={handleSourceChanged}
+            onSourceChanged={refreshSourceStatus}
           />
         )}
 

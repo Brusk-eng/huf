@@ -29,6 +29,8 @@ import {
 } from '@/services/knowledgeApi';
 import { file as frappeFile } from '@/lib/frappe-sdk';
 
+const INPUT_STATUS_POLL_MS = 3000;
+
 interface QueuedUpload {
   id: string;
   fileName: string;
@@ -100,15 +102,15 @@ export function KnowledgeInputsModal({
   const [url, setUrl] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const loadInputs = useCallback(async () => {
-    setLoading(true);
+  const loadInputs = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const data = await getKnowledgeInputs(knowledgeSource);
       setInputs(data);
     } catch {
-      toast.error('Failed to load knowledge inputs');
+      if (!silent) toast.error('Failed to load knowledge inputs');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [knowledgeSource]);
 
@@ -117,6 +119,27 @@ export function KnowledgeInputsModal({
       loadInputs();
     }
   }, [open, knowledgeSource, loadInputs]);
+
+  // Inputs are indexed in the background, so poll until none are still in progress.
+  const hasActiveInputs = inputs.some(
+    (input) => input.status === 'Pending' || input.status === 'Processing',
+  );
+  const hadActiveInputsRef = useRef(false);
+
+  useEffect(() => {
+    if (!open || !hasActiveInputs) return;
+    const timer = window.setInterval(() => {
+      void loadInputs(true);
+    }, INPUT_STATUS_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [open, hasActiveInputs, loadInputs]);
+
+  useEffect(() => {
+    if (hadActiveInputsRef.current && !hasActiveInputs) {
+      onSourceChanged();
+    }
+    hadActiveInputsRef.current = hasActiveInputs;
+  }, [hasActiveInputs, onSourceChanged]);
 
   const resetForm = () => {
     setInputType('File');
