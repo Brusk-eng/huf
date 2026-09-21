@@ -670,6 +670,18 @@ def create_meeting_recorder_app():
 	following the same get_value-check-then-insert-or-update pattern used
 	for the other install.py-seeded primitives (e.g. create_hub_orchestrator_agent).
 	Safe to call on both after_install and after_migrate.
+
+	This is also huf's own reference/example app, so it seeds alias/is_public/
+	agent/delivery to demonstrate Phase 1's public guest portal
+	(/huf/apps/meeting-recorder) and Phase 4's delivery metadata out of the
+	box, matching what apps_loader.upsert_huf_app does for third-party
+	manifests (see huf.ai.app_seeding.apps_loader.upsert_huf_app and
+	doc/features/apps/delivery-portal-vs-desk.md).
+
+	"route" stays "/huf/meetings" -- the classic SPA deep-link route -- since
+	Phase 4 deliberately kept Desk pages coexisting with the SPA rather than
+	replacing it; "delivery": "desk" only controls which surface renders
+	/huf/apps/meeting-recorder, it does not retire the SPA route.
 	"""
 	app_id = "meeting-recorder"
 	fields = {
@@ -681,11 +693,23 @@ def create_meeting_recorder_app():
 		"enabled": 1,
 		"sync_status": "Active",
 		"source_app": "huf",
+		"alias": "meeting-recorder",
+		"is_public": 1,
+		"agent": MEETING_SUMMARY_AGENT_NAME,
+		"delivery": "desk",
 	}
 
 	existing_name = frappe.db.get_value("HUF App", {"app_id": app_id}, "name")
 	if existing_name:
-		frappe.db.set_value("HUF App", existing_name, fields)
+		# Same manual-override carve-out as apps_loader.upsert_huf_app: a
+		# System Manager's hand-edit to enabled/alias/is_public/agent should
+		# survive re-sync on migrate, so updates never touch those fields.
+		update_fields = {
+			k: v
+			for k, v in fields.items()
+			if k not in ("enabled", "alias", "is_public", "agent")
+		}
+		frappe.db.set_value("HUF App", existing_name, update_fields)
 		return
 
 	doc = frappe.get_doc({"doctype": "HUF App", "app_id": app_id, **fields})
@@ -1210,13 +1234,42 @@ def remove_deprecated_gemini_audio_tools():
             except Exception as e:
                 logger.warning(f"Error removing deprecated tool {tool_name}: {e!s}")
 
+def _adapter_required_credentials(provider_id, extra_fields=None):
+	"""Build a service's required_credentials list from its gateway adapter's own
+	credential_schema, so install.py's seed can never drift from what
+	Gateway._validate_required_credentials() (and the adapter itself) actually enforce.
+
+	`extra_fields` covers credentials that are validated outside the adapter's
+	credential_schema entirely (e.g. Slack's signing_secret, which is checked by
+	Gateway._validate_slack_signing_secret()/slack_events.py, not SlackGatewayAdapter).
+	"""
+	from huf.ai.gateway_adapters.registered import get_adapter_class
+
+	adapter_cls = get_adapter_class(provider_id)
+	fields = [
+		{"key": f.key, "label": f.label, "required": f.required}
+		for f in adapter_cls.credential_schema.fields
+	]
+	fields.extend(extra_fields or [])
+	return fields
+
+
+# Credentials required outside of a gateway adapter's own credential_schema.
+# Slack's signing_secret is validated by Gateway._validate_slack_signing_secret()
+# (see huf/huf/doctype/gateway/gateway.py) and consumed by slack_events.py, not by
+# SlackGatewayAdapter itself, so it can't be discovered from credential_schema alone.
+_EXTRA_REQUIRED_CREDENTIALS = {
+	"slack": [{"key": "signing_secret", "label": "Slack Signing Secret", "required": True}],
+}
+
+
 def register_integration_services():
 	"""
 	Register built-in integration services in the Integration Service DocType.
 	These services represent external APIs that agents can interact with.
 	"""
 	import json
-	
+
 	# Define all built-in services with their required credentials
 	services = [
 		# Communication Tools
@@ -1225,7 +1278,7 @@ def register_integration_services():
 			"category": "Communication",
 			"surface": "Gateway",
 			"description": "Slack messaging and channel management",
-			"required_credentials": [{"key": "token", "label": "Slack Bot Token", "required": True}]
+			"required_credentials": _adapter_required_credentials("slack", _EXTRA_REQUIRED_CREDENTIALS["slack"])
 		},
 
 		{
@@ -1233,74 +1286,55 @@ def register_integration_services():
 			"category": "Communication",
 			"surface": "Gateway",
 			"description": "Telegram bot for messaging",
-			"required_credentials": [{"key": "token", "label": "Telegram Bot Token", "required": True}]
+			"required_credentials": _adapter_required_credentials("telegram")
 		},
 		{
 			"service_name": "whatsapp",
 			"category": "Communication",
 			"surface": "Gateway",
 			"description": "WhatsApp Business messaging via the Meta Cloud API",
-			"required_credentials": [
-				{"key": "phone_number_id", "label": "Phone Number ID", "required": True},
-				{"key": "access_token", "label": "Meta Permanent/System Access Token", "required": True},
-				{"key": "webhook_verify_token", "label": "Webhook Verify Token", "required": True},
-				{"key": "app_secret", "label": "Meta App Secret (for HMAC signature verification)", "required": False}
-			]
+			"required_credentials": _adapter_required_credentials("whatsapp")
 		},
 		{
 			"service_name": "messenger",
 			"category": "Communication",
 			"surface": "Gateway",
 			"description": "Facebook Messenger for Page messaging",
-			"required_credentials": [
-				{"key": "page_id", "label": "Facebook Page ID", "required": True},
-				{"key": "access_token", "label": "Facebook Page Access Token", "required": True},
-				{"key": "webhook_verify_token", "label": "Webhook Verify Token", "required": True},
-				{"key": "app_secret", "label": "Meta App Secret (for HMAC signature verification)", "required": False}
-			]
+			"required_credentials": _adapter_required_credentials("messenger")
 		},
 		{
 			"service_name": "instagram",
 			"category": "Communication",
 			"surface": "Gateway",
 			"description": "Instagram Direct messaging via the Meta Graph API",
-			"required_credentials": [
-				{"key": "instagram_account_id", "label": "Instagram Professional Account ID / Page ID", "required": True},
-				{"key": "access_token", "label": "Facebook / Instagram Page Access Token", "required": True},
-				{"key": "webhook_verify_token", "label": "Webhook Verify Token", "required": True},
-				{"key": "app_secret", "label": "Meta App Secret (for HMAC signature verification)", "required": False}
-			]
+			"required_credentials": _adapter_required_credentials("instagram")
 		},
 		{
 			"service_name": "email",
 			"category": "Communication",
 			"surface": "Gateway",
 			"description": "Inbound/outbound email messaging",
-			"required_credentials": [
-				{"key": "webhook_secret", "label": "Webhook Verification Secret (Optional)", "required": False},
-				{"key": "sender_email", "label": "Default Outbound Sender Email (Optional)", "required": False}
-			]
+			"required_credentials": _adapter_required_credentials("email")
 		},
 
 		{
 			"service_name": "google_chat",
 			"category": "Communication",
 			"surface": "Gateway",
-			"description": "Google Chat space messaging via incoming webhooks",
-			"required_credentials": [
-				{"key": "webhook_url", "label": "Google Chat Incoming Webhook URL (Optional)", "required": False},
-				{"key": "verification_token", "label": "Verification Token (Optional)", "required": False}
-			]
+			"description": "Google Chat space messaging via Bearer-JWT verified HTTP endpoint",
+			# GW-14: derived from GoogleChatGatewayAdapter.credential_schema
+			# (huf/ai/gateway_adapters/google_chat.py), single source of truth --
+			# `verification_token` (the retired body-token mechanism, see G1) is
+			# intentionally gone, since no current Google Chat app configuration
+			# can produce that field.
+			"required_credentials": _adapter_required_credentials("google_chat")
 		},
 		{
 			"service_name": "microsoft_teams",
 			"category": "Communication",
 			"surface": "Gateway",
 			"description": "Microsoft Teams bot for messaging",
-			"required_credentials": [
-				{"key": "app_id", "label": "Microsoft App ID", "required": True},
-				{"key": "app_password", "label": "Microsoft App Secret / Password", "required": True}
-			]
+			"required_credentials": _adapter_required_credentials("microsoft_teams")
 		},
 
 
@@ -1311,19 +1345,6 @@ def register_integration_services():
 			"surface": "Integration",
 			"description": "GitHub API for repository and issue management",
 			"required_credentials": [{"key": "access_token", "label": "GitHub Access Token", "required": True}]
-		},
-
-		# Project Management Tools
-		{
-			"service_name": "jira",
-			"category": "Project Management",
-			"surface": "Integration",
-			"description": "Jira issue tracking and project management",
-			"required_credentials": [
-				{"key": "server_url", "label": "Jira Server URL", "required": True},
-				{"key": "username", "label": "Username", "required": True},
-				{"key": "token", "label": "API Token", "required": True}
-			]
 		},
 
 		# Google Workspace Tools
