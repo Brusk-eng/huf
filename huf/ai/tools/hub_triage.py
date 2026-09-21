@@ -213,10 +213,12 @@ def discover_site_capabilities(query: str, limit: int = 8) -> dict:
 			app_resources = get_app_resources(app_name, "recommended")
 			if isinstance(app_resources, list):
 				# Filter to resources matching query tokens and check read permission
-				for resource in app_resources[:5]:  # Cap 5 per app
+				for resource in app_resources:
 					if isinstance(resource, dict):
 						doctype = resource.get("doctype_name") or resource.get("doctype")
 						if not doctype:
+							continue
+						if query_tokens and not any(t in doctype.lower() for t in query_tokens):
 							continue
 						# Check read permission
 						try:
