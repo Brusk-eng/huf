@@ -163,7 +163,7 @@ class TestFindExistingAgents(IntegrationTestCase):
 					{
 						"name": "agent_1",
 						"agent_name": "Database Agent",
-						"description": "Handles database queries",
+						"description": "Handles database query jobs",
 						"disabled": 0,
 						"is_system": 0,
 					},
