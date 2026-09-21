@@ -528,9 +528,10 @@ export function KnowledgeInputsModal({
                       </div>
                     </div>
                     <div className="flex items-center gap-1 flex-shrink-0">
-                      {input.input_type !== 'Text' && (
-                        // Use the stored file or URL resource directly for the View action.
+                      // Use the stored file or URL resource directly for the View action.
                         
+                      {input.input_type !== 'Text' && (
+
                         <Button
                           variant="ghost"
                           size="sm"
