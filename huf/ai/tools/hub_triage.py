@@ -75,14 +75,27 @@ def find_existing_agents(query: str, limit: int = 5) -> dict:
 		candidates = frappe.get_list(
 			"Agent",
 			filters={"disabled": 0, "allow_chat": 1},
-			fields=["name", "agent_name", "description", "is_system"],
-			limit_page_length=None,  # No internal limit; we'll cap at 10 below
+			fields=["name", "agent_name", "description"],
+			limit_page_length=200,
 		)
 	except Exception:
 		candidates = []
 
 	query_tokens = _tokenize_query(query)
 	scored = []
+
+	tools_by_agent = {}
+	try:
+		for row in frappe.get_all(
+			"Agent Tool",
+			filters={"parent": ["in", [c.get("name") for c in candidates]], "parenttype": "Agent"},
+			fields=["parent", "tool"],
+			parent_doctype="Agent",
+			limit_page_length=0,
+		):
+			tools_by_agent.setdefault(row["parent"], []).append(row["tool"])
+	except Exception:
+		tools_by_agent = {}
 
 	for cand in candidates:
 		# Skip "Hub Orchestrator" agent
@@ -93,15 +106,7 @@ def find_existing_agents(query: str, limit: int = 5) -> dict:
 		if not agent_name:
 			continue
 
-		# Fetch attached tools
-		try:
-			tools = frappe.get_all(
-				"Agent Tool",
-				filters={"parent": agent_name, "parenttype": "Agent"},
-				pluck="tool",
-			)
-		except Exception:
-			tools = []
+		tools = tools_by_agent.get(agent_name, [])
 
 		# Score this candidate
 		score = _score_candidate(
@@ -191,15 +196,23 @@ def discover_site_capabilities(query: str, limit: int = 8) -> dict:
 	reports = []
 	if query_tokens:
 		try:
-			# Build or_filters for each query token
-			or_filters = [[f"name", "like", f"%{token}%"] for token in query_tokens]
+			fields = ["name", "ref_doctype", "module", "report_type"]
+			phrase = " ".join(query_tokens)
 			reports = frappe.get_list(
 				"Report",
-				filters={"disabled": 0},
-				or_filters=or_filters,
-				fields=["name", "ref_doctype", "module", "report_type"],
+				filters={"disabled": 0, "name": ["like", f"%{phrase}%"]},
+				fields=fields,
 				limit_page_length=limit,
 			)
+			if not reports:
+				# Fall back to reports matching every token, then any token.
+				for join in ("and", "or"):
+					flt = [["name", "like", f"%{t}%"] for t in query_tokens]
+					kw = {"filters": [["disabled", "=", 0]] + flt} if join == "and" else {
+						"filters": {"disabled": 0}, "or_filters": flt}
+					reports = frappe.get_list("Report", fields=fields, limit_page_length=limit, **kw)
+					if reports:
+						break
 		except Exception:
 			reports = []
 

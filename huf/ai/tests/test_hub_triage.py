@@ -276,3 +276,18 @@ class TestDiscoverSiteCapabilities(IntegrationTestCase):
 			"catalogue_matches",
 		}
 		self.assertEqual(set(result.keys()), expected_keys)
+
+
+class TestFindAgentsToolScoring(IntegrationTestCase):
+	def test_matches_on_attached_tool_name(self):
+		"""An agent with no name/description hit still matches via its tools."""
+		with (
+			patch("frappe.get_roles", return_value=BUILDER_ROLES),
+			patch(
+				"frappe.get_list",
+				return_value=[{"name": "a1", "agent_name": "Finance Bot", "description": "helper"}],
+			),
+			patch("frappe.get_all", return_value=[{"parent": "a1", "tool": "erpnext_run_report"}]),
+		):
+			result = hub_triage.find_existing_agents(query="run report sales")
+		self.assertEqual(result["matches"][0]["tools"], ["erpnext_run_report"])

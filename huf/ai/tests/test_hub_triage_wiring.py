@@ -157,3 +157,26 @@ class TestHubTriageWiring(IntegrationTestCase):
 			gather_idx,
 			"TRIAGE step must appear before GATHER step"
 		)
+
+	def test_existing_agent_instructions_refreshed(self):
+		"""An already-provisioned agent with the old prompt gets the seeded one."""
+		old = "You are the Hub Orchestrator.\n1. GATHER: ask."
+		with (
+			patch("frappe.db.exists", return_value=True),
+			patch("frappe.db.get_value", return_value=old),
+			patch("frappe.db.set_value") as set_value,
+		):
+			changed = hub_orchestrator_module.ensure_hub_orchestrator_instructions()
+		self.assertTrue(changed)
+		args = set_value.call_args[0]
+		self.assertEqual(args[:3], ("Agent", "Hub Orchestrator", "instructions"))
+		self.assertIn("0. TRIAGE", args[3])
+
+	def test_current_instructions_left_alone(self):
+		with (
+			patch("frappe.db.exists", return_value=True),
+			patch("frappe.db.get_value", return_value="x 0. TRIAGE y"),
+			patch("frappe.db.set_value") as set_value,
+		):
+			self.assertFalse(hub_orchestrator_module.ensure_hub_orchestrator_instructions())
+		set_value.assert_not_called()
