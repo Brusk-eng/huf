@@ -66,6 +66,8 @@ BUILDER_TOOL_NAMES = (
     "list_provider_options",
     "ask_user",
     "list_agents",
+    "find_existing_agents",
+    "discover_site_capabilities",
     "get_agent",
     "list_apps",
     "get_app",
@@ -76,6 +78,7 @@ BUILDER_TOOL_NAMES = (
     "list_app_components",
     "render_app_component",
     "resolve_recent_resource",
+    "erpnext_list_reports",
 )
 
 
