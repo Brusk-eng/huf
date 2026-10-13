@@ -100,10 +100,22 @@ class TestBridge(unittest.TestCase):
 		with avail(), patch.object(frappe.db, "get_value", return_value="ACC"), patch.object(
 			frappe.db, "exists", return_value=True
 		), patch.object(frappe, "get_doc", return_value=doc):
-			acct = wb.resolve_account()
+			acct = wb.resolve_account("ACC")
+			default = wb.resolve_default_account()
 		self.assertEqual(acct["token"], "secret")
 		self.assertEqual(acct["version"], "v25.0")
 		self.assertEqual(acct["url"], "https://graph.facebook.com")
+		self.assertEqual(default["name"], "ACC")  # non-gateway tools only
+
+	def test_resolve_account_has_no_default_fallback(self):
+		"""Gateway/webhook/management paths never guess an account: an empty name is no_account."""
+		with avail(), patch.object(frappe.db, "get_value", return_value="ACC") as gv, patch.object(
+			frappe.db, "exists", return_value=True
+		):
+			self.assertEqual(wb.resolve_account(), {"error": "no_account"})
+			self.assertEqual(wb.resolve_account(None), {"error": "no_account"})
+			self.assertEqual(wb.resolve_account(""), {"error": "no_account"})
+		gv.assert_not_called()
 
 	def test_resolve_account_none_and_unavailable(self):
 		with avail(), patch.object(frappe.db, "get_value", return_value=None):
@@ -322,7 +334,9 @@ class TestBridge(unittest.TestCase):
 		with avail(), patch.object(frappe, "has_permission", return_value=False):
 			with self.assertRaises(frappe.PermissionError):
 				wb.create_template("ACC", good)
-		with avail(), patch.object(frappe, "has_permission", return_value=True):
+		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
+			wb, "_docname_taken_by_other_account", return_value=None
+		):
 			self.assertEqual(wb.create_template("ACC", {**good, "template_name": "Bad Name"})["error"], "invalid_name")
 			self.assertEqual(wb.create_template("ACC", {**good, "category": "X"})["error"], "invalid_category")
 			too_long = wb.create_template("ACC", {**good, "template_name": "a" * 513})
@@ -337,6 +351,16 @@ class TestBridge(unittest.TestCase):
 			self.assertTrue(res["success"])
 			self.assertEqual(gd.call_args.args[0]["category"], "MARKETING")
 
+	def test_create_template_refuses_a_docname_owned_by_another_account(self):
+		"""frappe_whatsapp names templates <name>-<language> site-wide: never overwrite another account's."""
+		good = {"template_name": "promo_3", "category": "utility", "language_code": "en_US", "template": "Hi {{1}} there", "sample_values": "Ann"}
+		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
+			frappe.db, "exists", return_value=True
+		), patch.object(frappe.db, "get_value", return_value="OTHER"), patch.object(frappe, "get_doc") as gd:
+			res = wb.create_template("ACC", good)
+		self.assertEqual(res["error"], "template_name_taken_by_other_account")
+		gd.assert_not_called()
+
 	def test_create_template_meta_rejection_drops_local_orphan(self):
 		good = {"template_name": "promo_2", "category": "utility", "language_code": "en_US", "template": "Hi {{1}} there", "sample_values": "Ann"}
 
@@ -347,7 +371,9 @@ class TestBridge(unittest.TestCase):
 		doc = Rejecting(name="promo_2-en_US")
 		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
 			frappe, "get_doc", return_value=doc
-		), patch.object(frappe.db, "exists", return_value=True), patch.object(frappe.db, "delete") as dele:
+		), patch.object(frappe.db, "exists", return_value=True), patch.object(frappe.db, "delete") as dele, patch.object(
+			wb, "_docname_taken_by_other_account", return_value=None
+		):
 			res = wb.create_template("ACC", good)
 		self.assertEqual(res["error"], "create_failed")
 		dele.assert_called_once_with("WhatsApp Templates", {"name": "promo_2-en_US"})

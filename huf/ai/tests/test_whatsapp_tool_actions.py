@@ -59,12 +59,13 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		self._patches = [
 			patch.object(bridge, "is_available", return_value=False),
 			patch.object(bridge, "resolve_account", return_value=None),
+			patch.object(bridge, "resolve_default_account", return_value=None),
 			patch.object(bridge, "window_state", return_value={"open": False}),
 			_settings(),
 			_creds(),
 			patch.object(whatsapp, "_gateway_account_name", return_value="WA-1"),
 		]
-		self.mock_available, self.mock_resolve, self.mock_window, *_ = (p.start() for p in self._patches)
+		self.mock_available, self.mock_resolve, _default, self.mock_window, *_ = (p.start() for p in self._patches)
 		self.post = patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.9"}]})).start()
 		self.addCleanup(patch.stopall)
 
@@ -160,6 +161,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 			_settings(allow_proactive="1"),
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "resolve_default_account", return_value=_account()),
 			patch.object(bridge, "create_template") as mock_create,
 		):
 			result = json.loads(whatsapp.handle_action("create_template", template_name="promo"))
@@ -204,6 +206,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		with (
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "resolve_default_account", return_value=_account()),
 			patch.object(bridge, "send_template", return_value={"success": True, "name": "WM-2", "message_id": "m2"}) as mock_tpl,
 		):
 			result = json.loads(
@@ -216,6 +219,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		with (
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "resolve_default_account", return_value=_account()),
 			patch.object(bridge, "create_template") as mock_create,
 		):
 			result = json.loads(
@@ -231,6 +235,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 			_settings(allow_whatsapp_management="true", auto_submit_templates="true"),
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "resolve_default_account", return_value=_account()),
 			patch.object(bridge, "create_template", return_value={"success": True, "name": "TPL-3"}) as mock_create,
 		):
 			result = json.loads(whatsapp.handle_action("create_template", template_name="promo", category="MARKETING"))
@@ -256,6 +261,7 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 		with (
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "resolve_default_account", return_value=_account()),
 			patch.object(bridge, "send_text", return_value={"success": True, "name": "WM-1", "message_id": "wamid.1", "status": "Sent"}) as mock_send,
 			patch.object(whatsapp.requests, "post") as mock_post,
 		):
@@ -269,6 +275,7 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 		with (
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "resolve_default_account", return_value=_account()),
 			patch.object(bridge, "send_text", side_effect=bridge.BridgeError({"success": False, "error": "send_failed"})),
 		):
 			result = json.loads(whatsapp.handle_action("send_message", to="15551234567", message="hi"))
@@ -278,6 +285,7 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 		with (
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value={"error": "no_account"}),
+			patch.object(bridge, "resolve_default_account", return_value={"error": "no_account"}),
 			patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.2"}]})) as mock_post,
 		):
 			result = json.loads(
@@ -315,6 +323,7 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 		rows = [{"name": "TPL-1", "template_name": "promo", "status": "APPROVED"}]
 		with (
 			patch.object(bridge, "is_available", return_value=True),
+			patch.object(bridge, "resolve_account", return_value=_account("WA-1")),
 			patch.object(bridge, "list_templates", return_value=rows) as mock_list,
 		):
 			result = json.loads(whatsapp.handle_action("list_templates", whatsapp_account="WA-1", status="APPROVED"))
@@ -322,11 +331,35 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 		self.assertEqual(result["data"], rows)
 		mock_list.assert_called_once_with("WA-1", "APPROVED")
 
+	def test_list_templates_with_a_gateway_uses_only_that_gateways_account(self):
+		with (
+			patch.object(bridge, "is_available", return_value=True),
+			patch.object(whatsapp, "_gateway_account_name", return_value="WA-GW"),
+			patch.object(bridge, "resolve_account", return_value=_account("WA-GW")),
+			patch.object(bridge, "resolve_default_account", return_value=_account("DEFAULT")),
+			patch.object(bridge, "list_templates", return_value=[]) as mock_list,
+		):
+			whatsapp.handle_action("list_templates", gateway_name="GW-1", whatsapp_account="OTHER")
+		mock_list.assert_called_once_with("WA-GW", None)
+
+	def test_gateway_without_account_never_falls_back_to_the_default_account(self):
+		with (
+			patch.object(bridge, "is_available", return_value=True),
+			patch.object(whatsapp, "_gateway_account_name", return_value=""),
+			patch.object(bridge, "resolve_default_account", return_value=_account("DEFAULT")) as default,
+			patch.object(bridge, "list_templates") as mock_list,
+		):
+			result = json.loads(whatsapp.handle_action("list_templates", gateway_name="GW-1"))
+		self.assertEqual(result["error"], "gateway_required")
+		default.assert_not_called()
+		mock_list.assert_not_called()
+
 	def test_create_template_with_management_setting_calls_bridge(self):
 		with (
 			_settings(allow_whatsapp_management="1", auto_submit_templates="1"),
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "resolve_default_account", return_value=_account()),
 			patch.object(
 				bridge,
 				"create_template",

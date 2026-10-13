@@ -42,6 +42,8 @@ PNG = (
 class FakeGraphCase(IntegrationTestCase):
 	"""Shared server + fixtures."""
 
+	MODE = "direct"
+
 	@classmethod
 	def setUpClass(cls):
 		super().setUpClass()
@@ -120,8 +122,11 @@ class FakeGraphCase(IntegrationTestCase):
 					"is_default_outgoing": 1,
 				}
 			).insert(ignore_permissions=True)
-		self.direct_gateway = self._make_gateway(f"FG Direct {suffix}", None)
-		self.bridge_gateway = self._make_gateway(f"FG Bridge {suffix}", self.account.name) if self.account else None
+		# one enabled gateway per phone number id (the Gateway rejects a second): only the mode under test is enabled
+		self.direct_gateway = self._make_gateway(f"FG Direct {suffix}", None) if self.MODE == "direct" else None
+		self.bridge_gateway = (
+			self._make_gateway(f"FG Bridge {suffix}", self.account.name) if self.account and self.MODE == "bridge" else None
+		)
 
 	def _make_gateway(self, name, account):
 		srv = self.server
@@ -210,6 +215,8 @@ class FakeGraphCase(IntegrationTestCase):
 
 
 class TestDirectMode(FakeGraphCase):
+	MODE = "direct"
+
 	def test_text_reply(self):
 		event = self._inbound(self.direct_gateway)
 		delivery = gateway_webhook.send_gateway_reply(self.direct_gateway, event, "agent answer")
@@ -350,6 +357,8 @@ class TestDirectMode(FakeGraphCase):
 
 
 class TestBridgeMode(FakeGraphCase):
+	MODE = "bridge"
+
 	def setUp(self):
 		super().setUp()
 		self._need_bridge()
@@ -393,7 +402,7 @@ class TestBridgeMode(FakeGraphCase):
 		early = mgmt.send_template_message(
 			to=SENDER, template_name="fg_order_update", body_params=json.dumps(["Ann", "today"]),
 			header_params=json.dumps(["A-100"]), button_params=json.dumps([{"index": 0, "sub_type": "url", "text": "A-100"}]),
-			account=self.account.name,
+			gateway_name=self.bridge_gateway.name,
 		)
 		self.assertEqual(early["error"], "send_failed")
 		self.assertIn("APPROVED", early["message"])
@@ -407,7 +416,7 @@ class TestBridgeMode(FakeGraphCase):
 		sent = mgmt.send_template_message(
 			to="+1 555 123 4567", template_name="fg_order_update", body_params=json.dumps(["Ann", "today"]),
 			header_params=json.dumps(["A-100"]), button_params=json.dumps([{"index": 0, "sub_type": "url", "text": "A-100"}]),
-			account=self.account.name,
+			gateway_name=self.bridge_gateway.name,
 		)
 		self.assertTrue(sent["success"], sent)
 		body = self.server.sent[-1]
@@ -425,7 +434,7 @@ class TestBridgeMode(FakeGraphCase):
 		before = len(self.server.requests_to("POST", "/messages"))
 		missing = mgmt.send_template_message(
 			to=SENDER, template_name="fg_order_update", body_params=json.dumps(["Ann", "today"]),
-			header_params=json.dumps(["A-100"]), account=self.account.name,
+			header_params=json.dumps(["A-100"]), gateway_name=self.bridge_gateway.name,
 		)
 		self.assertEqual(missing["error"], "validation_failed")
 		self.assertEqual(missing["errors"][0]["field"], "button_params")
@@ -464,7 +473,7 @@ class TestBridgeMode(FakeGraphCase):
 		self.assertEqual((again["imported"], again["updated"], again["unchanged"]), (0, 0, 1))
 		self.assertEqual(self.server.requests_to("POST", "/message_templates"), [])
 
-		sent = mgmt.send_template_message(to=SENDER, template_name="fg_preexisting", account=self.account.name)
+		sent = mgmt.send_template_message(to=SENDER, template_name="fg_preexisting", gateway_name=self.bridge_gateway.name)
 		self.assertTrue(sent["success"], sent)
 		self.assertEqual(self.server.sent[-1]["template"]["name"], "fg_preexisting")
 		self.assertEqual(self.server.sent[-1]["template"]["language"], {"code": "en_US"})
@@ -486,12 +495,12 @@ class TestBridgeMode(FakeGraphCase):
 		self.assertEqual([b["type"] for b in comps["BUTTONS"]["buttons"]], ["QUICK_REPLY", "QUICK_REPLY"])
 		self.server.approve("fg_promo_image")
 		# media header with no link is a structured error
-		no_link = mgmt.send_template_message(to=SENDER, template_name="fg_promo_image", body_params=json.dumps(["Ann"]), account=self.account.name)
+		no_link = mgmt.send_template_message(to=SENDER, template_name="fg_promo_image", body_params=json.dumps(["Ann"]), gateway_name=self.bridge_gateway.name)
 		# an IMAGE header falls back to the template's own sample link (frappe_whatsapp behaviour)
 		self.assertTrue(no_link["success"], no_link)
 		self.assertEqual(self.server.sent[-1]["template"]["components"][1]["parameters"][0]["image"]["link"], sample)
 		ok = mgmt.send_template_message(
-			to=SENDER, template_name="fg_promo_image", body_params=json.dumps(["Ann"]), account=self.account.name,
+			to=SENDER, template_name="fg_promo_image", body_params=json.dumps(["Ann"]), gateway_name=self.bridge_gateway.name,
 			header_params=json.dumps([{"type": "image", "link": f"{self.server.url}/files/samples/header.png"}]),
 		)
 		self.assertTrue(ok["success"], ok)
@@ -509,7 +518,7 @@ class TestBridgeMode(FakeGraphCase):
 		self.assertTrue(created["success"], created)
 		self.server.approve("fg_plain")
 		mgmt.sync_templates(account=self.account.name)
-		result = mgmt.send_template_message(to=SENDER, template_name="fg_plain", body_params=json.dumps(["Zed"]), account=self.account.name)
+		result = mgmt.send_template_message(to=SENDER, template_name="fg_plain", body_params=json.dumps(["Zed"]), gateway_name=self.bridge_gateway.name)
 		self.assertTrue(result["success"], result)
 		self.assertEqual(self.server.sent[-1]["template"]["components"], [{"type": "body", "parameters": [{"type": "text", "text": "Zed"}]}])
 

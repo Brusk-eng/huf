@@ -91,8 +91,13 @@ class LifecycleCase(fgc.FakeGraphCase):
 		self.addCleanup(patcher.stop)
 		self.addCleanup(lambda: setattr(frappe.flags, "huf_current_agent_run_id", None))
 
-	def _state(self, docname):
-		return frappe.get_doc(STATE, docname)
+	def _state(self, docname, account=None):
+		"""State rows are keyed per account; sites without frappe_whatsapp use the unscoped bucket."""
+		account = self.account.name if account is None and self.account else account
+		return frappe.get_doc(STATE, bridge.state_key(account, docname))
+
+	def _acct(self):
+		return {"account": self.account.name} if self.account else {}
 
 	def _statuses(self):
 		return [c.args[1] for c in self.realtime.call_args_list if c.args[0] == "whatsapp_template_status"]
@@ -181,11 +186,11 @@ class TestWebhookState(LifecycleCase):
 
 class TestDrafts(LifecycleCase):
 	def test_user_draft_lifecycle_reject_never_calls_meta(self):
-		made = mgmt.create_template_draft(payload=json.dumps(_payload()))
+		made = mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload()))
 		self.assertTrue(made["success"], made)
 		self.assertEqual(made["status"], "Pending Review")
 		self.assertEqual(self.server.requests, [])
-		listed = mgmt.list_template_drafts(status="Pending Review")["drafts"]
+		listed = mgmt.list_template_drafts(**self._acct(), status="Pending Review")["drafts"]
 		row = next(d for d in listed if d["name"] == made["name"])
 		self.assertEqual((row["template_name"], row["requested_via"], row["payload"]["body"]), ("lc_promo", "User", _payload()["body"]))
 		rejected = mgmt.reject_template_draft(name=made["name"], note="wrong tone")
@@ -199,22 +204,22 @@ class TestDrafts(LifecycleCase):
 		self.assertEqual(self.server.requests, [])
 
 	def test_draft_validation_matches_create_template(self):
-		bad = mgmt.create_template_draft(payload=json.dumps(_payload(body="Hi {{1}} and {{2}}", sample_values="Ann")))
+		bad = mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload(body="Hi {{1}} and {{2}}", sample_values="Ann")))
 		self.assertEqual(bad["error"], "validation_failed")
-		self.assertEqual(mgmt.create_template_draft(payload=json.dumps(_payload(category="X")))["error"], "invalid_category")
-		self.assertEqual(mgmt.create_template_draft(payload=json.dumps(_payload(template_name="Bad Name")))["error"], "invalid_name")
+		self.assertEqual(mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload(category="X")))["error"], "invalid_category")
+		self.assertEqual(mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload(template_name="Bad Name")))["error"], "invalid_name")
 		self.assertEqual(frappe.db.count(DRAFT, {"template_name": ["in", ["lc_promo", "Bad Name"]]}), 0)
 
 	def test_non_admin_cannot_approve_reject_or_create(self):
-		made = mgmt.create_template_draft(payload=json.dumps(_payload()))
+		made = mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload()))
 		frappe.set_user(fgc.EXEC_USER)
 		try:
 			for call in (
 				lambda: mgmt.approve_template_draft(name=made["name"]),
 				lambda: mgmt.reject_template_draft(name=made["name"]),
 				lambda: bridge.approve_draft(made["name"]),
-				lambda: mgmt.create_template_draft(payload=json.dumps(_payload(template_name="lc_other"))),
-				lambda: mgmt.list_template_drafts(),
+				lambda: mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload(template_name="lc_other"))),
+				lambda: mgmt.list_template_drafts(**self._acct()),
 			):
 				with self.assertRaises(frappe.PermissionError):
 					call()
@@ -225,7 +230,7 @@ class TestDrafts(LifecycleCase):
 
 	def test_approval_submits_exactly_once(self):
 		self._need_bridge()
-		made = mgmt.create_template_draft(account=self.account.name, payload=json.dumps(_payload()))
+		made = mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload()))
 		approved = mgmt.approve_template_draft(name=made["name"], note="ok")
 		self.assertTrue(approved["success"], approved)
 		self.assertEqual(approved["status"], "Approved & Submitted")
@@ -242,7 +247,7 @@ class TestDrafts(LifecycleCase):
 	def test_meta_refusal_marks_draft_failed(self):
 		self._need_bridge()
 		self.server.add_template("lc_promo", "en_US")  # Meta already has it
-		made = mgmt.create_template_draft(account=self.account.name, payload=json.dumps(_payload()))
+		made = mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload()))
 		out = mgmt.approve_template_draft(name=made["name"])
 		self.assertFalse(out["success"])
 		self.assertEqual(out["status"], "Failed")
@@ -368,7 +373,7 @@ class TestSyncState(LifecycleCase):
 
 class TestEditTemplate(LifecycleCase):
 	def _set_log(self, docname, stamps):
-		frappe.db.set_value(STATE, docname, "edit_log", json.dumps(stamps))
+		frappe.db.set_value(STATE, bridge.state_key(self.account.name, docname), "edit_log", json.dumps(stamps))
 
 	def _ago(self, **kw):
 		return (datetime.now(timezone.utc) - timedelta(**kw)).isoformat()

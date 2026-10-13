@@ -334,30 +334,75 @@ def _template_update_text(update: dict, name: str) -> str | None:
 	return f"Fallback template {name} is {state}" + (f" ({reason})" if reason and reason != "NONE" else "")
 
 
-def _record_template_update(update: dict, account: str | None = None) -> None:
-	"""Store the template's review/quality state, then flag a fallback template that needs attention.
+def _warn(text: str) -> None:
+	try:
+		frappe.logger("huf").warning(text)
+	except Exception:
+		pass
 
-	A rejected/paused/disabled, low-quality or re-categorised template that a gateway relies on as its fallback.
+
+def _route_template_update(gateway_name: str, update: dict) -> tuple[list[str], bool]:
+	"""Accounts a template update belongs to, by WABA id (``entry[].id`` == ``WhatsApp Account.business_id``).
+
+	Template webhooks always arrive on the Meta app's default callback, i.e. at whichever Gateway
+	owns that URL, so the receiving Gateway says nothing about which account the template is on.
+	Returns ``(accounts, handled)``: with the bridge present an unmatched WABA is ignored (logged,
+	``handled`` False) instead of being guessed onto the receiving gateway's account. Without the
+	bridge there are no accounts; the update is recorded unscoped (``[""]``).
 	"""
+	from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+
+	if not bridge.is_available():
+		return [""], True
+	waba_id = str(update.get("waba_id") or "").strip()
+	accounts = bridge.accounts_for_waba(waba_id)
+	if not accounts:
+		_warn(
+			f"WhatsApp gateway {gateway_name}: template update for WABA '{waba_id or '(none)'}' ignored; "
+			"no WhatsApp Account has that business_id"
+		)
+		return [], False
+	return accounts, True
+
+
+def _record_template_update(update: dict, gateway_name: str = "") -> bool:
+	"""Store the template's review/quality state per account, then flag fallback templates needing attention.
+
+	The update is routed to the account(s) of its WABA, never to "whichever Gateway received it".
+	Only gateways linked to those accounts (or, in direct mode with no account, the receiving
+	gateway itself) whose fallback template is this one get the operator note.
+	"""
+	accounts: list[str] = []
 	try:
 		from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 
-		bridge.record_template_webhook(update, account or None)  # best effort, never raises
+		accounts, handled = _route_template_update(gateway_name, update)
+		if not handled:
+			return False
+		for account in accounts:
+			bridge.record_template_webhook(update, account or None)  # best effort, never raises
 	except Exception:
 		pass
 	try:
 		name = str(update.get("message_template_name") or update.get("name") or "").strip()
 		if not name:
-			return
+			return True
 		text = _template_update_text(update, name)
 		if not text:
-			return
+			return True
+		linked = {a for a in accounts if a}
 		for row in frappe.get_all(
-			"Gateway", filters={"provider": "WhatsApp", "fallback_template": name}, fields=["name"]
+			"Gateway",
+			filters={"provider": "WhatsApp", "fallback_template": name},
+			fields=["name", "whatsapp_account"],
 		):
-			_set_gateway_error(row["name"] if isinstance(row, dict) else row.name, text)
+			row_name = row["name"] if isinstance(row, dict) else row.name
+			row_account = (row.get("whatsapp_account") if isinstance(row, dict) else getattr(row, "whatsapp_account", "")) or ""
+			if (row_account and row_account in linked) or (not row_account and row_name == gateway_name):
+				_set_gateway_error(row_name, text)
 	except Exception:
 		pass
+	return True
 
 
 def _supports_batch_parse(adapter) -> bool:
@@ -409,10 +454,13 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			continue
 		try:  # best-effort mirror into frappe_whatsapp (A4)
 			if account_name is None:
+				# the Gateway's own account only: never a default or first-Active guess
 				account_name = (getattr(gateway, "whatsapp_account", "") or "").strip()
-				if not account_name:
-					resolved = bridge.resolve_account(None)
-					account_name = (resolved or {}).get("name") or ""
+				if not account_name and bridge.is_available():
+					_warn(
+						f"WhatsApp gateway {gateway.name}: no WhatsApp Account linked; "
+						"inbound messages are not mirrored into frappe_whatsapp"
+					)
 			message = (event.raw_payload or {}).get("message")
 			payload_phone_id = str(((event.raw_payload or {}).get("metadata") or {}).get("phone_number_id") or "")
 			if (
@@ -428,17 +476,16 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 	for status in parsed.statuses:
 		if str(status.get("status") or "").lower() == "failed":
 			_record_failed_status(gateway.name, status)
-	for update in parsed.template_updates:
-		_record_template_update(update, (getattr(gateway, "whatsapp_account", "") or "").strip() or None)
+	routed_updates = [update for update in parsed.template_updates if _record_template_update(update, gateway.name)]
 
 	forwarded = 0
 	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
 	changes += [
 		{
 			"field": _TEMPLATE_KIND_FIELDS.get(update.get("kind"), "message_template_status_update"),
-			"value": {k: v for k, v in update.items() if k != "kind"},
+			"value": {k: v for k, v in update.items() if k not in ("kind", "waba_id")},
 		}
-		for update in parsed.template_updates
+		for update in routed_updates
 	]
 	for change in changes:
 		try:

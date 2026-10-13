@@ -166,7 +166,9 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					continue
 				field = change.get("field")
 				if field in _TEMPLATE_FIELD_KINDS:
-					template_updates.append({**value, "kind": _TEMPLATE_FIELD_KINDS[field]})
+					# the WABA id (entry[].id) is what routes a template update to its WhatsApp Account
+					waba_id = str(entry.get("id") or "") if isinstance(entry, dict) else ""
+					template_updates.append({**value, "kind": _TEMPLATE_FIELD_KINDS[field], "waba_id": waba_id})
 					continue
 				items = _as_list(value.get("messages")) + _as_list(value.get("statuses"))
 				metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}

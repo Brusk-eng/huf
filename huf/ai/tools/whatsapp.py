@@ -117,8 +117,28 @@ def _graph_root() -> str:
 	return f"{bridge.graph_base_url(override)}/{bridge.GRAPH_DEFAULT_VERSION}"
 
 
+def _gateway_integration_credentials(gateway_name: str) -> tuple[str, str]:
+	"""phone_number_id / access_token of the named Gateway's own Integration Settings."""
+	try:
+		settings_name = frappe.db.get_value("Gateway", gateway_name, "integration_settings")
+		if not settings_name:
+			return "", ""
+		doc = frappe.get_doc("Integration Settings", settings_name)
+		values = {row.key: (row.get_password("value") or "") for row in doc.credentials or [] if row.key}
+		return str(values.get("phone_number_id") or "").strip(), str(values.get("access_token") or "").strip()
+	except Exception:
+		return "", ""
+
+
 def _get_whatsapp_credentials(kwargs: dict | None = None) -> tuple[str, str]:
-	"""Get phone_number_id and access_token from server-side configuration only."""
+	"""Get phone_number_id and access_token from server-side configuration only.
+
+	A named gateway uses its own integration credentials; other WhatsApp accounts are never
+	consulted for it. Without a gateway the first WhatsApp Account / active integration is used.
+	"""
+	gateway_name = ((kwargs or {}).get("gateway_name") or "").strip()
+	if gateway_name:
+		return _gateway_integration_credentials(gateway_name)
 	phone_number_id = ""
 	access_token = ""
 
@@ -196,19 +216,22 @@ def _gateway_account_name(gateway_name: str) -> Optional[str]:
 def _resolve_bridge_account(kwargs: dict) -> Optional[dict]:
 	"""Return the resolved WhatsApp Account dict, or None when unavailable.
 
-	A named ``gateway_name`` pins the account to that gateway's own account
-	(falling back to the default account like the webhook does); a
-	``whatsapp_account`` argument is only honoured without a gateway.
+	A named ``gateway_name`` pins the account to that gateway's own account and never
+	falls back to a default or caller-supplied one (an unlinked gateway means direct mode).
+	A ``whatsapp_account`` argument is only honoured without a gateway, where the
+	default account is used when none is given (non-gateway tool use).
 	"""
 	if not bridge.is_available():
 		return None
-	account_name = (kwargs.get("whatsapp_account") or "").strip() or None
 	gateway_name = (kwargs.get("gateway_name") or "").strip()
 	if gateway_name:
 		gw_account = _gateway_account_name(gateway_name)
-		if gw_account is not None:
-			account_name = gw_account or None
-	acct = bridge.resolve_account(account_name)
+		if not gw_account:
+			return None
+		acct = bridge.resolve_account(gw_account)
+	else:
+		account_name = (kwargs.get("whatsapp_account") or "").strip()
+		acct = bridge.resolve_account(account_name) if account_name else bridge.resolve_default_account()
 	if not acct or acct.get("error"):
 		return None
 	return acct
@@ -256,7 +279,7 @@ def _send_message(kwargs: dict) -> str:
 			return _error(f"Failed to send WhatsApp message: {str(e)}")
 		return _success({"message_id": res.get("message_id"), "recipient": recipient, "status": "sent", "name": res.get("name")})
 
-	phone_number_id, access_token = _get_whatsapp_credentials()
+	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
 		return _error("WhatsApp credentials not found")
 
@@ -353,7 +376,7 @@ def _send_media(kwargs: dict) -> str:
 			return _error(f"Failed to send WhatsApp media: {str(e)}")
 		return _success({"message_id": res.get("message_id"), "recipient": recipient, "status": "sent", "name": res.get("name")})
 
-	phone_number_id, access_token = _get_whatsapp_credentials()
+	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
 		return _error("WhatsApp credentials not found")
 	try:
@@ -413,7 +436,7 @@ def _send_template(kwargs: dict) -> str:
 			return _error(f"Failed to send WhatsApp template: {str(e)}")
 		return _success({"message_id": res.get("message_id"), "recipient": recipient, "status": "sent", "name": res.get("name")})
 
-	phone_number_id, access_token = _get_whatsapp_credentials()
+	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
 		return _error("WhatsApp credentials not found")
 
@@ -503,10 +526,12 @@ def _list_templates(kwargs: dict) -> str:
 	"""List WhatsApp Templates via the bridge (read-only)."""
 	if not bridge.is_available():
 		return _error("bridge_unavailable")
-	account_name = (kwargs.get("whatsapp_account") or "").strip() or None
+	acct = _resolve_bridge_account(kwargs)
+	if not acct:
+		return _refused("gateway_required", "Name a gateway (or a WhatsApp account); templates are never listed across accounts.")
 	status = (kwargs.get("status") or "").strip() or None
 	try:
-		rows = bridge.list_templates(account_name, status)
+		rows = bridge.list_templates(acct["name"], status)
 	except frappe.PermissionError:
 		return _refused("permission_denied", "Not permitted to read WhatsApp Templates")
 	except Exception as e:
@@ -548,7 +573,8 @@ def _get_template_status(kwargs: dict) -> str:
 	if not ref:
 		return _error("'template_name' (a template name or a draft name) is required")
 	try:
-		result = bridge.get_draft_or_state(ref)
+		acct = _resolve_bridge_account(kwargs) if bridge.is_available() else None
+		result = bridge.get_draft_or_state(ref, (acct or {}).get("name"))
 	except Exception as e:
 		return _error(f"Failed to read template status: {str(e)}")
 	return _bridge_result(result)

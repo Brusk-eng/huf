@@ -41,7 +41,7 @@ def _payload(messages=None, statuses=None):
 
 
 class TestWhatsAppIngress(unittest.TestCase):
-	def _call(self, payload=None, *, secret="s3cret", method="POST", query=None, body=None, ingest=None, record=None, forward=None, account_matches=True, gateway_rows=()):
+	def _call(self, payload=None, *, secret="s3cret", method="POST", query=None, body=None, ingest=None, record=None, forward=None, account_matches=True, gateway_rows=(), gateway_account="Acct", waba_accounts=None, bridge_available=True):
 		adapter = WhatsAppGatewayAdapter(CREDS, gateway_context={"gateway_name": "WA"})
 		raw = body if body is not None else json.dumps(payload or {}).encode()
 		sig = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
@@ -52,7 +52,9 @@ class TestWhatsAppIngress(unittest.TestCase):
 		self.mock_frappe.QueryDeadlockError = frappe.QueryDeadlockError
 		self.mock_frappe.request = SimpleNamespace(args={"gateway_name": "WA"})
 		self.mock_frappe.local = SimpleNamespace(response=response)
-		self.mock_frappe.get_doc.return_value = SimpleNamespace(name="WA", provider="WhatsApp", is_enabled=1, whatsapp_account="")
+		self.mock_frappe.get_doc.return_value = SimpleNamespace(
+			name="WA", provider="WhatsApp", is_enabled=1, whatsapp_account=gateway_account
+		)
 		self.mock_frappe.get_all.return_value = list(gateway_rows)
 		self.gate = MagicMock()
 		self.ingest = ingest or MagicMock(
@@ -68,8 +70,11 @@ class TestWhatsAppIngress(unittest.TestCase):
 			f"{BRIDGE}.forward_status", self.forward
 		), patch(f"{BRIDGE}.record_incoming", self.record), patch(
 			f"{BRIDGE}.account_matches_phone_id", return_value=account_matches
-		) as self.matches, patch(
-			f"{BRIDGE}.resolve_account", return_value={"name": "Acct"}
+		) as self.matches, patch(f"{BRIDGE}.is_available", return_value=bridge_available), patch(
+			f"{BRIDGE}.accounts_for_waba",
+			side_effect=lambda waba: list((waba_accounts if waba_accounts is not None else {"waba-1": ["Acct"]}).get(waba, [])),
+		), patch(f"{BRIDGE}.record_template_webhook") as self.record_template, patch(
+			f"{BRIDGE}.resolve_account", side_effect=AssertionError("webhook paths must not resolve a default account")
 		), patch("huf.ai.gateway_webhook._text_response") as self.text:
 			self.result = gateway_webhook.handle_gateway_webhook()
 		self.response = response
@@ -139,6 +144,13 @@ class TestWhatsAppIngress(unittest.TestCase):
 		self.assertIsNone(self._call(method="GET", query=query, body=b""))
 		self.text.assert_called_once_with("abc")
 
+	def test_gateway_without_account_never_mirrors_and_never_guesses_a_default(self):
+		result = self._call(_payload([_msg("wamid.1")]), gateway_account="")
+		self.assertEqual(result["ingested"], 1)
+		self.record.assert_not_called()
+		self.matches.assert_not_called()
+		self.assertIn("no WhatsApp Account linked", str(self.mock_frappe.logger.return_value.warning.call_args))
+
 	def test_mirror_skipped_when_account_phone_differs_from_payload(self):
 		result = self._call(_payload([_msg("wamid.1")]), account_matches=False)
 		self.assertEqual(result["ingested"], 1)
@@ -204,13 +216,18 @@ class TestWhatsAppIngress(unittest.TestCase):
 		self.assertIn("payload for phone number id other-999 ignored; one Gateway per Meta app/number", values["last_error"])
 
 	@staticmethod
-	def _template_payload(event, name="reopen"):
+	def _template_payload(event, name="reopen", waba="waba-1"):
 		update = {"event": event, "message_template_name": name, "reason": "INVALID_FORMAT"}
-		return {"entry": [{"changes": [{"field": "message_template_status_update", "value": update}]}]}
+		return {"entry": [{"id": waba, "changes": [{"field": "message_template_status_update", "value": update}]}]}
 
-	def test_template_rejection_marks_gateways_using_it_as_fallback(self):
+	def test_template_rejection_marks_gateways_of_the_wabas_account_using_it_as_fallback(self):
+		rows = [
+			{"name": "WA", "whatsapp_account": "Acct"},
+			{"name": "WA2", "whatsapp_account": "Acct"},
+			{"name": "OTHER", "whatsapp_account": "Elsewhere"},  # same fallback name, different account: untouched
+		]
 		for state in ("REJECTED", "PAUSED", "DISABLED"):
-			result = self._call(self._template_payload(state), gateway_rows=[{"name": "WA"}, {"name": "WA2"}])
+			result = self._call(self._template_payload(state), gateway_rows=rows)
 			self.assertTrue(result["success"])
 			self.assertEqual(
 				self.mock_frappe.get_all.call_args.kwargs["filters"], {"provider": "WhatsApp", "fallback_template": "reopen"}
@@ -218,32 +235,70 @@ class TestWhatsAppIngress(unittest.TestCase):
 			calls = self.mock_frappe.db.set_value.call_args_list
 			self.assertEqual([c.args[1] for c in calls], ["WA", "WA2"])
 			self.assertIn(f"reopen is {state}", calls[0].args[2]["last_error"])
+			self.record_template.assert_called_once()
+			self.assertEqual(self.record_template.call_args.args[1], "Acct")
+
+	def test_template_update_routes_by_waba_id_not_by_receiving_gateway(self):
+		result = self._call(
+			self._template_payload("REJECTED", waba="waba-Y"),
+			gateway_rows=[{"name": "WA", "whatsapp_account": "Acct"}],
+			waba_accounts={"waba-Y": ["AcctY"], "waba-1": ["Acct"]},
+		)
+		self.assertEqual(self.record_template.call_args.args[1], "AcctY")
+		self.mock_frappe.db.set_value.assert_not_called()  # WA is linked to Acct, not to the WABA's account
+		self.assertEqual(result["forwarded"], 1)
+
+	def test_template_update_for_unknown_waba_is_ignored_with_warning(self):
+		result = self._call(
+			self._template_payload("REJECTED", waba="waba-nobody"), gateway_rows=[{"name": "WA", "whatsapp_account": "Acct"}]
+		)
+		self.assertTrue(result["success"])
+		self.record_template.assert_not_called()
+		self.mock_frappe.db.set_value.assert_not_called()
+		self.assertEqual(result["forwarded"], 0)  # not forwarded to frappe_whatsapp either
+		self.assertIn("waba-nobody", str(self.mock_frappe.logger.return_value.warning.call_args))
+
+	def test_template_update_without_bridge_is_recorded_unscoped_and_flags_receiving_gateway_only(self):
+		self._call(
+			self._template_payload("PAUSED"),
+			gateway_rows=[{"name": "WA", "whatsapp_account": ""}, {"name": "WA2", "whatsapp_account": ""}],
+			gateway_account="",
+			bridge_available=False,
+		)
+		self.assertIsNone(self.record_template.call_args.args[1])
+		self.assertEqual([c.args[1] for c in self.mock_frappe.db.set_value.call_args_list], ["WA"])
 
 	def test_template_approval_or_unused_template_changes_nothing(self):
-		self._call(self._template_payload("APPROVED"), gateway_rows=[{"name": "WA"}])
+		self._call(self._template_payload("APPROVED"), gateway_rows=[{"name": "WA", "whatsapp_account": "Acct"}])
 		self.mock_frappe.db.set_value.assert_not_called()
 		self._call(self._template_payload("REJECTED", "other"), gateway_rows=[])  # no gateway uses it
 		self.mock_frappe.db.set_value.assert_not_called()
 
 	def test_template_quality_and_category_updates_surface_on_fallback_gateways(self):
+		rows = [{"name": "WA", "whatsapp_account": "Acct"}]
+
 		def payload(field, value):
-			return {"entry": [{"changes": [{"field": field, "value": {"message_template_name": "reopen", **value}}]}]}
+			return {
+				"entry": [
+					{"id": "waba-1", "changes": [{"field": field, "value": {"message_template_name": "reopen", **value}}]}
+				]
+			}
 
 		self._call(
 			payload("message_template_quality_update", {"previous_quality_score": "GREEN", "new_quality_score": "RED"}),
-			gateway_rows=[{"name": "WA"}],
+			gateway_rows=rows,
 		)
 		self.assertIn("reopen quality dropped to RED (was GREEN)", self.mock_frappe.db.set_value.call_args.args[2]["last_error"])
 		self.mock_frappe.db.set_value.reset_mock()
 		self._call(
 			payload("template_category_update", {"previous_category": "UTILITY", "new_category": "MARKETING"}),
-			gateway_rows=[{"name": "WA"}],
+			gateway_rows=rows,
 		)
 		self.assertIn("category changed to MARKETING (was UTILITY)", self.mock_frappe.db.set_value.call_args.args[2]["last_error"])
 		self.mock_frappe.db.set_value.reset_mock()
 		self._call(
 			payload("message_template_quality_update", {"previous_quality_score": "RED", "new_quality_score": "GREEN"}),
-			gateway_rows=[{"name": "WA"}],
+			gateway_rows=rows,
 		)
 		self.mock_frappe.db.set_value.assert_not_called()
 

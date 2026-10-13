@@ -9,11 +9,13 @@ never imported at module import time (only lazily, inside :func:`forward_status`
 
 Structured errors: functions that can fail for expected reasons return or
 raise a dict-shaped error ``{"success": False, "error": "<code>", ...}``.
-``resolve_account`` returns ``{"error": "no_account"}`` when no account exists.
+``resolve_account`` returns ``{"error": "no_account"}`` when the named account does not exist
+or no name is given: there is no default-account guess on gateway paths.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import re
@@ -116,6 +118,13 @@ def _err(code: str, **extra: Any) -> dict[str, Any]:
 	return {"success": False, "error": code, **extra}
 
 
+def _gateway_required() -> dict[str, Any]:
+	return _err(
+		"gateway_required",
+		message="Choose a WhatsApp gateway (or an account you may access); data is never listed across accounts.",
+	)
+
+
 def _default_get(*args: Any, **kwargs: Any) -> Any:
 	import requests
 
@@ -143,19 +152,16 @@ def normalize_phone(raw: Any) -> str:
 
 
 def resolve_account(name: str | None = None) -> dict[str, Any] | None:
-	"""Resolve a WhatsApp Account to a plain dict.
+	"""Resolve a named WhatsApp Account to a plain dict.
 
-	With ``name=None`` the default outgoing account is used, else the first
-	Active one. Returns ``None`` when the bridge is unavailable and
-	``{"error": "no_account"}`` when no matching account exists. Never raises
-	for a missing account.
+	There is deliberately no default: an empty ``name`` is ``{"error": "no_account"}``.
+	Gateway paths derive the account from ``Gateway.whatsapp_account`` and never guess;
+	only non-gateway agent tools may use :func:`resolve_default_account`. Returns ``None``
+	when the bridge is unavailable and ``{"error": "no_account"}`` when the account does
+	not exist. Never raises for a missing account.
 	"""
 	if not is_available():
 		return None
-	if not name:
-		name = frappe.db.get_value("WhatsApp Account", {"is_default_outgoing": 1}, "name")
-		if not name:
-			name = frappe.db.get_value("WhatsApp Account", {"status": "Active"}, "name")
 	if not name or not frappe.db.exists("WhatsApp Account", name):
 		return {"error": "no_account"}
 	doc = frappe.get_doc("WhatsApp Account", name)
@@ -170,6 +176,39 @@ def resolve_account(name: str | None = None) -> dict[str, Any] | None:
 		"webhook_verify_token": doc.get("webhook_verify_token"),
 		"status": doc.get("status"),
 	}
+
+
+def resolve_default_account() -> dict[str, Any] | None:
+	"""The default outgoing (else first Active) account, for NON-gateway agent tools only.
+
+	Gateway, webhook and management code must never call this: they resolve through
+	``Gateway.whatsapp_account`` so one gateway can never act as another's account.
+	"""
+	if not is_available():
+		return None
+	name = frappe.db.get_value("WhatsApp Account", {"is_default_outgoing": 1}, "name")
+	if not name:
+		name = frappe.db.get_value("WhatsApp Account", {"status": "Active"}, "name")
+	return resolve_account(name)
+
+
+def gateway_account(gateway_name: str) -> str:
+	"""``Gateway.whatsapp_account`` ('' when unlinked or the gateway is unknown)."""
+	try:
+		return str(frappe.db.get_value("Gateway", gateway_name, "whatsapp_account") or "").strip()
+	except Exception:
+		return ""
+
+
+def accounts_for_waba(waba_id: Any) -> list[str]:
+	"""WhatsApp Accounts whose ``business_id`` is the given WABA id (payload ``entry[].id``)."""
+	waba = str(waba_id or "").strip()
+	if not waba or not is_available():
+		return []
+	try:
+		return list(frappe.get_all("WhatsApp Account", filters={"business_id": waba}, pluck="name") or [])
+	except Exception:
+		return []
 
 
 def _account_or_error(account_name: str | None) -> dict[str, Any]:
@@ -347,14 +386,19 @@ def send_text(
 
 
 def _template_docname(account_name: str, template_name: str, language_code: str | None = None) -> str:
-	"""Map a Meta template name to the ``WhatsApp Templates`` document name.
+	"""Map a Meta template name to the ``WhatsApp Templates`` document name, within one account.
 
 	``WhatsApp Message.template`` is a Link to the document, whose name is
 	``<template_name>-<language_code>`` and not the bare Meta name. With several
-	languages for one template, ``language_code`` picks the matching row.
+	languages for one template, ``language_code`` picks the matching row. Every lookup
+	is filtered by ``whatsapp_account``: another account's template of the same name is
+	never returned (an unmatched name is returned unchanged for the caller to reject).
 	"""
-	if frappe.db.exists("WhatsApp Templates", template_name):
-		return template_name
+	scoped = frappe.db.get_value(
+		"WhatsApp Templates", {"name": template_name, "whatsapp_account": account_name}, "name"
+	)
+	if scoped:
+		return scoped
 	for field in ("actual_name", "template_name"):
 		filters = {"whatsapp_account": account_name, field: template_name}
 		if language_code:
@@ -368,12 +412,15 @@ def _template_docname(account_name: str, template_name: str, language_code: str 
 
 
 def template_language(account_name: str, template_name: str, preferred: str | None = None) -> str | None:
-	"""Language code of the WhatsApp Templates row for ``template_name`` (None if not found)."""
+	"""Language code of the account's WhatsApp Templates row for ``template_name`` (None if not found)."""
 	if not is_available():
 		return None
 	try:
-		if frappe.db.exists("WhatsApp Templates", template_name):
-			return frappe.db.get_value("WhatsApp Templates", template_name, "language_code") or None
+		scoped = frappe.db.get_value(
+			"WhatsApp Templates", {"name": template_name, "whatsapp_account": account_name}, "language_code"
+		)
+		if scoped:
+			return scoped
 		for field in ("actual_name", "template_name"):
 			filters = {"whatsapp_account": account_name, field: template_name}
 			if preferred:
@@ -439,7 +486,10 @@ def _template_row(docname: str) -> dict[str, Any] | None:
 	row = frappe.db.get_value(
 		"WhatsApp Templates",
 		docname,
-		["template", "header_type", "header", "sample", "actual_name", "template_name", "language_code", "status"],
+		[
+			"template", "header_type", "header", "sample", "actual_name", "template_name", "language_code", "status",
+			"whatsapp_account",
+		],
 		as_dict=True,
 	)
 	row["buttons"] = frappe.get_all(
@@ -513,6 +563,9 @@ def send_template(
 	errors += header_errors + button_errors
 	docname = _template_docname(account_name, template_name, language_code)
 	tpl = _template_row(docname)
+	if tpl and (tpl.get("whatsapp_account") or "") != (account_name or ""):
+		# the docname resolves to another account's template: never send it from this account
+		raise BridgeError(_err("template_not_found", message="That template does not belong to this WhatsApp account."))
 	if tpl:
 		errors += _check_send_against_template(tpl, params, headers_n, buttons_n)
 	if errors:
@@ -683,12 +736,16 @@ def send_media(
 
 
 def list_templates(account_name: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
-	"""List WhatsApp Templates (empty list when the bridge is unavailable)."""
+	"""List one account's WhatsApp Templates (empty list when the bridge is unavailable).
+
+	An account is required: without one this raises ``gateway_required`` instead of
+	returning every account's templates.
+	"""
 	if not is_available():
 		return []
-	filters: dict[str, Any] = {}
-	if account_name:
-		filters["whatsapp_account"] = account_name
+	if not account_name:
+		raise BridgeError(_gateway_required())
+	filters: dict[str, Any] = {"whatsapp_account": account_name}
 	if status:
 		filters["status"] = status
 	rows = frappe.get_list(
@@ -706,20 +763,20 @@ def list_templates(account_name: str | None = None, status: str | None = None) -
 
 
 def _attach_state(rows: list[dict[str, Any]]) -> None:
-	"""Add review/quality state columns to listed template rows (best effort)."""
+	"""Add review/quality state columns to listed template rows (best effort), matched per account."""
 	try:
 		states = {
-			r["template"]: r
+			(r.get("whatsapp_account") or "", r["template"]): r
 			for r in frappe.get_all(
 				STATE_DOCTYPE,
 				filters={"template": ["in", [r["name"] for r in rows] or [""]]},
-				fields=["template", "rejected_reason", "quality_score", "correct_category", "last_meta_update"],
+				fields=["template", "whatsapp_account", "rejected_reason", "quality_score", "correct_category", "last_meta_update"],
 			)
 		}
 	except Exception:
 		states = {}
 	for row in rows:
-		st = states.get(row["name"]) or {}
+		st = states.get((row.get("whatsapp_account") or "", row["name"])) or {}
 		row["rejected_reason"] = st.get("rejected_reason") or ""
 		row["quality_score"] = st.get("quality_score") or "UNKNOWN"
 		row["correct_category"] = st.get("correct_category") or ""
@@ -818,6 +875,22 @@ def validate_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
 	return {"name": name, "category": category, "language_code": language_code, "language": language, "spec": spec}
 
 
+def _docname_taken_by_other_account(account_name: str, docname: str) -> dict[str, Any] | None:
+	"""Error dict when ``docname`` (``<name>-<lang>``, unique site-wide upstream) belongs to another account."""
+	if not frappe.db.exists("WhatsApp Templates", docname):
+		return None
+	owner = frappe.db.get_value("WhatsApp Templates", docname, "whatsapp_account")
+	if (owner or "") != (account_name or ""):
+		return _err(
+			"template_name_taken_by_other_account",
+			message=(
+				f"The template document {docname} already belongs to another WhatsApp account. "
+				"frappe_whatsapp names templates <name>-<language> site-wide, so pick a different template name."
+			),
+		)
+	return None
+
+
 def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any]:
 	"""Create a WhatsApp Templates row (its after_insert pushes to Meta). Permission-checked (A8).
 
@@ -837,6 +910,9 @@ def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any
 		return checked["error"]
 	name, category, language_code = checked["name"], checked["category"], checked["language_code"]
 	language, spec = checked["language"], checked["spec"]
+	taken = _docname_taken_by_other_account(account_name, f"{name}-{language_code}")
+	if taken:
+		return taken
 	values: dict[str, Any] = {k: payload[k] for k in _TEMPLATE_PASSTHROUGH if payload.get(k)}
 	values.update(
 		{
@@ -1118,9 +1194,15 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 					if not name:
 						language = str(tpl.get("language") or "")
 						# docname is <name>-<language> and unique site-wide: skip what cannot be named or collides
-						if not language or frappe.db.exists("WhatsApp Templates", f"{tpl['name']}-{language}"):
+						if not language:
 							skipped += 1
-							skipped_reasons.append(_redact(f"{tpl['name']}: no language or name collision"))
+							skipped_reasons.append(_redact(f"{tpl['name']}: no language"))
+							continue
+						if frappe.db.exists("WhatsApp Templates", f"{tpl['name']}-{language}"):
+							skipped += 1
+							taken = _docname_taken_by_other_account(account_name, f"{tpl['name']}-{language}")
+							code = "template_name_taken_by_other_account" if taken else "name collision"
+							skipped_reasons.append(_redact(f"{tpl['name']}: {code} ({tpl['name']}-{language})"))
 							continue
 						sp = f"wa_import_{seen}"
 						frappe.db.savepoint(sp)
@@ -1232,11 +1314,30 @@ def _loads(value: Any, default: Any = None) -> Any:
 		return default
 
 
-def _state_row(docname: str) -> dict[str, Any] | None:
+STATE_KEY_SEP = "::"
+_NAME_MAX = 140
+
+
+def state_key(account: str | None, docname: str) -> str:
+	"""Name of a ``WhatsApp Template State``: ``<account>::<template docname>`` (account-scoped).
+
+	Over-long keys keep the account prefix and replace the template part with a hash, so two
+	accounts never share a state row even when they hold a template of the same name.
+	"""
+	account = str(account or "")
+	key = f"{account}{STATE_KEY_SEP}{docname}"
+	if len(key) > _NAME_MAX:
+		digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+		key = f"{account[:60]}{STATE_KEY_SEP}{digest}"
+	return key
+
+
+def _state_row(docname: str, account: str | None = None) -> dict[str, Any] | None:
 	try:
-		if not frappe.db.exists(STATE_DOCTYPE, docname):
+		key = state_key(account, docname)
+		if not frappe.db.exists(STATE_DOCTYPE, key):
 			return None
-		return frappe.db.get_value(STATE_DOCTYPE, docname, "*", as_dict=True)
+		return frappe.db.get_value(STATE_DOCTYPE, key, "*", as_dict=True)
 	except Exception:
 		return None
 
@@ -1253,21 +1354,33 @@ def _clean_reason(reason: Any) -> str:
 	return "" if text.upper() == "NONE" else text
 
 
-def _resolve_state_name(template_id: Any, name: Any, language: Any) -> str | None:
+def _resolve_state_name(template_id: Any, name: Any, language: Any, account: str | None = None) -> str | None:
+	"""Template docname for a webhook/sync reference, looked up inside ``account`` when given."""
 	tid = str(template_id or "").strip()
+	scope = {"whatsapp_account": account} if account else {}
 	if tid:
-		found = frappe.db.get_value(STATE_DOCTYPE, {"template_id": tid}, "name")
+		found = frappe.db.get_value(STATE_DOCTYPE, {"template_id": tid, **scope}, "template")
 		if found:
 			return found
 		if frappe.db.exists("DocType", "WhatsApp Templates"):
-			found = frappe.db.get_value("WhatsApp Templates", {"id": tid}, "name")
+			found = frappe.db.get_value("WhatsApp Templates", {"id": tid, **scope}, "name")
 			if found:
 				return found
 	name, language = str(name or "").strip(), str(language or "").strip()
+	if name and language and account and frappe.db.exists("DocType", "WhatsApp Templates"):
+		# the account's own row for that Meta name + language (its docname may not be <name>-<language>)
+		found = _local_template(account, name, language)
+		if found:
+			return found
 	if name and language:
-		return f"{name}-{language}"
+		docname = f"{name}-{language}"
+		if account and frappe.db.exists("DocType", "WhatsApp Templates"):
+			owner = frappe.db.get_value("WhatsApp Templates", docname, "whatsapp_account")
+			if frappe.db.exists("WhatsApp Templates", docname) and (owner or "") != account:
+				return None  # that document belongs to another account: never touch its state
+		return docname
 	if name and frappe.db.exists("DocType", "WhatsApp Templates"):
-		found = frappe.db.get_value("WhatsApp Templates", {"actual_name": name}, "name")
+		found = frappe.db.get_value("WhatsApp Templates", {"actual_name": name, **scope}, "name")
 		if found:
 			return found
 	return None
@@ -1301,15 +1414,18 @@ def record_template_state(
 	try:
 		if not frappe.db.exists("DocType", STATE_DOCTYPE):
 			return None
-		docname = docname or _resolve_state_name(template_id, name, language)
+		account = str(account or "").strip()
+		docname = docname or _resolve_state_name(template_id, name, language, account)
 		if not docname:
 			return None
+		key = state_key(account, docname)
 		event_u = str(event or "").strip().upper()
 		new_status = str(status or "").strip().upper() or (event_u if event_u in TEMPLATE_STATUSES else "")
 		now = frappe.utils.now_datetime()
-		existing = frappe.db.exists(STATE_DOCTYPE, docname)
-		doc = frappe.get_doc(STATE_DOCTYPE, docname) if existing else frappe.new_doc(STATE_DOCTYPE)
+		existing = frappe.db.exists(STATE_DOCTYPE, key)
+		doc = frappe.get_doc(STATE_DOCTYPE, key) if existing else frappe.new_doc(STATE_DOCTYPE)
 		if not existing:
+			doc.state_key = key
 			doc.template = docname
 		old_status = (doc.get("status") or "") if existing else ""
 		if template_id not in (None, ""):
@@ -1514,7 +1630,7 @@ def get_template(name: str) -> dict[str, Any]:
 	if not name or not frappe.db.exists("WhatsApp Templates", name):
 		return _err("not_found")
 	row = frappe.db.get_value("WhatsApp Templates", name, _ROW_FIELDS, as_dict=True)
-	state = _state_row(name) or {}
+	state = _state_row(name, row.get("whatsapp_account")) or {}
 	status = (state.get("status") or row.get("status") or "").upper()
 	quota = edit_quota(status, state.get("edit_log"))
 	view = {
@@ -1585,7 +1701,7 @@ def edit_template(name: str, payload: dict[str, Any]) -> dict[str, Any]:
 			return _err("immutable_field", field=key, message="Template name and language cannot be changed after creation.")
 	if not row.get("id"):
 		return _err("no_template_id", message="This template has no Meta ID yet; sync templates first.")
-	state = _state_row(name) or {}
+	state = _state_row(name, row.get("whatsapp_account")) or {}
 	status = (state.get("status") or row.get("status") or "").upper()
 	quota = edit_quota(status, state.get("edit_log"))
 	if not quota["editable"]:
@@ -1695,8 +1811,9 @@ def edit_template(name: str, payload: dict[str, Any]) -> dict[str, Any]:
 		docname=name, template_id=row["id"], account=row.get("whatsapp_account"), status="PENDING",
 		category=category, reason="", recommendation="", components=components, source="edit",
 	)
-	if frappe.db.exists(STATE_DOCTYPE, name):
-		frappe.db.set_value(STATE_DOCTYPE, name, "edit_log", json.dumps(log))
+	edit_key = state_key(row.get("whatsapp_account"), name)
+	if frappe.db.exists(STATE_DOCTYPE, edit_key):
+		frappe.db.set_value(STATE_DOCTYPE, edit_key, "edit_log", json.dumps(log))
 	return {
 		"success": True,
 		"name": name,
@@ -1794,9 +1911,7 @@ def approve_draft(name: str, note: str = "") -> dict[str, Any]:
 	if not is_available():
 		result: dict[str, Any] = _err("bridge_unavailable")
 	else:
-		if not account:
-			acct = resolve_account(None)
-			account = (acct or {}).get("name") if acct and not acct.get("error") else None
+		# the draft's own account only: no default-account guess at approval time
 		try:
 			result = create_template(account, payload) if account else _err("no_account")
 		except frappe.PermissionError:
@@ -1842,27 +1957,45 @@ def reject_draft(name: str, note: str = "") -> dict[str, Any]:
 	return {"success": True, "name": doc.name, "status": doc.status}
 
 
-def list_drafts(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-	"""Template drafts, newest first (permission-checked read)."""
+def list_drafts(
+	status: str | None = None, limit: int = 100, account: str | None = None
+) -> list[dict[str, Any]]:
+	"""Template drafts of ONE account, newest first (permission-checked read).
+
+	``account=None`` raises ``gateway_required`` rather than listing every account's drafts;
+	``account=""`` is the unscoped bucket of sites without frappe_whatsapp (drafts with no account).
+	"""
 	if not frappe.has_permission(DRAFT_DOCTYPE, "read"):
 		raise frappe.PermissionError("Not permitted to read WhatsApp Template Drafts")
-	filters = {"status": status} if status else {}
+	if account is None:
+		raise BridgeError(_gateway_required())
+	filters: dict[str, Any] = {"whatsapp_account": account if account else ["is", "not set"]}
+	if status:
+		filters["status"] = status
 	rows = frappe.get_all(DRAFT_DOCTYPE, filters=filters, fields=["*"], order_by="creation desc", limit_page_length=limit)
 	return [_draft_row(r) for r in rows]
 
 
-def get_draft_or_state(ref: str) -> dict[str, Any]:
-	"""Agent-facing lookup by draft name or template name: draft state plus Meta review state."""
+def get_draft_or_state(ref: str, account: str | None = None) -> dict[str, Any]:
+	"""Agent-facing lookup by draft name or template name: draft state plus Meta review state.
+
+	With ``account`` only that account's drafts and template states are consulted.
+	"""
 	ref = str(ref or "").strip()
 	if not ref:
 		return _err("invalid_name", message="template_name is required")
 	out: dict[str, Any] = {"success": True}
 	draft = None
-	if frappe.db.exists(DRAFT_DOCTYPE, ref):
+	draft_scope = {"whatsapp_account": account} if account else {}
+	if frappe.db.exists(DRAFT_DOCTYPE, {"name": ref, **draft_scope}):
 		draft = frappe.get_doc(DRAFT_DOCTYPE, ref)
 	else:
 		hit = frappe.get_all(
-			DRAFT_DOCTYPE, filters={"template_name": ref}, order_by="creation desc", limit_page_length=1, pluck="name"
+			DRAFT_DOCTYPE,
+			filters={"template_name": ref, **draft_scope},
+			order_by="creation desc",
+			limit_page_length=1,
+			pluck="name",
 		)
 		if hit:
 			draft = frappe.get_doc(DRAFT_DOCTYPE, hit[0])
@@ -1873,13 +2006,17 @@ def get_draft_or_state(ref: str) -> dict[str, Any]:
 			"submit_error": draft.submit_error or "", "submitted_template": draft.submitted_template or "",
 		}
 		docname = draft.submitted_template or None
-	if not docname and frappe.db.exists(STATE_DOCTYPE, ref):
+		account = account or (draft.get("whatsapp_account") or None)
+	state_scope = {"whatsapp_account": account} if account else {}
+	if not docname and frappe.db.exists(STATE_DOCTYPE, {"template": ref, **state_scope}):
 		docname = ref
 	if not docname:
-		hit = frappe.get_all(STATE_DOCTYPE, filters={"template": ["like", f"{ref}-%"]}, limit_page_length=1, pluck="name")
+		hit = frappe.get_all(
+			STATE_DOCTYPE, filters={"template": ["like", f"{ref}-%"], **state_scope}, limit_page_length=1, pluck="template"
+		)
 		docname = hit[0] if hit else None
 	if docname:
-		state = _state_row(docname) or {}
+		state = _state_row(docname, account) or {}
 		out.update(
 			template=docname, status=state.get("status") or "", reason=state.get("rejected_reason") or "",
 			recommendation=state.get("rejection_recommendation") or "",
@@ -2028,9 +2165,9 @@ def list_messages(account_name: str | None = None, phone: str | None = None, lim
 	"""List WhatsApp Messages (newest first); bridge_unavailable error if absent (A15)."""
 	if not is_available():
 		return _err("bridge_unavailable")
-	filters: dict[str, Any] = {}
-	if account_name:
-		filters["whatsapp_account"] = account_name
+	if not account_name:
+		return _gateway_required()
+	filters: dict[str, Any] = {"whatsapp_account": account_name}
 	if phone:
 		p = normalize_phone(phone)
 		or_filters = {"to": p, "from": p}
@@ -2056,7 +2193,9 @@ def list_conversations(account_name: str | None = None, limit: int = 50) -> dict
 	"""Group recent messages by counterparty number (latest message each)."""
 	if not is_available():
 		return _err("bridge_unavailable")
-	filters = {"whatsapp_account": account_name} if account_name else {}
+	if not account_name:
+		return _gateway_required()
+	filters = {"whatsapp_account": account_name}
 	rows = frappe.get_list(
 		"WhatsApp Message",
 		filters=filters,
