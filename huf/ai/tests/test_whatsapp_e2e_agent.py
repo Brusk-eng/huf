@@ -215,6 +215,10 @@ class _E2EMixin:
 		if not getattr(frappe.local, "response", None):
 			frappe.local.response = frappe._dict()
 		self.addCleanup(lambda: setattr(frappe.local, "request", self._prev_request))
+		# trusted bridge sends commit for status-webhook matching; keep test data rollback-able
+		commit = patch.object(frappe.db, "commit")
+		commit.start()
+		self.addCleanup(commit.stop)
 		enq = patch("frappe.enqueue")  # no worker; the test calls process_gateway_event itself
 		enq.start()
 		self.addCleanup(enq.stop)

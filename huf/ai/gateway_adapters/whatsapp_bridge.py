@@ -18,17 +18,20 @@ import importlib
 import json
 import re
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, urlparse
 
 import frappe
+import frappe.utils
 
 GRAPH_DEFAULT_VERSION = "v21.0"
 WINDOW_HOURS = 24
 DEFAULT_MAX_MEDIA_BYTES = 16 * 1024 * 1024
 DEFAULT_MIME_PREFIXES = ("image/", "audio/", "video/", "application/pdf", "text/plain")
-TEMPLATE_CATEGORIES = ("MARKETING", "UTILITY", "AUTHENTICATION")
+# AUTHENTICATION is intentionally unsupported: Meta requires OTP button components.
+TEMPLATE_CATEGORIES = ("MARKETING", "UTILITY")
+FORWARD_RETRY_DELAY_SECONDS = 5
 _TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 _HTTP_TIMEOUT = 15
 _MEDIA_HOST_SUFFIXES = ("fbcdn.net", "facebook.com", "whatsapp.net", "fbsbx.com")
@@ -138,11 +141,39 @@ def account_matches_phone_id(account_name: str, phone_number_id: str) -> bool:
 	return bool(phone_id) and str(phone_id) == str(phone_number_id)
 
 
+def message_time(raw_payload: Any) -> datetime | None:
+	"""Return the provider's own message timestamp as a naive system-time datetime.
+
+	Meta stamps ``messages[].timestamp`` in epoch seconds (UTC). ``received_at``
+	is stored with ``now_datetime()`` (naive, system timezone), so the epoch is
+	converted into the system timezone and made naive to be comparable.
+	"""
+	if isinstance(raw_payload, (str, bytes)):
+		try:
+			raw_payload = json.loads(raw_payload)
+		except ValueError:
+			return None
+	message = raw_payload.get("message") if isinstance(raw_payload, dict) else None
+	if not isinstance(message, dict):
+		return None
+	try:
+		epoch = int(str(message.get("timestamp")).strip())
+		utc = datetime.fromtimestamp(epoch, tz=timezone.utc)
+	except (TypeError, ValueError, OverflowError, OSError):
+		return None
+	return frappe.utils.convert_utc_to_system_timezone(utc).replace(tzinfo=None)
+
+
 def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> dict[str, Any]:
 	"""Compute the 24h customer-service window from signed Gateway Events only (A3).
 
 	Only inbound events with ``verified_sender=1`` for the same gateway and
 	normalised sender count. WhatsApp Message rows are never consulted.
+
+	The window anchors on the customer's own message time (Meta redelivers old
+	webhooks for days, so ``received_at`` alone would reopen a closed window),
+	falling back to ``received_at`` when the payload carries no timestamp. The
+	message time is capped at ``received_at`` so clock skew cannot extend it.
 	"""
 	now = now or frappe.utils.now_datetime()
 	sender = normalize_phone(phone)
@@ -154,16 +185,21 @@ def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> 
 			"verified_sender": 1,
 			"received_at": [">=", now - timedelta(hours=WINDOW_HOURS)],
 		},
-		fields=["received_at", "verified_sender", "sender_id"],
+		fields=["received_at", "verified_sender", "sender_id", "raw_payload"],
 		order_by="received_at desc",
-		limit_page_length=20,
+		limit_page_length=50,
 	)
 	last = None
 	for row in rows or []:
 		if not row.get("verified_sender"):
 			continue
 		ts = row.get("received_at")
-		if ts and (last is None or ts > last):
+		if not ts:
+			continue
+		sent = message_time(row.get("raw_payload"))
+		if sent is not None:
+			ts = min(sent, ts)
+		if last is None or ts > last:
 			last = ts
 	if last is None:
 		return {"open": False, "last_inbound_at": None, "expires_at": None}
@@ -248,6 +284,10 @@ def send_text(
 	try:
 		doc = frappe.get_doc(values)
 		doc.insert(ignore_permissions=bool(trusted))
+		if trusted:
+			# Gateway reply path runs in a background job: persist the outgoing row
+			# now so Meta's status webhook can match its wamid straight away.
+			frappe.db.commit()
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
@@ -255,21 +295,46 @@ def send_text(
 	return _readback(doc)
 
 
-def _template_docname(account_name: str, template_name: str) -> str:
+def _template_docname(account_name: str, template_name: str, language_code: str | None = None) -> str:
 	"""Map a Meta template name to the ``WhatsApp Templates`` document name.
 
 	``WhatsApp Message.template`` is a Link to the document, whose name is
-	``<template_name>-<language_code>`` and not the bare Meta name.
+	``<template_name>-<language_code>`` and not the bare Meta name. With several
+	languages for one template, ``language_code`` picks the matching row.
 	"""
 	if frappe.db.exists("WhatsApp Templates", template_name):
 		return template_name
 	for field in ("actual_name", "template_name"):
-		name = frappe.db.get_value(
-			"WhatsApp Templates", {"whatsapp_account": account_name, field: template_name}, "name"
-		)
+		filters = {"whatsapp_account": account_name, field: template_name}
+		if language_code:
+			name = frappe.db.get_value("WhatsApp Templates", {**filters, "language_code": language_code}, "name")
+			if name:
+				return name
+		name = frappe.db.get_value("WhatsApp Templates", filters, "name")
 		if name:
 			return name
 	return template_name
+
+
+def template_language(account_name: str, template_name: str, preferred: str | None = None) -> str | None:
+	"""Language code of the WhatsApp Templates row for ``template_name`` (None if not found)."""
+	if not is_available():
+		return None
+	try:
+		if frappe.db.exists("WhatsApp Templates", template_name):
+			return frappe.db.get_value("WhatsApp Templates", template_name, "language_code") or None
+		for field in ("actual_name", "template_name"):
+			filters = {"whatsapp_account": account_name, field: template_name}
+			if preferred:
+				found = frappe.db.get_value("WhatsApp Templates", {**filters, "language_code": preferred}, "language_code")
+				if found:
+					return found
+			found = frappe.db.get_value("WhatsApp Templates", filters, "language_code")
+			if found:
+				return found
+	except Exception:
+		return None
+	return None
 
 
 def send_template(
@@ -279,6 +344,7 @@ def send_template(
 	body_params: list | None = None,
 	header_params: list | None = None,
 	trusted: bool = False,
+	language_code: str | None = None,
 ) -> dict[str, Any]:
 	"""Send an approved template via an Outgoing ``WhatsApp Message`` (use_template=1).
 
@@ -293,7 +359,7 @@ def send_template(
 		"type": "Outgoing",
 		"to": normalize_phone(to),
 		"use_template": 1,
-		"template": _template_docname(account_name, template_name),
+		"template": _template_docname(account_name, template_name, language_code),
 		"whatsapp_account": account_name,
 		"content_type": "text",
 		"template_parameters": ",".join(params),
@@ -305,6 +371,10 @@ def send_template(
 	try:
 		doc = frappe.get_doc(values)
 		doc.insert(ignore_permissions=bool(trusted))
+		if trusted:
+			# Gateway reply path runs in a background job: persist the outgoing row
+			# now so Meta's status webhook can match its wamid straight away.
+			frappe.db.commit()
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
@@ -434,11 +504,13 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 	return {"success": True, "seen": seen, "updated": updated}
 
 
-def forward_status(change: dict[str, Any]) -> bool:
+def forward_status(change: dict[str, Any], _retry: bool = False) -> bool:
 	"""Forward a status ``change`` to frappe_whatsapp's ``update_status`` (A4).
 
-	Lazy import; unknown message wamids are skipped; never raises. Returns
-	True only if a forward actually happened.
+	Lazy import; never raises. Returns True only if a forward actually happened.
+	A message status whose wamid is not (yet) known is not dropped: one delayed
+	retry is enqueued (the outgoing row may still be uncommitted when Meta's
+	webhook arrives). ``_retry`` marks that retry so it never loops.
 	"""
 	try:
 		if not is_available():
@@ -446,12 +518,34 @@ def forward_status(change: dict[str, Any]) -> bool:
 		if change.get("field") == "messages":
 			statuses = (change.get("value") or {}).get("statuses") or []
 			if not statuses or not frappe.db.exists("WhatsApp Message", {"message_id": statuses[0].get("id")}):
+				if statuses and not _retry:
+					_enqueue_forward_retry(change)
 				return False
 		webhook = importlib.import_module("frappe_whatsapp.utils.webhook")
 		webhook.update_status(change)
 		return True
 	except Exception:
 		return False
+
+
+def _enqueue_forward_retry(change: dict[str, Any]) -> None:
+	try:
+		frappe.enqueue(
+			"huf.ai.gateway_adapters.whatsapp_bridge.retry_forward_status",
+			queue="short",
+			enqueue_after_commit=True,
+			change=change,
+		)
+	except Exception:
+		pass  # best effort
+
+
+def retry_forward_status(change: dict[str, Any]) -> bool:
+	"""Background job: wait briefly for the outgoing row to be committed, then forward once."""
+	import time
+
+	time.sleep(FORWARD_RETRY_DELAY_SECONDS)
+	return forward_status(change, _retry=True)
 
 
 def download_media(

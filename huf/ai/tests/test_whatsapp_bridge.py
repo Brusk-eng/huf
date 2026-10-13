@@ -137,6 +137,65 @@ class TestBridge(unittest.TestCase):
 		res, _ = self._window([])
 		self.assertFalse(res["open"])
 
+	def _event_row(self, received_at, ts_epoch=None, verified=1):
+		payload = {"message": {"id": "w", "timestamp": str(ts_epoch)}} if ts_epoch is not None else {}
+		return {"received_at": received_at, "verified_sender": verified, "raw_payload": payload}
+
+	def _epoch(self, naive_local, tz="Asia/Kolkata"):
+		from zoneinfo import ZoneInfo
+
+		return int(naive_local.replace(tzinfo=ZoneInfo(tz)).timestamp())
+
+	def test_redelivered_old_message_does_not_open_window(self):
+		# Meta redelivers a 30h-old message just now: received_at is fresh, the message is not.
+		old = self._epoch(NOW - timedelta(hours=30))
+		with patch("frappe.utils.data.get_system_timezone", return_value="Asia/Kolkata"):
+			res, _ = self._window([self._event_row(NOW - timedelta(minutes=1), old)])
+		self.assertFalse(res["open"])
+
+	def test_fresh_message_opens_window_anchored_on_message_time(self):
+		sent = NOW - timedelta(hours=23, minutes=30)  # received_at is later (delayed delivery)
+		with patch("frappe.utils.data.get_system_timezone", return_value="Asia/Kolkata"):
+			res, _ = self._window([self._event_row(NOW - timedelta(minutes=5), self._epoch(sent))])
+		self.assertTrue(res["open"])
+		self.assertEqual(res["last_inbound_at"], sent)
+		self.assertEqual(res["expires_at"], sent + timedelta(hours=24))
+
+	def test_window_timezone_boundary(self):
+		# Same instant, different system zones: the naive conversion must follow the zone.
+		sent_utc_naive = datetime(2026, 1, 9, 12, 30)  # 23.5h before NOW if NOW is also UTC
+		epoch = int(sent_utc_naive.replace(tzinfo=__import__("datetime").timezone.utc).timestamp())
+		with patch("frappe.utils.data.get_system_timezone", return_value="UTC"):
+			res, _ = self._window([self._event_row(NOW, epoch)])
+			self.assertTrue(res["open"])  # 23.5h old
+			res, _ = self._window([self._event_row(NOW, epoch - 3600)])
+			self.assertFalse(res["open"])  # 24.5h old
+		# NOW is naive in Kolkata (UTC+5:30): the same epoch is 5.5h further back in that zone's wall clock.
+		with patch("frappe.utils.data.get_system_timezone", return_value="Asia/Kolkata"):
+			self.assertEqual(wb.message_time({"message": {"timestamp": str(epoch)}}), sent_utc_naive + timedelta(hours=5, minutes=30))
+
+	def test_window_falls_back_to_received_at_without_timestamp(self):
+		for payload in ({}, {"message": {"timestamp": "garbage"}}, "not json"):
+			row = {"received_at": NOW - timedelta(hours=1), "verified_sender": 1, "raw_payload": payload}
+			res, _ = self._window([row])
+			self.assertTrue(res["open"])
+			self.assertEqual(res["last_inbound_at"], NOW - timedelta(hours=1))
+
+	def test_message_timestamp_never_extends_beyond_received_at(self):
+		future = self._epoch(NOW + timedelta(hours=5))
+		with patch("frappe.utils.data.get_system_timezone", return_value="Asia/Kolkata"):
+			res, _ = self._window([self._event_row(NOW - timedelta(hours=23), future)])
+		self.assertEqual(res["last_inbound_at"], NOW - timedelta(hours=23))
+
+	def test_window_uses_newest_effective_anchor(self):
+		old = self._epoch(NOW - timedelta(hours=40))
+		fresh = self._epoch(NOW - timedelta(hours=2))
+		with patch("frappe.utils.data.get_system_timezone", return_value="Asia/Kolkata"):
+			res, _ = self._window(
+				[self._event_row(NOW - timedelta(minutes=1), old), self._event_row(NOW - timedelta(minutes=3), fresh)]
+			)
+		self.assertTrue(res["open"])
+
 	def test_record_incoming_idempotent(self):
 		msg = {"id": "wamid.1", "from": "+1 415", "type": "text", "text": {"body": "hi"}}
 		with avail(False):
@@ -185,7 +244,7 @@ class TestBridge(unittest.TestCase):
 		doc = FakeDoc()
 		with avail(), patch.object(wb, "resolve_account", return_value=ACCT), patch.object(frappe, "get_doc", return_value=doc) as gd, patch.object(
 			wb, "_template_docname", return_value="hello_tpl-en_US"
-		):
+		), patch.object(frappe.db, "commit") as commit:
 			wb.send_template("ACC", "+1 415", "hello_tpl", ["a", "b"], ["h"])
 		v = gd.call_args.args[0]
 		self.assertEqual(v["use_template"], 1)
@@ -193,6 +252,47 @@ class TestBridge(unittest.TestCase):
 		self.assertEqual(v["template_parameters"], "a,b")
 		self.assertEqual(v["template_header_parameters"], "h")
 		self.assertEqual(doc.insert_kwargs, {"ignore_permissions": False})
+		commit.assert_not_called()  # user-initiated path never commits
+
+	def test_trusted_sends_commit_right_after_insert(self):
+		for send in (
+			lambda: wb.send_text("ACC", "1", "x", trusted=True),
+			lambda: wb.send_template("ACC", "1", "t", [], trusted=True),
+		):
+			doc = FakeDoc()
+			order = []
+			doc.insert = lambda **kw: order.append("insert") or FakeDoc.insert(doc, **kw)
+			with avail(), patch.object(wb, "resolve_account", return_value=ACCT), patch.object(
+				frappe, "get_doc", return_value=doc
+			), patch.object(wb, "_template_docname", return_value="t"), patch.object(
+				frappe.db, "commit", side_effect=lambda: order.append("commit")
+			):
+				send()
+			self.assertEqual(order, ["insert", "commit"])
+
+	def test_template_language_and_docname_by_language(self):
+		def get_value(dt, filters, field=None, *a, **k):
+			if isinstance(filters, dict) and filters.get("language_code") == "hi":
+				return "reopen-hi" if field == "name" else "hi"
+			if isinstance(filters, dict) and filters.get("actual_name") == "reopen":
+				return "reopen-en_US" if field == "name" else "en_US"
+			return None
+
+		with avail(), patch.object(frappe.db, "exists", return_value=False), patch.object(
+			frappe.db, "get_value", side_effect=get_value
+		):
+			self.assertEqual(wb.template_language("ACC", "reopen", "hi"), "hi")
+			self.assertEqual(wb.template_language("ACC", "reopen"), "en_US")
+			self.assertEqual(wb._template_docname("ACC", "reopen", "hi"), "reopen-hi")
+			self.assertIsNone(wb.template_language("ACC", "nope"))
+		with avail(False):
+			self.assertIsNone(wb.template_language("ACC", "reopen"))
+
+	def test_authentication_category_is_not_supported(self):
+		self.assertEqual(wb.TEMPLATE_CATEGORIES, ("MARKETING", "UTILITY"))
+		with avail(), patch.object(frappe, "has_permission", return_value=True):
+			res = wb.create_template("ACC", {"template_name": "otp", "category": "AUTHENTICATION", "language_code": "en"})
+		self.assertEqual(res["error"], "invalid_category")
 
 	def test_list_templates(self):
 		with avail(False):
@@ -257,8 +357,15 @@ class TestBridge(unittest.TestCase):
 		msg_change = {"field": "messages", "value": {"statuses": [{"id": "w1"}]}}
 		tpl_change = {"field": "message_template_status_update", "value": {}}
 		with avail(), patch.dict(sys.modules, {"frappe_whatsapp.utils.webhook": mod}):
-			with patch.object(frappe.db, "exists", return_value=False):
+			with patch.object(frappe.db, "exists", return_value=False), patch.object(frappe, "enqueue") as enq:
 				self.assertFalse(wb.forward_status(msg_change))
+				# unknown wamid: exactly one delayed retry is queued, not a drop
+				enq.assert_called_once()
+				self.assertTrue(enq.call_args.kwargs["enqueue_after_commit"])
+				self.assertEqual(enq.call_args.kwargs["change"], msg_change)
+				enq.reset_mock()
+				self.assertFalse(wb.forward_status(msg_change, _retry=True))
+				enq.assert_not_called()  # the retry never re-enqueues
 			mod.update_status.assert_not_called()
 			with patch.object(frappe.db, "exists", return_value=True):
 				self.assertTrue(wb.forward_status(msg_change))
@@ -270,6 +377,13 @@ class TestBridge(unittest.TestCase):
 		with avail():  # module missing -> ImportError swallowed
 			with patch.object(wb.importlib, "import_module", side_effect=ImportError):
 				self.assertFalse(wb.forward_status(tpl_change))
+
+	def test_retry_forward_status_waits_then_forwards_once(self):
+		change = {"field": "messages", "value": {"statuses": [{"id": "w1"}]}}
+		with patch("time.sleep") as sleep, patch.object(wb, "forward_status", return_value=True) as fwd:
+			self.assertTrue(wb.retry_forward_status(change))
+		sleep.assert_called_once_with(wb.FORWARD_RETRY_DELAY_SECONDS)
+		fwd.assert_called_once_with(change, _retry=True)
 
 	def _media_get(self, meta, content=b"data"):
 		def http_get(url, **kw):

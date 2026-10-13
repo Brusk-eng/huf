@@ -183,6 +183,10 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 		self._prev_request_ip = getattr(frappe.local, "request_ip", None)
 		frappe.local.request_ip = "127.0.0.1"  # rate_limit on whitelisted endpoints needs an identity
 		self.addCleanup(self._restore_request)
+		# trusted bridge sends commit for status-webhook matching; keep test data rollback-able
+		commit = patch.object(frappe.db, "commit")
+		commit.start()
+		self.addCleanup(commit.stop)
 		# no worker is running; never really enqueue
 		enq = patch("frappe.enqueue")
 		enq.start()
