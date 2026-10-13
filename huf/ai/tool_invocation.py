@@ -67,6 +67,7 @@ TYPE_TO_FUNCTION_PATH: dict[str, str] = {
 	"GET": "huf.ai.http_handler.handle_get_request",
 	"POST": "huf.ai.http_handler.handle_post_request",
 	"Run Agent": "huf.ai.sdk_tools.handle_run_agent",
+	"Code Execution": "huf.ai.tools.code_execution.run_python",
 	"Attach File to Document": "huf.ai.sdk_tools.handle_attach_file_to_document",
 	"Send Email": "huf.ai.sdk_tools.handle_send_email",
 	"Get Conversation Data": "huf.ai.sdk_tools.handle_get_conversation_data",
@@ -223,6 +224,10 @@ def build_extra_args(tool_doc: dict) -> dict:
 		extra["function_name"] = tool_doc["function_name"]
 	elif types == "Run Agent" and tool_doc.get("agent"):
 		extra["target_agent_name"] = tool_doc["agent"]
+	elif types == "Code Execution":
+		# Trusted: the agent whose tool list is being built. Always set (even
+		# to None) so a model-supplied ``agent_doc`` is overwritten, never kept.
+		extra["agent_doc"] = tool_doc.get("agent_doc")
 
 	if types in ("GET", "POST"):
 		extra["tool_name"] = tool_doc.get("tool_name") or tool_doc.get("name")
@@ -332,6 +337,16 @@ async def invoke_tool(
 
 	tool_type = tool_doc.get("types")
 	allowed_for_guest = bool(tool_doc.get("allowed_for_guest"))
+
+	if tool_type == "Code Execution":
+		# Only an agent run may execute code: the agent is injected by
+		# sdk_tools.create_agent_tools. Flows/procedures have no trusted agent,
+		# so a caller-supplied ``agent_doc`` must never be honoured.
+		return ToolResult(
+			success=False,
+			error="Code Execution tools are only available to an agent run.",
+			denied=True,
+		)
 
 	perm_check = check_tool_permission(tool_type, allowed_for_guest=allowed_for_guest)
 	if not perm_check["allowed"]:
