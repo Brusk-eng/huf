@@ -127,7 +127,7 @@ class TestWhatsAppManagement(unittest.TestCase):
 	def test_setup_status_flags_missing_app_secret_without_leaking_values(self):
 		self.frappe.utils.get_url.return_value = "https://huf.example.com"
 		self.frappe.get_all.side_effect = lambda doctype, **kwargs: (
-			[{"name": "GW-1", "enabled": 1, "integration_settings": "IS-1"}]
+			[{"name": "GW-1", "is_enabled": 1, "integration_settings": "IS-1"}]
 			if doctype == "Gateway"
 			else [{"name": "ACC-1", "phone_id": "111", "status": "Active"}]
 		)

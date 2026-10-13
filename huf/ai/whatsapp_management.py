@@ -153,7 +153,7 @@ def _gateway_status(gateway: dict[str, Any]) -> dict[str, Any]:
 		failing.append("webhook_verify_token_missing")
 	return {
 		"name": gateway["name"],
-		"enabled": bool(gateway.get("enabled")),
+		"enabled": bool(gateway.get("is_enabled")),
 		"whatsapp_account": gateway.get("whatsapp_account"),
 		"app_secret_present": presence["app_secret"],
 		"app_secret_missing": not presence["app_secret"],
@@ -182,7 +182,7 @@ def get_setup_status(gateway_name: str | None = None) -> dict[str, Any]:
 	gateways_raw = frappe.get_all(
 		"Gateway",
 		filters=filters,
-		fields=["name", "enabled", "integration_settings"],
+		fields=["name", "is_enabled", "integration_settings"],
 		limit_page_length=100,
 	)
 	gateways = []
