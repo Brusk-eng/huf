@@ -218,6 +218,54 @@ class TestWhatsAppGatewayAdapter(unittest.TestCase):
 		self.assertEqual(delivery.provider_message_id, "wamid.t")
 		self.assertEqual(self.calls, [])
 
+	def test_fallback_template_uses_configured_language_in_direct_mode(self):
+		adapter = self.make({"gateway_name": "gw", "fallback_template": "reopen", "fallback_template_language": "pt_BR"})
+		with patch(BRIDGE) as b:
+			b.window_state.return_value = CLOSED
+			b.is_available.return_value = False
+			b.normalize_phone.side_effect = lambda x: x
+			delivery = adapter.send_reply(self.reply())
+		self.assertEqual(self.calls[0]["json"]["template"]["language"], {"code": "pt_BR"})
+		self.assertTrue(delivery.provider_response["fallback_template_sent"])
+
+	def test_fallback_template_language_defaults_to_en_us(self):
+		adapter = self.make({"gateway_name": "gw", "fallback_template": "reopen"})
+		with patch(BRIDGE) as b:
+			b.window_state.return_value = CLOSED
+			b.is_available.return_value = False
+			b.normalize_phone.side_effect = lambda x: x
+			adapter.send_reply(self.reply())
+		self.assertEqual(self.calls[0]["json"]["template"]["language"], {"code": "en_US"})
+
+	def test_fallback_template_language_read_from_templates_row_in_bridge_mode(self):
+		adapter = self.make(
+			{"gateway_name": "gw", "whatsapp_account": "acct", "fallback_template": "reopen", "fallback_template_language": "en_US"}
+		)
+		with patch(BRIDGE) as b:
+			b.window_state.return_value = CLOSED
+			b.is_available.return_value = True
+			b.template_language.return_value = "hi"
+			b.send_template.return_value = {"message_id": "wamid.t", "name": "WM-2"}
+			delivery = adapter.send_reply(self.reply())
+			b.template_language.assert_called_once_with("acct", "reopen", "en_US")
+			self.assertEqual(b.send_template.call_args.kwargs["language_code"], "hi")
+		self.assertTrue(delivery.provider_response["fallback_template_sent"])
+
+	def test_in_window_reply_is_not_flagged_as_fallback(self):
+		adapter = self.make({"gateway_name": "gw", "fallback_template": "reopen"})
+		with patch(BRIDGE) as b:
+			b.window_state.return_value = OPEN
+			b.is_available.return_value = False
+			b.normalize_phone.side_effect = lambda x: x
+			delivery = adapter.send_reply(self.reply())
+		self.assertNotIn("fallback_template_sent", delivery.provider_response)
+
+	def test_unknown_phone_number_ids_are_reported_by_parse(self):
+		parsed = self.adapter.parse_payload(_request(_payload([_msg("wamid.1")], phone_id="other")))
+		self.assertEqual(parsed.unknown_phone_ids, ("other",))
+		ok = self.adapter.parse_payload(_request(_payload([_msg("wamid.1")])))
+		self.assertEqual(ok.unknown_phone_ids, ())
+
 	def test_window_closed_without_fallback_raises(self):
 		adapter = self.make({"gateway_name": "gw"})
 		with patch(BRIDGE) as b:

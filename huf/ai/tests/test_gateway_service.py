@@ -1101,6 +1101,25 @@ class TestWhatsAppGatewayService(unittest.TestCase):
         mock_frappe.db.rollback.assert_not_called()  # handled, not re-raised -> no retry loop
 
     @patch("huf.ai.gateway_service.frappe")
+    def test_fallback_template_delivery_is_noted_but_stays_succeeded(self, mock_frappe):
+        event = self._event()
+        delivery = SimpleNamespace(provider_message_id="wamid.t", provider_response={"fallback_template_sent": True})
+        result, _ = self._process(mock_frappe, event, send_return=delivery)
+        assert result["status"] == "Succeeded"
+        final = [c.args[0] for c in event.db_set.call_args_list if isinstance(c.args[0], dict) and c.args[0].get("status") == "Succeeded"]
+        assert final[-1]["error_message"] == (
+            "Fallback template sent; agent reply suppressed (24h window closed)"
+        )
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_normal_delivery_has_no_error_note(self, mock_frappe):
+        event = self._event()
+        delivery = SimpleNamespace(provider_message_id="wamid.o", provider_response={})
+        self._process(mock_frappe, event, send_return=delivery)
+        final = [c.args[0] for c in event.db_set.call_args_list if isinstance(c.args[0], dict) and c.args[0].get("status") == "Succeeded"]
+        assert "error_message" not in final[-1]
+
+    @patch("huf.ai.gateway_service.frappe")
     def test_bridge_error_marks_event_failed(self, mock_frappe):
         from huf.ai.gateway_adapters.whatsapp_bridge import BridgeError
 

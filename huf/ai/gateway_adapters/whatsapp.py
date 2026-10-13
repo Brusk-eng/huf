@@ -48,6 +48,7 @@ class WhatsAppParsed:
 	statuses: tuple[dict, ...]
 	template_updates: tuple[dict, ...]
 	ignored: int
+	unknown_phone_ids: tuple[str, ...] = ()
 
 
 def _requests_post(url: str, *, json: dict, headers: dict, timeout: int) -> Any:
@@ -95,6 +96,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		self._gateway_name = str(ctx.get("gateway_name") or "").strip()
 		self._account = str(ctx.get("whatsapp_account") or "").strip()
 		self._fallback_template = str(ctx.get("fallback_template") or "").strip()
+		self._fallback_language = str(ctx.get("fallback_template_language") or "").strip() or DEFAULT_TEMPLATE_LANGUAGE
 
 	# ------------------------------------------------------------------ ingress
 	def verify_url(self, request: GatewayInboundRequest) -> str:
@@ -138,6 +140,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		statuses: list[dict] = []
 		template_updates: list[dict] = []
 		ignored = 0
+		unknown_phone_ids: list[str] = []
 
 		for entry in _as_list(payload.get("entry")):
 			for change in _as_list(entry.get("changes") if isinstance(entry, dict) else None):
@@ -157,6 +160,8 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 				phone_id = str(metadata.get("phone_number_id") or "")
 				# Fail closed: a change without metadata.phone_number_id is ignored.
 				if not phone_id or not self._phone_id_accepted(phone_id):
+					if phone_id and phone_id not in unknown_phone_ids:
+						unknown_phone_ids.append(phone_id)
 					ignored += max(len(items), 1)
 					continue
 				for status in _as_list(value.get("statuses")):
@@ -176,7 +181,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					else:
 						messages.append(event)
 
-		return WhatsAppParsed(tuple(messages), tuple(statuses), tuple(template_updates), ignored)
+		return WhatsAppParsed(tuple(messages), tuple(statuses), tuple(template_updates), ignored, tuple(unknown_phone_ids))
 
 	def normalize_inbound(self, request: GatewayInboundRequest) -> NormalizedGatewayEvent:
 		"""Return the first message event; ValueError only if nothing actionable exists."""
@@ -262,8 +267,17 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			state = bridge.window_state(self._gateway_name, reply.conversation_id)
 			if not state.get("open"):
 				if self._fallback_template:
-					return self.send_template(
-						reply.conversation_id, self._fallback_template, DEFAULT_TEMPLATE_LANGUAGE, [], trusted=True
+					language = self._fallback_language
+					if self._bridge_mode():
+						language = (
+							bridge.template_language(self._account, self._fallback_template, language) or language
+						)
+					delivery = self.send_template(
+						reply.conversation_id, self._fallback_template, language, [], trusted=True
+					)
+					return OutboundDelivery(
+						provider_message_id=delivery.provider_message_id,
+						provider_response={**dict(delivery.provider_response), "fallback_template_sent": True},
 					)
 				raise WhatsAppWindowClosed(
 					f"WhatsApp 24-hour customer-service window is closed for {reply.conversation_id}. "
@@ -303,7 +317,9 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		"""Send an approved template (always allowed, window-independent)."""
 		params = [str(p) for p in (body_params or [])]
 		if self._bridge_mode():
-			result = bridge.send_template(self._account, to, template_name, params, trusted=trusted)
+			result = bridge.send_template(
+				self._account, to, template_name, params, trusted=trusted, language_code=language_code
+			)
 			return _delivery_from_bridge(result)
 		template: dict[str, Any] = {"name": template_name, "language": {"code": language_code or DEFAULT_TEMPLATE_LANGUAGE}}
 		if params:

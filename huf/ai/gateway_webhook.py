@@ -191,6 +191,7 @@ def get_gateway_adapter(gateway):
 				"gateway_name": gateway.name,
 				"whatsapp_account": (gateway.get("whatsapp_account") or "").strip(),
 				"fallback_template": (gateway.get("fallback_template") or "").strip(),
+				"fallback_template_language": (gateway.get("fallback_template_language") or "").strip(),
 			},
 		)
 	return adapter_class(credentials)
@@ -244,6 +245,83 @@ def _ingest_rate_gate() -> None:
 _ingest_rate_gate = rate_limit(key="gateway_name", limit=100, seconds=60)(_ingest_rate_gate)
 
 
+def _transient_error_types() -> tuple[type, ...]:
+	types: list[type] = [frappe.QueryDeadlockError, frappe.QueryTimeoutError, ConnectionError, TimeoutError]
+	try:
+		import pymysql
+
+		types.append(pymysql.OperationalError)
+	except Exception:
+		pass
+	return tuple(types)
+
+
+# Errors worth a provider retry (Meta redelivers on non-2xx; ingest is deduped).
+# Everything else is deterministic: retrying the same payload cannot succeed.
+_TRANSIENT_ERRORS = _transient_error_types()
+_TEMPLATE_BAD_STATES = frozenset({"REJECTED", "PAUSED", "DISABLED"})
+_GATEWAY_ERROR_MAX = 500
+
+
+def _set_gateway_error(gateway_name: str, text: str, *, touch_event: bool = False) -> None:
+	"""Best-effort, redacted operator-visible note on the Gateway. Never raises."""
+	try:
+		from huf.ai.gateway_service import _redact_error_text
+
+		values: dict[str, Any] = {"last_error": _redact_error_text(str(text))[:_GATEWAY_ERROR_MAX]}
+		if touch_event:
+			values["last_event_at"] = frappe.utils.now_datetime()
+		frappe.db.set_value("Gateway", gateway_name, values, update_modified=False)
+	except Exception:
+		pass
+
+
+def _record_failed_status(gateway_name: str, status: dict) -> None:
+	"""A failed outbound delivery must be visible even when nothing is forwarded (direct mode)."""
+	try:
+		errors = status.get("errors") if isinstance(status.get("errors"), list) else []
+		first = errors[0] if errors and isinstance(errors[0], dict) else {}
+		code = first.get("code") or "unknown"
+		title = first.get("title") or first.get("message") or "no detail"
+		recipient = str(status.get("recipient_id") or "")
+		masked = f"...{recipient[-4:]}" if len(recipient) > 4 else "recipient"
+		text = f"WhatsApp delivery failed to {masked}: error {code} ({title})"
+		_set_gateway_error(gateway_name, text, touch_event=True)
+		frappe.log_error(title="WhatsApp delivery failed", message=text)
+	except Exception:
+		pass
+
+
+def _record_unknown_phone_ids(gateway_name: str, phone_ids) -> None:
+	for phone_id in phone_ids:
+		text = (
+			f"payload for phone number id {phone_id} ignored; "
+			"one Gateway per Meta app/number (create a separate Gateway for each number)"
+		)
+		try:
+			frappe.logger("huf").warning(f"WhatsApp gateway {gateway_name}: {text}")
+		except Exception:
+			pass
+		_set_gateway_error(gateway_name, text, touch_event=True)
+
+
+def _record_template_update(update: dict) -> None:
+	"""A rejected/paused/disabled template that a gateway relies on as its fallback."""
+	try:
+		state = str(update.get("event") or update.get("status") or "").upper()
+		name = str(update.get("message_template_name") or update.get("name") or "").strip()
+		if state not in _TEMPLATE_BAD_STATES or not name:
+			return
+		reason = str(update.get("reason") or "").strip()
+		text = f"Fallback template {name} is {state}" + (f" ({reason})" if reason and reason != "NONE" else "")
+		for row in frappe.get_all(
+			"Gateway", filters={"provider": "WhatsApp", "fallback_template": name}, fields=["name"]
+		):
+			_set_gateway_error(row["name"] if isinstance(row, dict) else row.name, text)
+	except Exception:
+		pass
+
+
 def _supports_batch_parse(adapter) -> bool:
 	# Class-level lookup so duck-typed/mock adapters do not accidentally qualify.
 	return callable(getattr(type(adapter), "parse_payload", None))
@@ -265,7 +343,8 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 
 	ingested = duplicates = 0
 	results: list[dict] = []
-	first_error = None
+	first_transient = None
+	failed = 0
 	account_name = None
 	for event in parsed.messages:
 		try:
@@ -276,9 +355,12 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 				verified_sender=True,
 				raw_payload=dict(event.raw_payload),
 			)
-		except Exception as exc:  # keep fanning out; re-raised below so the provider retries (deduped)
+		except Exception as exc:
 			frappe.log_error(frappe.get_traceback(), "WhatsApp gateway ingest failed")
-			first_error = first_error or exc
+			if isinstance(exc, _TRANSIENT_ERRORS):
+				first_transient = first_transient or exc  # re-raised below so Meta retries (deduped)
+			else:
+				failed += 1  # deterministic: a retry cannot succeed, so still ack 200
 			continue
 		results.append(result)
 		if result.get("duplicate"):
@@ -294,10 +376,22 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 					resolved = bridge.resolve_account(None)
 					account_name = (resolved or {}).get("name") or ""
 			message = (event.raw_payload or {}).get("message")
-			if account_name and isinstance(message, dict):
+			payload_phone_id = str(((event.raw_payload or {}).get("metadata") or {}).get("phone_number_id") or "")
+			if (
+				account_name
+				and isinstance(message, dict)
+				and bridge.account_matches_phone_id(account_name, payload_phone_id)
+			):
 				bridge.record_incoming(account_name, message, getattr(event, "display_name", "") or None)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "WhatsApp record_incoming failed")
+
+	_record_unknown_phone_ids(gateway.name, getattr(parsed, "unknown_phone_ids", ()) or ())
+	for status in parsed.statuses:
+		if str(status.get("status") or "").lower() == "failed":
+			_record_failed_status(gateway.name, status)
+	for update in parsed.template_updates:
+		_record_template_update(update)
 
 	forwarded = 0
 	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
@@ -309,8 +403,8 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		except Exception:
 			pass  # best effort, never fail the ack
 
-	if first_error is not None:
-		raise first_error
+	if first_transient is not None:
+		raise first_transient
 	return {
 		"success": True,
 		"messages": len(parsed.messages),
@@ -320,6 +414,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		"template_updates": len(parsed.template_updates),
 		"forwarded": forwarded,
 		"ignored": parsed.ignored,
+		"failed": failed,
 		"results": results,
 	}
 

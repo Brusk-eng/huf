@@ -193,6 +193,9 @@ def _whatsapp_send_errors(provider: str | None) -> tuple[type[BaseException], ..
     return (WhatsAppWindowClosed, BridgeError)
 
 
+WHATSAPP_FALLBACK_NOTE = "Fallback template sent; agent reply suppressed (24h window closed)"
+
+
 def _whatsapp_error_text(exc: BaseException) -> str:
     """Operator-readable text for a WhatsAppWindowClosed / BridgeError."""
     payload = getattr(exc, "payload", None)
@@ -809,6 +812,7 @@ def process_gateway_event(event_name: str) -> dict:
                     )
             prompt = f"{attachment_note}\n{event.message_text}" if attachment_note else event.message_text
 
+            fallback_note = ""
             result = run_agent_sync(
                 agent_name=event.target_agent,
                 prompt=prompt,
@@ -823,6 +827,8 @@ def process_gateway_event(event_name: str) -> dict:
                 _throttle_outbound_send(gateway.name, _outbound_rate_cap(gateway.provider))
                 delivery = send_gateway_reply(gateway, event, str(response))
                 provider_message_id = delivery.provider_message_id
+                if (getattr(delivery, "provider_response", None) or {}).get("fallback_template_sent"):
+                    fallback_note = WHATSAPP_FALLBACK_NOTE
             except _whatsapp_send_errors(gateway.provider) as exc:
                 # A7: a closed 24h window / bridge failure is an operator-fixable
                 # condition, not a transient one -- fail the event cleanly, no retry loop.
@@ -847,7 +853,10 @@ def process_gateway_event(event_name: str) -> dict:
                 else:
                     raise
 
-            event.db_set({"agent_run": result.get("agent_run_id"), "status": "Succeeded"})
+            succeeded = {"agent_run": result.get("agent_run_id"), "status": "Succeeded"}
+            if fallback_note:
+                succeeded["error_message"] = fallback_note
+            event.db_set(succeeded)
             return {
                 "event_name": event.name,
                 "status": "Succeeded",

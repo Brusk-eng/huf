@@ -41,7 +41,7 @@ def _payload(messages=None, statuses=None):
 
 
 class TestWhatsAppIngress(unittest.TestCase):
-	def _call(self, payload=None, *, secret="s3cret", method="POST", query=None, body=None, ingest=None, record=None, forward=None):
+	def _call(self, payload=None, *, secret="s3cret", method="POST", query=None, body=None, ingest=None, record=None, forward=None, account_matches=True, gateway_rows=()):
 		adapter = WhatsAppGatewayAdapter(CREDS, gateway_context={"gateway_name": "WA"})
 		raw = body if body is not None else json.dumps(payload or {}).encode()
 		sig = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
@@ -49,9 +49,11 @@ class TestWhatsAppIngress(unittest.TestCase):
 		response = SimpleNamespace()
 		self.mock_frappe = MagicMock()
 		self.mock_frappe.PermissionError = frappe.PermissionError
+		self.mock_frappe.QueryDeadlockError = frappe.QueryDeadlockError
 		self.mock_frappe.request = SimpleNamespace(args={"gateway_name": "WA"})
 		self.mock_frappe.local = SimpleNamespace(response=response)
 		self.mock_frappe.get_doc.return_value = SimpleNamespace(name="WA", provider="WhatsApp", is_enabled=1, whatsapp_account="")
+		self.mock_frappe.get_all.return_value = list(gateway_rows)
 		self.gate = MagicMock()
 		self.ingest = ingest or MagicMock(
 			side_effect=lambda gw, eid, ctx, **kw: {"event_name": f"GE-{eid}", "status": "Queued"}
@@ -65,6 +67,8 @@ class TestWhatsAppIngress(unittest.TestCase):
 		), patch("huf.ai.gateway_service.ingest_gateway_event", self.ingest), patch(
 			f"{BRIDGE}.forward_status", self.forward
 		), patch(f"{BRIDGE}.record_incoming", self.record), patch(
+			f"{BRIDGE}.account_matches_phone_id", return_value=account_matches
+		) as self.matches, patch(
 			f"{BRIDGE}.resolve_account", return_value={"name": "Acct"}
 		), patch("huf.ai.gateway_webhook._text_response") as self.text:
 			self.result = gateway_webhook.handle_gateway_webhook()
@@ -134,6 +138,92 @@ class TestWhatsAppIngress(unittest.TestCase):
 		query = {"hub.mode": "subscribe", "hub.verify_token": "verify-value", "hub.challenge": "abc"}
 		self.assertIsNone(self._call(method="GET", query=query, body=b""))
 		self.text.assert_called_once_with("abc")
+
+	def test_mirror_skipped_when_account_phone_differs_from_payload(self):
+		result = self._call(_payload([_msg("wamid.1")]), account_matches=False)
+		self.assertEqual(result["ingested"], 1)
+		self.record.assert_not_called()
+		self.matches.assert_called_once_with("Acct", "phone-123")
+
+	def test_deterministic_ingest_error_is_logged_and_acked(self):
+		boom = MagicMock(side_effect=[frappe.ValidationError("bad"), {"event_name": "GE-2", "status": "Queued"}])
+		result = self._call(_payload([_msg("wamid.1"), _msg("wamid.2")]), ingest=boom)
+		self.assertTrue(result["success"])
+		self.assertEqual((result["ingested"], result["failed"]), (1, 1))
+		self.mock_frappe.log_error.assert_called()
+
+	def test_transient_ingest_errors_are_reraised_after_fanout(self):
+		import pymysql
+
+		for exc in (frappe.QueryDeadlockError("d"), frappe.QueryTimeoutError("t"), pymysql.OperationalError(2013, "lost"), ConnectionError("c")):
+			ingest = MagicMock(side_effect=[exc, {"event_name": "GE-2", "status": "Queued"}])
+			with self.assertRaises(type(exc)):
+				self._call(_payload([_msg("wamid.1"), _msg("wamid.2")]), ingest=ingest)
+			self.assertEqual(ingest.call_count, 2)  # the rest of the batch still ingested
+
+	def _failed_status(self):
+		return {
+			"id": "wamid.out",
+			"status": "failed",
+			"recipient_id": "919876543210",
+			"errors": [{"code": 131047, "title": "Re-engagement message Bearer abcdefghijkl"}],
+		}
+
+	def test_failed_status_sets_gateway_last_error_even_when_nothing_is_forwarded(self):
+		result = self._call(_payload(statuses=[self._failed_status()]), forward=MagicMock(return_value=False))
+		self.assertTrue(result["success"])
+		self.assertEqual(result["forwarded"], 0)
+		set_value = self.mock_frappe.db.set_value
+		set_value.assert_called_once()
+		args = set_value.call_args
+		self.assertEqual(args.args[:2], ("Gateway", "WA"))
+		values = args.args[2]
+		self.assertIn("131047", values["last_error"])
+		self.assertIn("3210", values["last_error"])
+		self.assertNotIn("919876543210", values["last_error"])
+		self.assertNotIn("abcdefghijkl", values["last_error"])  # redacted
+		self.assertIn("last_event_at", values)
+		self.mock_frappe.log_error.assert_called_once()
+
+	def test_failed_status_recording_never_breaks_the_ack(self):
+		with patch("huf.ai.gateway_webhook._set_gateway_error", side_effect=RuntimeError("db")):
+			result = self._call(_payload(statuses=[self._failed_status()]))
+		self.assertTrue(result["success"])
+
+	def test_non_failed_status_leaves_last_error_alone(self):
+		self._call(_payload(statuses=[{"id": "w", "status": "delivered"}]))
+		self.mock_frappe.db.set_value.assert_not_called()
+
+	def test_unknown_phone_number_id_is_recorded_not_silently_dropped(self):
+		payload = _payload([_msg("wamid.1")])
+		payload["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"] = "other-999"
+		result = self._call(payload)
+		self.assertTrue(result["success"])  # still acked
+		self.ingest.assert_not_called()
+		values = self.mock_frappe.db.set_value.call_args.args[2]
+		self.assertIn("payload for phone number id other-999 ignored; one Gateway per Meta app/number", values["last_error"])
+
+	@staticmethod
+	def _template_payload(event, name="reopen"):
+		update = {"event": event, "message_template_name": name, "reason": "INVALID_FORMAT"}
+		return {"entry": [{"changes": [{"field": "message_template_status_update", "value": update}]}]}
+
+	def test_template_rejection_marks_gateways_using_it_as_fallback(self):
+		for state in ("REJECTED", "PAUSED", "DISABLED"):
+			result = self._call(self._template_payload(state), gateway_rows=[{"name": "WA"}, {"name": "WA2"}])
+			self.assertTrue(result["success"])
+			self.assertEqual(
+				self.mock_frappe.get_all.call_args.kwargs["filters"], {"provider": "WhatsApp", "fallback_template": "reopen"}
+			)
+			calls = self.mock_frappe.db.set_value.call_args_list
+			self.assertEqual([c.args[1] for c in calls], ["WA", "WA2"])
+			self.assertIn(f"reopen is {state}", calls[0].args[2]["last_error"])
+
+	def test_template_approval_or_unused_template_changes_nothing(self):
+		self._call(self._template_payload("APPROVED"), gateway_rows=[{"name": "WA"}])
+		self.mock_frappe.db.set_value.assert_not_called()
+		self._call(self._template_payload("REJECTED", "other"), gateway_rows=[])  # no gateway uses it
+		self.mock_frappe.db.set_value.assert_not_called()
 
 	def test_malformed_signed_json_is_400(self):
 		result = self._call(body=b"not json")
