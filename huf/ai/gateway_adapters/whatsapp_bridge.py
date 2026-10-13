@@ -260,10 +260,13 @@ def send_template(
 	template_name: str,
 	body_params: list | None = None,
 	header_params: list | None = None,
+	trusted: bool = False,
 ) -> dict[str, Any]:
 	"""Send an approved template via an Outgoing ``WhatsApp Message`` (use_template=1).
 
-	Permission-checked (no ignore_permissions). Raises :class:`BridgeError`.
+	Permission-checked unless ``trusted=True``, which is only for the
+	gateway-internal reply path (the Gateway's service user does not hold
+	WhatsApp Message create rights). Raises :class:`BridgeError`.
 	"""
 	_account_or_error(account_name)
 	params = [str(p) for p in (body_params or [])]
@@ -283,7 +286,7 @@ def send_template(
 		values["template_header_parameters"] = ",".join(str(p) for p in header_params)
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert()
+		doc.insert(ignore_permissions=bool(trusted))
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:

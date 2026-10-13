@@ -385,6 +385,18 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 		self.assertEqual(body["template"]["name"], "fs_send_tpl")
 		self.assertIn({"type": "text", "text": "Ann"}, body["template"]["components"][0]["parameters"])
 
+	def test_11b_trusted_template_send_skips_user_permission_check(self):
+		created = self._make_template("fs_trusted_tpl")
+		frappe.db.set_value("WhatsApp Templates", created["name"], "status", "APPROVED")
+		frappe.set_user(EXEC_USER)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				bridge.send_template(self.account.name, SENDER, "fs_trusted_tpl")
+			result = bridge.send_template(self.account.name, SENDER, "fs_trusted_tpl", trusted=True)
+		finally:
+			frappe.set_user("Administrator")
+		self.assertTrue(result["success"], result)
+
 	def test_12_send_text_message_window_policy(self):
 		before = self._outgoing_count()
 		closed = mgmt.send_text_message(gateway_name=self.gateway.name, to=SENDER, text="hello?")

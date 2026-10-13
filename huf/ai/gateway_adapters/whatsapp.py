@@ -262,7 +262,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			if not state.get("open"):
 				if self._fallback_template:
 					return self.send_template(
-						reply.conversation_id, self._fallback_template, DEFAULT_TEMPLATE_LANGUAGE, []
+						reply.conversation_id, self._fallback_template, DEFAULT_TEMPLATE_LANGUAGE, [], trusted=True
 					)
 				raise WhatsAppWindowClosed(
 					f"WhatsApp 24-hour customer-service window is closed for {reply.conversation_id}. "
@@ -297,11 +297,12 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		template_name: str,
 		language_code: str = DEFAULT_TEMPLATE_LANGUAGE,
 		body_params: list | tuple | None = None,
+		trusted: bool = False,
 	) -> OutboundDelivery:
 		"""Send an approved template (always allowed, window-independent)."""
 		params = [str(p) for p in (body_params or [])]
 		if self._bridge_mode():
-			result = bridge.send_template(self._account, to, template_name, params)
+			result = bridge.send_template(self._account, to, template_name, params, trusted=trusted)
 			return _delivery_from_bridge(result)
 		template: dict[str, Any] = {"name": template_name, "language": {"code": language_code or DEFAULT_TEMPLATE_LANGUAGE}}
 		if params:
