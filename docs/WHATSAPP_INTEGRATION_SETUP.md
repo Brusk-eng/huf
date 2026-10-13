@@ -81,7 +81,7 @@ Then create a **WhatsApp Account** in Frappe Desk. The code reads these fields:
 | `url` | Graph base URL (defaults to `https://graph.facebook.com`) |
 | `version` | Graph API version (defaults to `v21.0`) |
 | `is_default_outgoing` | Selected when no account is named |
-| `status` | Account must not be inactive when resolved as the first active account |
+| `status` | Used only by the fallback that picks the first account with status `Active` |
 
 Mark one account as **default outgoing**. If no account is marked default, the first account with status `Active` is used. If neither exists, the bridge returns `no_account`.
 
@@ -199,7 +199,7 @@ Template name rules: lowercase letters, digits and underscores only (`^[a-z0-9_]
 
 **Agent tool actions** (`huf/ai/tools/whatsapp.py`): `list_templates` (read-only) and `create_template` (gated, see section 6).
 
-**Approval lifecycle**: the code does not enforce a state machine. A template is created in Meta by `frappe_whatsapp`. Its `status` field holds the value Meta reports, which Huf copies on `sync_templates`. The status values Huf expects are `PENDING`, `APPROVED` and `REJECTED`, and the agent tool filters on them. Only `APPROVED` templates can be sent successfully. Run a sync after Meta reviews a template, then check its status before using it as a fallback.
+**Approval lifecycle**: the code does not enforce a state machine. A template is created in Meta by `frappe_whatsapp`. Its `status` field holds the value Meta reports, which Huf copies on `sync_templates`. The agent tool's `status` filter uses the values `PENDING`, `APPROVED` and `REJECTED`. Huf does not block sends of a template based on its status. Run a sync after Meta reviews a template, and check its status before relying on it as a fallback.
 
 ---
 
@@ -269,7 +269,8 @@ Quoted replies do not create a new conversation. The adapter sets `thread_id` to
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
-| Meta shows "verification failed" when saving the callback | The GET token does not match `webhook_verify_token`, or the gateway name in the URL is wrong or the gateway is disabled | Make the token identical in both places. Check `gateway_name` and `is_enabled`. A mismatch returns HTTP 403 `Webhook verification failed` |
+| Meta shows "verification failed" when saving the callback | The GET token does not match `webhook_verify_token`, or the `gateway_name` in the URL is unknown | Make the token identical in both places. A token mismatch returns HTTP 403 `Webhook verification failed`. An unknown gateway returns 404 |
+| Callback returns 403 `Gateway is disabled` (any method) | The Gateway is not enabled | Enable the Gateway |
 | Every POST delivery returns 401 `Provider verification failed` | `app_secret` is missing, the `X-Hub-Signature-256` header is absent, or the signature does not match | Run `get_setup_status`. If `app_secret_missing` is listed, add the App Secret. Confirm the callback is Huf's URL, not `frappe_whatsapp`'s |
 | Reply shows `WhatsApp 24-hour customer-service window is closed` (Gateway Event `Failed`) | The sender has not messaged in the last 24 hours and there is no `fallback_template` | Set a `fallback_template` on the Gateway, or ask the customer to message again. The management `send_text_message` also returns `window_closed` |
 | `bridge_unavailable` from management or tool calls | `frappe_whatsapp` is not installed, or one of its three DocTypes is missing | Install the app (section 2). Direct replies still work without it |
@@ -277,7 +278,7 @@ Quoted replies do not create a new conversation. The adapter sets `thread_id` to
 | `app_secret_missing` in `failing_checks` | The `app_secret` credential row is empty | Add the Meta App Secret to the Integration Settings |
 | Duplicate events | Meta redelivers a message. Each delivery has the same message id | Expected. The second delivery is recorded as a duplicate and does not start another run. Ingest errors are re-raised so Meta retries; redelivery is then deduplicated |
 | Messages for another phone number are ignored | The payload's `metadata.phone_number_id` does not match the gateway's `phone_number_id` | Check that the Integration Settings and the webhook subscription belong to the same WhatsApp number |
-| Status updates do not appear in `frappe_whatsapp` | Bridge mode is off, or the message id is not in `WhatsApp Message` | Status is forwarded only for known messages. Status-only deliveries are acknowledged with 200 and do not start runs |
+| Message status updates do not appear in `frappe_whatsapp` | `frappe_whatsapp` is not installed, or no `WhatsApp Message` row exists for that message id | Message statuses are forwarded only when the message id exists in `WhatsApp Message`. Status-only deliveries are acknowledged with 200 and do not start runs |
 
 ---
 
