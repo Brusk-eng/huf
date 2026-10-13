@@ -62,29 +62,15 @@ export interface WebhookTriggerConfig {
 
 export interface ScheduleTriggerConfig {
   type: 'schedule';
-  /**
-   * The schedule itself lives in the backend (set_flow_trigger / get_flow_trigger), edited in
-   * FlowTriggerPanel. The fields below are legacy display-only values the runtime ignores.
-   * @deprecated
-   */
-  intervalType?: ScheduleIntervalType;
-  /** @deprecated display-only, ignored by the runtime */
-  interval?: number;
-  /** @deprecated display-only, ignored by the runtime */
-  cronExpression?: string;
-  /** @deprecated display-only, ignored by the runtime */
-  timezone?: string;
-  /** Set by FlowTriggerPanel when the server holds this flow's trigger; makes the node count as configured. */
-  trigger_bound?: boolean;
+  /** 5-field cron; mirrors the trigger saved via set_flow_trigger (FlowTriggerPanel). */
+  cron?: string;
 }
 
 export interface DocEventTriggerConfig {
   type: 'doc-event';
-  /** Doc-event settings live in the backend (set_flow_trigger); these are display-only legacy values. */
+  /** Mirror the trigger saved via set_flow_trigger (FlowTriggerPanel). */
   doctype?: string;
-  event?: DocEventType;
-  /** Set by FlowTriggerPanel when the server holds this flow's trigger; makes the node count as configured. */
-  trigger_bound?: boolean;
+  event?: 'after_insert' | 'on_update' | 'on_submit' | 'on_cancel' | 'on_trash';
 }
 
 export interface AppTriggerConfig {

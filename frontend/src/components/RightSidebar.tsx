@@ -25,6 +25,8 @@ import {
 import { useFlowContext } from '../contexts/FlowContext';
 import { NodeSelectionModal } from './modals/NodeSelectionModal';
 import { FlowTriggerPanel } from './FlowTriggerPanel';
+import { syncedTriggerConfig } from '../lib/flowTrigger';
+import type { FlowNodeData } from '../types/flow.types';
 import { getAgents, getDocTypes, getRoles } from '../services/agentApi';
 import { getToolFunctions, getToolFunction, getFlowTools, type FlowTool } from '../services/toolApi';
 import { VariablePicker } from './ui/VariablePicker';
@@ -293,15 +295,13 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
           hasUnsavedChanges={hasUnsavedChanges}
           docTypes={docTypes}
           loadingDocTypes={loadingDocTypes}
-          onBoundChange={(bound) => {
-            // Stamp (or clear) the marker the serializer reads, only when it actually changes.
-            if (!selectedNodeId || !selectedNode || (config.trigger_bound === true) === bound) return;
+          onSynced={(mirror) => {
+            // Keep the node's real config (cron / doctype+event) equal to the saved trigger.
+            if (!selectedNodeId || !selectedNode) return;
+            const next = syncedTriggerConfig(config.type as 'schedule' | 'doc-event', config as unknown as Record<string, unknown>, mirror);
+            if (!next) return;
             updateNode(selectedNodeId, {
-              data: {
-                ...selectedNode.data,
-                configured: bound,
-                triggerConfig: { ...config, trigger_bound: bound }
-              }
+              data: { ...selectedNode.data, configured: mirror != null, triggerConfig: next as FlowNodeData['triggerConfig'] }
             });
           }}
         />

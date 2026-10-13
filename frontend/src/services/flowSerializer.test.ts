@@ -143,14 +143,28 @@ describe('flowSerializer', () => {
             configured: true,
             triggerConfig: {
               type: 'schedule',
-              intervalType: 'hours',
-              interval: 1,
+              cron: '0 * * * *',
             },
           },
         },
       ]);
       const serialized = serializeFlow(flow);
       expect(serialized.nodes[0].type).toBe('trigger.schedule');
+    });
+
+    it('emits only schema-allowed config keys for schedule and doc-event nodes', () => {
+      const mk = (id: string, triggerConfig: Record<string, unknown>) => ({
+        id, type: 'trigger', position: { x: 0, y: 0 },
+        data: { nodeType: 'trigger', label: id, icon: 'Clock', configured: true, triggerConfig },
+      });
+      const flow = createTestFlow([
+        mk('s', { type: 'schedule', cron: '0 * * * *', intervalType: 'hours', interval: 1, timezone: 'UTC' }),
+        mk('d', { type: 'doc-event', doctype: 'ToDo', event: 'on_update', trigger_bound: true }),
+      ] as never);
+      const out = serializeFlow(flow);
+      // graph_ir.schema.json: schedule = {cron}, doc-event = {doctype, event}, additionalProperties false
+      expect(out.nodes.find((n) => n.id === 's')!.config).toEqual({ cron: '0 * * * *' });
+      expect(out.nodes.find((n) => n.id === 'd')!.config).toEqual({ doctype: 'ToDo', event: 'on_update' });
     });
 
     it('maps trigger with doc-event type to trigger.doc-event', () => {
@@ -167,7 +181,7 @@ describe('flowSerializer', () => {
             triggerConfig: {
               type: 'doc-event',
               doctype: 'Task',
-              event: 'save',
+              event: 'on_update',
             },
           },
         },
@@ -356,8 +370,7 @@ describe('flowSerializer', () => {
             configured: true,
             triggerConfig: {
               type: 'schedule',
-              intervalType: 'days',
-              interval: 1,
+              cron: '0 0 * * *',
             },
           },
         },
@@ -445,9 +458,7 @@ describe('flowSerializer', () => {
           configured: true,
           triggerConfig: {
             type: 'schedule',
-            intervalType: 'hours',
-            interval: 2,
-            timezone: 'UTC',
+            cron: '0 */2 * * *',
           },
         },
       };
@@ -456,9 +467,7 @@ describe('flowSerializer', () => {
       const serialized = serializeFlow(flow);
 
       expect(serialized.nodes[0].config).not.toHaveProperty('type');
-      expect(serialized.nodes[0].config).toHaveProperty('intervalType', 'hours');
-      expect(serialized.nodes[0].config).toHaveProperty('interval', 2);
-      expect(serialized.nodes[0].config).toHaveProperty('timezone', 'UTC');
+      expect(serialized.nodes[0].config).toEqual({ cron: '0 */2 * * *' });
     });
   });
 
@@ -745,19 +754,6 @@ describe('flowSerializer', () => {
       ]);
       const flow = deserializeFlow('f', 'F', 'Draft', graph);
       expect(flow.nodes.map((n) => n.data.configured)).toEqual([false, true, true, true]);
-    });
-
-    it('counts a server-bound schedule / doc-event trigger as configured via the trigger_bound marker', () => {
-      const graph = makeBackendGraph([
-        { id: 's', type: 'trigger.schedule', config: {}, next: 'd' },
-        { id: 'e', type: 'trigger.doc-event', config: { trigger_bound: true }, next: 'd' },
-        { id: 'w', type: 'trigger.webhook', config: { trigger_bound: true }, next: 'd' },
-        { id: 'b', type: 'trigger.schedule', config: { trigger_bound: true }, next: 'd' },
-        { id: 'd', type: 'output', config: {}, next: null },
-      ]);
-      const flow = deserializeFlow('f', 'F', 'Draft', graph);
-      // unmarked schedule, marked doc-event, webhook ignores the marker (needs method), marked schedule, output
-      expect(flow.nodes.map((n) => n.data.configured)).toEqual([false, true, false, true, true]);
     });
   });
 });

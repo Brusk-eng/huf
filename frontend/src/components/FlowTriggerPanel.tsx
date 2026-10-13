@@ -10,22 +10,20 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { clearFlowTrigger, getFlowTrigger, setFlowTrigger } from '../services/flowApi';
 import {
   DOC_EVENTS,
-  SCHEDULE_INTERVALS,
   DEFAULT_DOC_EVENT_FORM,
   DEFAULT_SCHEDULE_FORM,
   describeTriggerState,
   docEventFormToArgs,
   scheduleFormToArgs,
   summaryToDocEventForm,
+  summaryToNodeConfig,
   summaryToScheduleForm,
   triggerDisabledReason,
   triggerErrorInfo,
   type DocEventForm,
   type FlowDocEvent,
-  isTriggerBoundFor,
   type FlowTriggerSummary,
   type ScheduleForm,
-  type ScheduleInterval,
   type TriggerErrorInfo,
 } from '../lib/flowTrigger';
 
@@ -35,8 +33,8 @@ interface FlowTriggerPanelProps {
   hasUnsavedChanges: boolean;
   docTypes: Array<{ value: string; label: string }>;
   loadingDocTypes: boolean;
-  /** Reports whether the server holds a trigger of this kind, after a hydrate / save / clear succeeds. */
-  onBoundChange?: (bound: boolean) => void;
+  /** Canonical node config (cron / doctype+event) after a hydrate / save / clear succeeds; null when there is none. */
+  onSynced?: (config: ReturnType<typeof summaryToNodeConfig>) => void;
 }
 
 /**
@@ -44,7 +42,7 @@ interface FlowTriggerPanelProps {
  * flow's converted Procedure), not in the node config, so it hydrates from get_flow_trigger
  * and writes through set_flow_trigger.
  */
-export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, loadingDocTypes, onBoundChange }: FlowTriggerPanelProps) {
+export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, loadingDocTypes, onSynced }: FlowTriggerPanelProps) {
   const navigate = useNavigate();
   const [summary, setSummary] = useState<FlowTriggerSummary | null>(null);
   const [loading, setLoading] = useState(false);
@@ -54,8 +52,8 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
   const [docForm, setDocForm] = useState<DocEventForm>(DEFAULT_DOC_EVENT_FORM);
 
   // Latest callback without refetching when its identity changes (it closes over the selected node).
-  const boundRef = useRef(onBoundChange);
-  boundRef.current = onBoundChange;
+  const syncedRef = useRef(onSynced);
+  syncedRef.current = onSynced;
 
   const hydrate = useCallback((s: FlowTriggerSummary | null) => {
     setSummary(s);
@@ -75,7 +73,7 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
       .then((s) => {
         if (cancelled) return;
         hydrate(s);
-        boundRef.current?.(isTriggerBoundFor(kind, s));
+        syncedRef.current?.(summaryToNodeConfig(kind, s));
       })
       .catch((e) => !cancelled && setError(triggerErrorInfo(e)))
       .finally(() => !cancelled && setLoading(false));
@@ -102,7 +100,7 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
     try {
       const next = await setFlowTrigger(built.args);
       hydrate(next);
-      boundRef.current?.(isTriggerBoundFor(kind, next));
+      syncedRef.current?.(summaryToNodeConfig(kind, next));
       toast.success(next.enabled && next.automation_status === 'Active' ? 'Trigger saved' : 'Trigger saved, activation pending');
     } catch (e) {
       setError(triggerErrorInfo(e));
@@ -118,7 +116,7 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
     try {
       await clearFlowTrigger(flowId);
       hydrate(null);
-      boundRef.current?.(false);
+      syncedRef.current?.(null);
       toast.success('Trigger removed');
     } catch (e) {
       setError(triggerErrorInfo(e));
@@ -137,66 +135,15 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
       {kind === 'schedule' ? (
         <>
           <div>
-            <Label htmlFor="schedule-mode">Schedule type</Label>
-            <Select
-              value={scheduleForm.mode}
+            <Label htmlFor="cron">Cron expression</Label>
+            <Input
+              id="cron"
               disabled={formDisabled}
-              onValueChange={(v) => setScheduleForm({ ...scheduleForm, mode: v as ScheduleForm['mode'] })}
-            >
-              <SelectTrigger id="schedule-mode">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="interval">Interval</SelectItem>
-                <SelectItem value="cron">Cron expression</SelectItem>
-              </SelectContent>
-            </Select>
+              value={scheduleForm.cron}
+              onChange={(e) => setScheduleForm({ cron: e.target.value })}
+              placeholder="0 */6 * * *"
+            />
           </div>
-          {scheduleForm.mode === 'interval' ? (
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <Label htmlFor="interval-count">Every</Label>
-                <Input
-                  id="interval-count"
-                  type="number"
-                  min="1"
-                  disabled={formDisabled}
-                  value={scheduleForm.intervalCount}
-                  onChange={(e) => setScheduleForm({ ...scheduleForm, intervalCount: parseInt(e.target.value) || 0 })}
-                />
-              </div>
-              <div>
-                <Label htmlFor="interval-unit">Period</Label>
-                <Select
-                  value={scheduleForm.interval}
-                  disabled={formDisabled}
-                  onValueChange={(v) => setScheduleForm({ ...scheduleForm, interval: v as ScheduleInterval })}
-                >
-                  <SelectTrigger id="interval-unit">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {SCHEDULE_INTERVALS.map((i) => (
-                      <SelectItem key={i} value={i}>
-                        {i}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-          ) : (
-            <div>
-              <Label htmlFor="cron">Cron expression</Label>
-              <Input
-                id="cron"
-                disabled={formDisabled}
-                value={scheduleForm.cron}
-                onChange={(e) => setScheduleForm({ ...scheduleForm, cron: e.target.value })}
-                placeholder="0 */6 * * *"
-              />
-            </div>
-          )}
         </>
       ) : (
         <>

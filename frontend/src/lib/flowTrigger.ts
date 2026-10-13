@@ -7,35 +7,15 @@
  * Frappe doc-event method names) rather than the old node-config intervalType/cron fields.
  */
 
-export const SCHEDULE_INTERVALS = ['Hourly', 'Daily', 'Weekly', 'Monthly', 'Yearly'] as const;
-export type ScheduleInterval = (typeof SCHEDULE_INTERVALS)[number];
-
-/** Mirrors huf.ai.automation_hooks.SUPPORTED_DOC_EVENTS. */
-export const DOC_EVENTS = [
-  'before_insert',
-  'after_insert',
-  'validate',
-  'before_save',
-  'after_save',
-  'before_submit',
-  'on_submit',
-  'on_update',
-  'on_cancel',
-  'before_rename',
-  'after_rename',
-  'on_trash',
-  'after_delete',
-] as const;
+/**
+ * Doc events a Flow trigger can use: the intersection of the backend's
+ * huf.ai.automation_hooks.SUPPORTED_DOC_EVENTS and the Flow graph IR enum
+ * (graph_ir.schema.json TriggerDocEventNode.config.event). The backend also accepts
+ * before_insert, validate, before_save, after_save, before_submit, before_rename,
+ * after_rename and after_delete, but the node config cannot hold them, so the panel does not offer them.
+ */
+export const DOC_EVENTS = ['after_insert', 'on_update', 'on_submit', 'on_cancel', 'on_trash'] as const;
 export type FlowDocEvent = (typeof DOC_EVENTS)[number];
-
-/** Node-config key marking that the server holds this node's trigger (see FlowTriggerPanel / flowSerializer). */
-export const TRIGGER_BOUND_KEY = 'trigger_bound';
-
-/** True when the server trigger state is a trigger of this node's kind (the node then counts as configured). */
-export function isTriggerBoundFor(kind: 'schedule' | 'doc-event', s: FlowTriggerSummary | null): boolean {
-  if (!s) return false;
-  return s.trigger_type === (kind === 'schedule' ? 'Schedule' : 'Doc Event');
-}
 
 /** Shape returned by get_flow_trigger / set_flow_trigger (null when the flow has no trigger). */
 export interface FlowTriggerSummary {
@@ -52,7 +32,7 @@ export interface FlowTriggerSummary {
   activation_required?: string;
   schedule_type?: 'Cron' | 'Interval' | null;
   cron?: string | null;
-  interval?: ScheduleInterval | null;
+  interval?: string | null;
   interval_count?: number | null;
   reference_doctype?: string | null;
   doc_event?: string | null;
@@ -61,7 +41,6 @@ export interface FlowTriggerSummary {
 
 export type SetFlowTriggerArgs =
   | { flow_id: string; trigger_type: 'schedule'; cron: string }
-  | { flow_id: string; trigger_type: 'schedule'; interval: ScheduleInterval; interval_count: number }
   | {
       flow_id: string;
       trigger_type: 'doc_event';
@@ -70,10 +49,8 @@ export type SetFlowTriggerArgs =
       condition?: string;
     };
 
+/** Cron only: an Hourly..Yearly + count interval has no exact 5-field cron and the node schema only holds cron. */
 export interface ScheduleForm {
-  mode: 'interval' | 'cron';
-  interval: ScheduleInterval;
-  intervalCount: number;
   cron: string;
 }
 
@@ -83,37 +60,22 @@ export interface DocEventForm {
   condition: string;
 }
 
-export const DEFAULT_SCHEDULE_FORM: ScheduleForm = {
-  mode: 'interval',
-  interval: 'Daily',
-  intervalCount: 1,
-  cron: '',
-};
+export const DEFAULT_SCHEDULE_FORM: ScheduleForm = { cron: '' };
 
 export const DEFAULT_DOC_EVENT_FORM: DocEventForm = {
   referenceDoctype: '',
-  docEvent: 'after_save',
+  docEvent: 'on_update',
   condition: '',
 };
 
 export type ArgsResult<T> = { ok: true; args: T } | { ok: false; error: string };
 
 export function scheduleFormToArgs(flowId: string, form: ScheduleForm): ArgsResult<SetFlowTriggerArgs> {
-  if (form.mode === 'cron') {
-    const cron = form.cron.trim().replace(/\s+/g, ' ');
-    if (cron.split(' ').length !== 5 || !cron) {
-      return { ok: false, error: 'Cron needs 5 parts: minute hour day month day-of-week.' };
-    }
-    return { ok: true, args: { flow_id: flowId, trigger_type: 'schedule', cron } };
+  const cron = form.cron.trim().replace(/\s+/g, ' ');
+  if (!cron || cron.split(' ').length !== 5) {
+    return { ok: false, error: 'Cron needs 5 parts: minute hour day month day-of-week.' };
   }
-  const count = Math.floor(Number(form.intervalCount));
-  if (!Number.isFinite(count) || count < 1) {
-    return { ok: false, error: 'Interval count must be 1 or more.' };
-  }
-  return {
-    ok: true,
-    args: { flow_id: flowId, trigger_type: 'schedule', interval: form.interval, interval_count: count },
-  };
+  return { ok: true, args: { flow_id: flowId, trigger_type: 'schedule', cron } };
 }
 
 export function docEventFormToArgs(flowId: string, form: DocEventForm): ArgsResult<SetFlowTriggerArgs> {
@@ -132,16 +94,8 @@ export function docEventFormToArgs(flowId: string, form: DocEventForm): ArgsResu
 }
 
 export function summaryToScheduleForm(s: FlowTriggerSummary | null): ScheduleForm {
-  if (!s || s.trigger_type !== 'Schedule') return { ...DEFAULT_SCHEDULE_FORM };
-  if (s.schedule_type === 'Cron') {
-    return { ...DEFAULT_SCHEDULE_FORM, mode: 'cron', cron: s.cron ?? '' };
-  }
-  return {
-    ...DEFAULT_SCHEDULE_FORM,
-    mode: 'interval',
-    interval: s.interval ?? DEFAULT_SCHEDULE_FORM.interval,
-    intervalCount: s.interval_count ?? 1,
-  };
+  if (!s || s.trigger_type !== 'Schedule' || s.schedule_type !== 'Cron') return { ...DEFAULT_SCHEDULE_FORM };
+  return { cron: s.cron ?? '' };
 }
 
 export function summaryToDocEventForm(s: FlowTriggerSummary | null): DocEventForm {
@@ -152,6 +106,42 @@ export function summaryToDocEventForm(s: FlowTriggerSummary | null): DocEventFor
     docEvent: event,
     condition: s.condition ?? '',
   };
+}
+
+/**
+ * The node config the canvas keeps in step with the saved trigger, so graph validation, activation
+ * rules and the node's `configured` flag need no special cases. Only schema-allowed keys
+ * (TriggerScheduleNode: cron; TriggerDocEventNode: doctype + event). Null when the server
+ * holds no trigger of this kind, or one the node config cannot express (an interval schedule,
+ * or a doc event outside DOC_EVENTS).
+ */
+export function summaryToNodeConfig(
+  kind: 'schedule' | 'doc-event',
+  s: FlowTriggerSummary | null
+): { cron: string } | { doctype: string; event: FlowDocEvent } | null {
+  if (!s) return null;
+  if (kind === 'schedule') {
+    const cron = (s.cron ?? '').trim();
+    return s.trigger_type === 'Schedule' && s.schedule_type === 'Cron' && cron ? { cron } : null;
+  }
+  const event = DOC_EVENTS.find((e) => e === s.doc_event);
+  return s.trigger_type === 'Doc Event' && s.reference_doctype && event
+    ? { doctype: s.reference_doctype, event }
+    : null;
+}
+
+/**
+ * The triggerConfig a schedule / doc-event node should hold after a sync, replacing whatever it held
+ * (legacy keys the schema forbids are dropped). Null when it already matches, to avoid dirtying the flow.
+ */
+export function syncedTriggerConfig(
+  kind: 'schedule' | 'doc-event',
+  current: Record<string, unknown>,
+  mirror: ReturnType<typeof summaryToNodeConfig>
+): Record<string, unknown> | null {
+  const next: Record<string, unknown> = { type: kind, ...(mirror ?? {}) };
+  const keys = new Set([...Object.keys(current), ...Object.keys(next)]);
+  return [...keys].every((k) => current[k] === next[k]) ? null : next;
 }
 
 export type TriggerStateKind = 'none' | 'live' | 'disabled' | 'activation_required';

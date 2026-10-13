@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
+  summaryToNodeConfig,
+  syncedTriggerConfig,
+  DOC_EVENTS,
   scheduleFormToArgs,
   docEventFormToArgs,
   summaryToScheduleForm,
@@ -7,7 +10,6 @@ import {
   describeTriggerState,
   triggerErrorInfo,
   triggerDisabledReason,
-  isTriggerBoundFor,
   DEFAULT_SCHEDULE_FORM,
   type FlowTriggerSummary,
 } from './flowTrigger';
@@ -26,22 +28,13 @@ const base: FlowTriggerSummary = {
 };
 
 describe('scheduleFormToArgs', () => {
-  it('maps cron mode and normalises whitespace', () => {
-    const r = scheduleFormToArgs('f1', { ...DEFAULT_SCHEDULE_FORM, mode: 'cron', cron: ' 0  */6 * * * ' });
+  it('normalises whitespace', () => {
+    const r = scheduleFormToArgs('f1', { cron: ' 0  */6 * * * ' });
     expect(r).toEqual({ ok: true, args: { flow_id: 'f1', trigger_type: 'schedule', cron: '0 */6 * * *' } });
   });
-  it('rejects bad cron', () => {
-    expect(scheduleFormToArgs('f1', { ...DEFAULT_SCHEDULE_FORM, mode: 'cron', cron: '* * *' }).ok).toBe(false);
-  });
-  it('maps interval mode', () => {
-    const r = scheduleFormToArgs('f1', { ...DEFAULT_SCHEDULE_FORM, interval: 'Weekly', intervalCount: 2 });
-    expect(r).toEqual({
-      ok: true,
-      args: { flow_id: 'f1', trigger_type: 'schedule', interval: 'Weekly', interval_count: 2 },
-    });
-  });
-  it('rejects non-positive counts', () => {
-    expect(scheduleFormToArgs('f1', { ...DEFAULT_SCHEDULE_FORM, intervalCount: 0 }).ok).toBe(false);
+  it('rejects non 5-part cron and empty input', () => {
+    expect(scheduleFormToArgs('f1', { cron: '* * *' }).ok).toBe(false);
+    expect(scheduleFormToArgs('f1', DEFAULT_SCHEDULE_FORM).ok).toBe(false);
   });
 });
 
@@ -59,15 +52,11 @@ describe('docEventFormToArgs', () => {
 });
 
 describe('hydration', () => {
-  it('round-trips interval schedules', () => {
-    const f = summaryToScheduleForm({ ...base, schedule_type: 'Interval', interval: 'Monthly', interval_count: 3 });
-    expect(f).toMatchObject({ mode: 'interval', interval: 'Monthly', intervalCount: 3 });
+  it('does not hydrate interval schedules into the cron-only form', () => {
+    expect(summaryToScheduleForm({ ...base, schedule_type: 'Interval', interval: 'Monthly', interval_count: 3 })).toEqual(DEFAULT_SCHEDULE_FORM);
   });
   it('round-trips cron schedules', () => {
-    expect(summaryToScheduleForm({ ...base, schedule_type: 'Cron', cron: '5 4 * * *' })).toMatchObject({
-      mode: 'cron',
-      cron: '5 4 * * *',
-    });
+    expect(summaryToScheduleForm({ ...base, schedule_type: 'Cron', cron: '5 4 * * *' })).toEqual({ cron: '5 4 * * *' });
   });
   it('falls back to defaults for other trigger types or none', () => {
     expect(summaryToScheduleForm(null)).toEqual(DEFAULT_SCHEDULE_FORM);
@@ -124,12 +113,30 @@ describe('triggerDisabledReason', () => {
   });
 });
 
-describe('isTriggerBoundFor', () => {
-  const s = { trigger_type: 'Schedule' } as FlowTriggerSummary;
-  it('is true only when the server trigger matches the node kind', () => {
-    expect(isTriggerBoundFor('schedule', s)).toBe(true);
-    expect(isTriggerBoundFor('doc-event', s)).toBe(false);
-    expect(isTriggerBoundFor('doc-event', { trigger_type: 'Doc Event' } as FlowTriggerSummary)).toBe(true);
-    expect(isTriggerBoundFor('schedule', null)).toBe(false);
+describe('summaryToNodeConfig', () => {
+  it('mirrors a cron schedule as { cron } only', () => {
+    expect(summaryToNodeConfig('schedule', { ...base, schedule_type: 'Cron', cron: ' 5 4 * * * ' })).toEqual({ cron: '5 4 * * *' });
+  });
+  it('has nothing for interval schedules, other kinds, or no trigger', () => {
+    expect(summaryToNodeConfig('schedule', { ...base, schedule_type: 'Interval', interval: 'Daily', interval_count: 1 })).toBeNull();
+    expect(summaryToNodeConfig('doc-event', { ...base, schedule_type: 'Cron', cron: '5 4 * * *' })).toBeNull();
+    expect(summaryToNodeConfig('schedule', null)).toBeNull();
+  });
+  it('mirrors a doc event as { doctype, event } only for schema-enum events', () => {
+    const doc = { ...base, trigger_type: 'Doc Event' as const, reference_doctype: 'ToDo', doc_event: 'on_update' };
+    expect(summaryToNodeConfig('doc-event', doc)).toEqual({ doctype: 'ToDo', event: 'on_update' });
+    expect(summaryToNodeConfig('doc-event', { ...doc, doc_event: 'before_save' })).toBeNull();
+  });
+  it('the offered events are all inside the graph IR enum', () => {
+    // Mirrors graph_ir.schema.json TriggerDocEventNode.config.event (ajv is not a direct frontend dependency).
+    expect([...DOC_EVENTS]).toEqual(['after_insert', 'on_update', 'on_submit', 'on_cancel', 'on_trash']);
+  });
+});
+
+describe('syncedTriggerConfig', () => {
+  it('drops legacy keys and returns null when already in step', () => {
+    expect(syncedTriggerConfig('schedule', { type: 'schedule', intervalType: 'hours', interval: 1 }, { cron: '0 * * * *' })).toEqual({ type: 'schedule', cron: '0 * * * *' });
+    expect(syncedTriggerConfig('schedule', { type: 'schedule', cron: '0 * * * *' }, { cron: '0 * * * *' })).toBeNull();
+    expect(syncedTriggerConfig('doc-event', { type: 'doc-event', doctype: 'ToDo', event: 'on_update' }, null)).toEqual({ type: 'doc-event' });
   });
 });

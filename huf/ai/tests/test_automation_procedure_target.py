@@ -396,3 +396,41 @@ class TestFlowTriggerApi(_Base):
 	def test_legacy_flow_scheduling_is_gone(self):
 		for name in ("schedule_flow", "unschedule_flow", "get_flow_schedule", "execute_scheduled_flow"):
 			self.assertFalse(hasattr(flow_api, name), name)
+
+	def _activate_with_trigger_node(self, trigger_node):
+		"""Save a real Flow Definition whose trigger node holds exactly the panel's mirrored config, as Active."""
+		from huf.huf.doctype.flow_definition.activation_rules import collect_activation_problems
+
+		defn = _flow_definition(
+			[
+				{"id": "start", **trigger_node, "next": "finish"},
+				{"id": "finish", "type": "output", "config": {"value": {"ok": True}}},
+			]
+		)
+		self.assertEqual(collect_activation_problems(defn), [])
+		flow_id = self._flow(defn)
+		doc = frappe.get_doc("Flow Definition", flow_id)
+		doc.status = "Active"
+		doc.save(ignore_permissions=True)
+		self.assertEqual(frappe.db.get_value("Flow Definition", flow_id, "status"), "Active")
+
+	def test_panel_schedule_node_config_saves_and_activates(self):
+		# Frontend summaryToNodeConfig('schedule', ...) -> { cron }
+		self._activate_with_trigger_node({"type": "trigger.schedule", "config": {"cron": "*/5 * * * *"}})
+
+	def test_panel_doc_event_node_config_saves_and_activates(self):
+		# Frontend summaryToNodeConfig('doc-event', ...) -> { doctype, event }, event within the schema enum
+		for event in ("after_insert", "on_update", "on_submit", "on_cancel", "on_trash"):
+			self._activate_with_trigger_node(
+				{"type": "trigger.doc-event", "config": {"doctype": "ToDo", "event": event}}
+			)
+
+	def test_trigger_bound_marker_is_rejected(self):
+		defn = _flow_definition(
+			[
+				{"id": "start", "type": "trigger.schedule", "config": {"trigger_bound": True}, "next": "finish"},
+				{"id": "finish", "type": "output", "config": {"value": {"ok": True}}},
+			]
+		)
+		with self.assertRaises(frappe.ValidationError):
+			self._flow(defn)

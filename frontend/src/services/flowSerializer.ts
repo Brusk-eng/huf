@@ -186,6 +186,9 @@ function extractNodeConfig(
 
     if (data?.triggerConfig && data.triggerConfig.type) {
         config = omitType(data.triggerConfig) as Record<string, unknown>;
+        // graph_ir.schema.json forbids extra keys on these two nodes; drop anything else.
+        const allowed = backendType === 'trigger.schedule' ? ['cron'] : backendType === 'trigger.doc-event' ? ['doctype', 'event'] : null;
+        if (allowed) config = Object.fromEntries(Object.entries(config).filter(([k]) => allowed.includes(k)));
     } else if (data?.actionConfig && data.actionConfig.type) {
         config = omitType(data.actionConfig) as Record<string, unknown>;
     }
@@ -269,8 +272,6 @@ function mapBackendNodeTypeToFrontend(
  * Mirrors the required string fields in graph_ir.schema.json (and the backend
  * activation rules in flow_definition/activation_rules.py).
  */
-import { TRIGGER_BOUND_KEY } from '../lib/flowTrigger';
-
 const REQUIRED_CONFIG_KEYS: Partial<Record<string, string[]>> = {
     'trigger.webhook': ['method'],
     'trigger.schedule': ['cron'],
@@ -286,8 +287,6 @@ const REQUIRED_CONFIG_KEYS: Partial<Record<string, string[]>> = {
 export function isBackendNodeConfigured(node: BackendNode): boolean {
     if (node.type === 'trigger.unset') return false;
     const config = (node.config ?? {}) as Record<string, unknown>;
-    // Schedule / doc-event triggers live on the server; FlowTriggerPanel stamps this marker once it holds one.
-    if ((node.type === 'trigger.schedule' || node.type === 'trigger.doc-event') && config[TRIGGER_BOUND_KEY] === true) return true;
     return (REQUIRED_CONFIG_KEYS[node.type] ?? []).every((key) => {
         const v = config[key];
         return v != null && !(typeof v === 'string' && v.trim() === '');
