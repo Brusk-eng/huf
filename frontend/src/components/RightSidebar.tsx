@@ -5,7 +5,7 @@ import { Input } from './ui/input';
 import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
-import { buildBranchOptionLabels } from '@/lib/flowBranchTargets';
+import { buildBranchOptionLabels, findUpstreamNodeIds } from '@/lib/flowBranchTargets';
 import { Label } from './ui/label';
 import { Combobox } from './ui/combobox';
 import { Checkbox } from './ui/checkbox';
@@ -696,7 +696,10 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                 const otherNodes = (activeFlow?.nodes || []).filter((n) => n.id !== selectedNodeId);
                 const currentValue = value || '';
                 const isMissing = currentValue && !otherNodes.some((n) => n.id === currentValue);
-                const optionLabels = buildBranchOptionLabels(otherNodes);
+                // Upstream targets stay selectable (a deliberate loop is legitimate in a
+                // loop node) but are marked, so a cycle is never offered silently.
+                const upstreamIds = findUpstreamNodeIds(activeFlow?.edges || [], selectedNodeId);
+                const optionLabels = buildBranchOptionLabels(otherNodes, upstreamIds);
                 return (
                   <Select value={currentValue} onValueChange={onChange}>
                     <SelectTrigger id={id}>
