@@ -237,6 +237,23 @@ def send_text(
 	return _readback(doc)
 
 
+def _template_docname(account_name: str, template_name: str) -> str:
+	"""Map a Meta template name to the ``WhatsApp Templates`` document name.
+
+	``WhatsApp Message.template`` is a Link to the document, whose name is
+	``<template_name>-<language_code>`` and not the bare Meta name.
+	"""
+	if frappe.db.exists("WhatsApp Templates", template_name):
+		return template_name
+	for field in ("actual_name", "template_name"):
+		name = frappe.db.get_value(
+			"WhatsApp Templates", {"whatsapp_account": account_name, field: template_name}, "name"
+		)
+		if name:
+			return name
+	return template_name
+
+
 def send_template(
 	account_name: str,
 	to: str,
@@ -255,7 +272,7 @@ def send_template(
 		"type": "Outgoing",
 		"to": normalize_phone(to),
 		"use_template": 1,
-		"template": template_name,
+		"template": _template_docname(account_name, template_name),
 		"whatsapp_account": account_name,
 		"content_type": "text",
 		"template_parameters": ",".join(params),

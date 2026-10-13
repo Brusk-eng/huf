@@ -175,11 +175,13 @@ class TestBridge(unittest.TestCase):
 
 	def test_send_template(self):
 		doc = FakeDoc()
-		with avail(), patch.object(wb, "resolve_account", return_value=ACCT), patch.object(frappe, "get_doc", return_value=doc) as gd:
+		with avail(), patch.object(wb, "resolve_account", return_value=ACCT), patch.object(frappe, "get_doc", return_value=doc) as gd, patch.object(
+			wb, "_template_docname", return_value="hello_tpl-en_US"
+		):
 			wb.send_template("ACC", "+1 415", "hello_tpl", ["a", "b"], ["h"])
 		v = gd.call_args.args[0]
 		self.assertEqual(v["use_template"], 1)
-		self.assertEqual(v["template"], "hello_tpl")
+		self.assertEqual(v["template"], "hello_tpl-en_US")
 		self.assertEqual(v["template_parameters"], "a,b")
 		self.assertEqual(v["template_header_parameters"], "h")
 		self.assertEqual(doc.insert_kwargs, {})
