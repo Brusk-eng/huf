@@ -89,13 +89,13 @@ class TestWhatsAppManagement(unittest.TestCase):
 			self.assertEqual(mgmt.list_messages(), {"success": False, "error": "bridge_unavailable"})
 			self.assertEqual(mgmt.list_conversations(), {"success": False, "error": "bridge_unavailable"})
 			self.assertEqual(
-				mgmt.send_template_message(to="447700900123", template_name="welcome"),
+				mgmt.send_template_message(gateway_name="GW-1", to="447700900123", template_name="welcome"),
 				{"success": False, "error": "bridge_unavailable"},
 			)
 
 	def test_bridge_error_is_converted_to_error_dict(self):
 		with patch.object(bridge, "send_template", side_effect=BridgeError({"error": "send_failed", "message": "boom"})):
-			result = mgmt.send_template_message(to="447700900123", template_name="welcome")
+			result = mgmt.send_template_message(gateway_name="GW-1", to="447700900123", template_name="welcome")
 
 		self.assertFalse(result["success"])
 		self.assertEqual(result["error"], "send_failed")
@@ -103,7 +103,7 @@ class TestWhatsAppManagement(unittest.TestCase):
 
 	def test_send_template_validates_template_name(self):
 		with patch.object(bridge, "send_template") as send_template:
-			result = mgmt.send_template_message(to="447700900123", template_name="Bad Name!")
+			result = mgmt.send_template_message(gateway_name="GW-1", to="447700900123", template_name="Bad Name!")
 
 		self.assertEqual(result["error"], "invalid_name")
 		send_template.assert_not_called()
@@ -210,7 +210,269 @@ class TestWhatsAppManagement(unittest.TestCase):
 		self.frappe.has_permission.return_value = False
 
 		with self.assertRaises(PermissionError):
-			mgmt.list_messages()
+			mgmt.list_messages(gateway_name="GW-1")
+
+
+class TestWhatsAppManagementAuthority(unittest.TestCase):
+	"""Roles, Gateway authority and account isolation of the management API (mock-based)."""
+
+	def setUp(self):
+		patcher = patch("huf.ai.whatsapp_management.frappe")
+		self.frappe = patcher.start()
+		self.addCleanup(patcher.stop)
+		self.frappe.PermissionError = PermissionError
+		self.frappe.db.exists.return_value = True
+		self.accounts = {"GW-A": "ACC-A", "GW-B": "ACC-B", "GW-NONE": ""}
+		self.frappe.db.get_value.side_effect = lambda doctype, name, field=None, *a, **k: (
+			self.accounts.get(name) if doctype == "Gateway" else None
+		)
+		self.roles = ["Desk User"]
+		self.frappe.get_roles.side_effect = lambda: list(self.roles)
+		self.frappe.session.user = "plain@example.com"
+		self.gateway_perms = {"read": True, "write": False}
+		self.doctype_perms = {"WhatsApp Message": True, "WhatsApp Templates": True}
+		self.draft_create = False
+
+		def has_permission(doctype, ptype="read", doc=None, **kwargs):
+			if doctype == "Gateway":
+				return self.gateway_perms.get(ptype, False)
+			if doctype == bridge.DRAFT_DOCTYPE:
+				return ptype == "read" or self.draft_create
+			return self.doctype_perms.get(doctype, False)
+
+		self.frappe.has_permission.side_effect = has_permission
+		self.frappe.get_list.return_value = ["GW-A"]
+		for target, kwargs in (
+			(bridge, {"name": "is_available", "return_value": True}),
+			(bridge, {"name": "resolve_account", "side_effect": lambda n=None: {"name": n, "phone_id": "1"} if n else {"error": "no_account"}}),
+		):
+			name = kwargs.pop("name")
+			p = patch.object(target, name, **kwargs)
+			p.start()
+			self.addCleanup(p.stop)
+		caps = patch("huf.permissions.has_capability", return_value=False)
+		self.has_capability = caps.start()
+		self.addCleanup(caps.stop)
+
+	# --- template management is admin-only -------------------------------
+
+	def test_plain_desk_user_cannot_manage_templates(self):
+		payload = json.dumps({"template_name": "hello", "category": "UTILITY", "language_code": "en_US", "body": "x"})
+		calls = (
+			lambda: mgmt.create_template(account="ACC-A", payload=payload),
+			lambda: mgmt.edit_template(name="hello-en_US", payload=payload),
+			lambda: mgmt.delete_template(name="hello-en_US"),
+			lambda: mgmt.sync_templates(account="ACC-A"),
+			lambda: mgmt.approve_template_draft(name="DRAFT-1"),
+			lambda: mgmt.reject_template_draft(name="DRAFT-1"),
+		)
+		with (
+			patch.object(bridge, "create_template") as create,
+			patch.object(bridge, "edit_template") as edit,
+			patch.object(bridge, "delete_template") as delete,
+			patch.object(bridge, "sync_templates") as sync,
+			patch.object(bridge, "approve_draft") as approve,
+			patch.object(bridge, "reject_draft") as reject,
+		):
+			for call in calls:
+				with self.assertRaises(PermissionError):
+					call()
+			for mock in (create, edit, delete, sync, approve, reject):
+				mock.assert_not_called()
+
+	def test_admin_roles_may_manage_templates(self):
+		payload = json.dumps({"template_name": "hello", "category": "UTILITY", "language_code": "en_US", "body": "x"})
+		for role in ("System Manager", "Huf Admin"):
+			self.roles = [role]
+			with patch.object(bridge, "create_template", return_value={"success": True}) as create:
+				self.assertTrue(mgmt.create_template(account="ACC-A", payload=payload)["success"])
+			create.assert_called_once()
+			self.assertEqual(create.call_args.args[0], "ACC-A")
+			with patch.object(bridge, "sync_templates", return_value={"success": True}) as sync:
+				self.assertTrue(mgmt.sync_templates(gateway_name="GW-A")["success"])
+			sync.assert_called_once_with("ACC-A")
+
+	def test_template_management_has_no_default_account(self):
+		self.roles = ["System Manager"]
+		payload = json.dumps({"template_name": "hello", "category": "UTILITY", "language_code": "en_US", "body": "x"})
+		with patch.object(bridge, "create_template") as create, patch.object(bridge, "sync_templates") as sync:
+			self.assertEqual(mgmt.create_template(payload=payload)["error"], "gateway_required")
+			self.assertEqual(mgmt.sync_templates()["error"], "gateway_required")
+		create.assert_not_called()
+		sync.assert_not_called()
+
+	def test_draft_request_path_needs_create_permission_or_admin(self):
+		payload = json.dumps({"template_name": "hello", "category": "UTILITY", "language_code": "en_US", "body": "x"})
+		with patch.object(bridge, "create_draft", return_value={"success": True, "name": "D-1"}) as create:
+			with self.assertRaises(PermissionError):
+				mgmt.create_template_draft(account="ACC-A", payload=payload)
+			create.assert_not_called()
+			self.draft_create = True  # the non-admin request path
+			self.assertTrue(mgmt.create_template_draft(gateway_name="GW-A", payload=payload)["success"])
+			self.assertEqual(create.call_args.kwargs["account"], "ACC-A")
+			self.assertNotIn("trusted", create.call_args.kwargs)  # never ignore_permissions on a user path
+			self.draft_create = False
+			self.roles = ["Huf Admin"]
+			self.assertTrue(mgmt.create_template_draft(account="ACC-A", payload=payload)["success"])
+
+	def test_draft_request_without_account_is_refused(self):
+		self.draft_create = True
+		payload = json.dumps({"template_name": "hello", "category": "UTILITY", "language_code": "en_US", "body": "x"})
+		with patch.object(bridge, "create_draft") as create:
+			self.assertEqual(mgmt.create_template_draft(payload=payload)["error"], "gateway_required")
+		create.assert_not_called()
+
+	# --- sending needs WRITE authority on the gateway ---------------------
+
+	def test_sends_require_gateway_name(self):
+		self.gateway_perms["write"] = True
+		with patch.object(bridge, "send_template") as send_template:
+			result = mgmt.send_template_message(to="447700900123", template_name="welcome")
+		self.assertEqual(result["error"], "invalid_gateway")
+		send_template.assert_not_called()
+		self.assertEqual(mgmt.send_text_message(to="447700900123", text="x")["error"], "invalid_gateway")
+		self.assertEqual(mgmt.send_media_message(to="447700900123", kind="image", link="https://a/b.png")["error"], "invalid_gateway")
+
+	def test_read_only_gateway_access_cannot_send(self):
+		self.gateway_perms.update(read=True, write=False)
+		with (
+			patch.object(bridge, "window_state", return_value={"open": True}),
+			patch.object(bridge, "send_text") as send_text,
+			patch.object(bridge, "send_media") as send_media,
+			patch.object(bridge, "send_template") as send_template,
+		):
+			with self.assertRaises(PermissionError):
+				mgmt.send_text_message(gateway_name="GW-A", to="447700900123", text="hi")
+			with self.assertRaises(PermissionError):
+				mgmt.send_media_message(gateway_name="GW-A", to="447700900123", kind="image", link="https://a/b.png")
+			with self.assertRaises(PermissionError):
+				mgmt.send_template_message(gateway_name="GW-A", to="447700900123", template_name="welcome")
+		for mock in (send_text, send_media, send_template):
+			mock.assert_not_called()
+
+	def test_gateway_writer_sends_from_the_gateways_own_account(self):
+		self.gateway_perms["write"] = True
+		with (
+			patch.object(bridge, "window_state", return_value={"open": True}),
+			patch.object(bridge, "send_text", return_value={"success": True}) as send_text,
+			patch.object(bridge, "send_media", return_value={"success": True}) as send_media,
+			patch.object(bridge, "send_template", return_value={"success": True}) as send_template,
+		):
+			mgmt.send_text_message(gateway_name="GW-B", to="447700900123", text="hi")
+			mgmt.send_media_message(gateway_name="GW-B", to="447700900123", kind="image", link="https://a/b.png")
+			mgmt.send_template_message(gateway_name="GW-B", to="447700900123", template_name="welcome")
+		self.assertEqual(send_text.call_args.args[0], "ACC-B")
+		self.assertEqual(send_media.call_args.args[0], "ACC-B")
+		self.assertEqual(send_template.call_args.args[0], "ACC-B")
+
+	def test_integrations_capability_grants_send_without_gateway_doc_write(self):
+		self.has_capability.return_value = True
+		with patch.object(bridge, "send_template", return_value={"success": True}) as send_template:
+			self.assertTrue(
+				mgmt.send_template_message(gateway_name="GW-A", to="447700900123", template_name="welcome")["success"]
+			)
+		self.assertEqual(send_template.call_args.args[0], "ACC-A")
+
+	def test_text_and_media_enforce_the_24h_window_but_templates_do_not(self):
+		self.gateway_perms["write"] = True
+		with (
+			patch.object(bridge, "window_state", return_value={"open": False, "expires_at": None}),
+			patch.object(bridge, "send_text") as send_text,
+			patch.object(bridge, "send_media") as send_media,
+			patch.object(bridge, "send_template", return_value={"success": True}) as send_template,
+		):
+			self.assertEqual(mgmt.send_text_message(gateway_name="GW-A", to="447700900123", text="x")["error"], "window_closed")
+			self.assertEqual(
+				mgmt.send_media_message(gateway_name="GW-A", to="447700900123", kind="image", link="https://a/b.png")["error"],
+				"window_closed",
+			)
+			self.assertTrue(mgmt.send_template_message(gateway_name="GW-A", to="447700900123", template_name="w")["success"])
+		send_text.assert_not_called()
+		send_media.assert_not_called()
+		send_template.assert_called_once()
+
+	def test_gateway_without_account_cannot_send(self):
+		self.gateway_perms["write"] = True
+		with patch.object(bridge, "send_template") as send_template:
+			result = mgmt.send_template_message(gateway_name="GW-NONE", to="447700900123", template_name="w")
+		self.assertEqual(result["error"], "no_account")  # no default-account guess
+		send_template.assert_not_called()
+
+	def test_send_template_has_no_account_parameter(self):
+		with self.assertRaises(TypeError):
+			mgmt.send_template_message(gateway_name="GW-A", to="447700900123", template_name="w", account="ACC-B")
+
+	# --- no cross-account listing ----------------------------------------
+
+	def test_lists_require_a_gateway_or_a_permitted_account(self):
+		with (
+			patch.object(bridge, "list_messages") as lm,
+			patch.object(bridge, "list_conversations") as lc,
+			patch.object(bridge, "list_templates") as lt,
+			patch.object(bridge, "list_drafts") as ld,
+		):
+			for result in (
+				mgmt.list_messages(),
+				mgmt.list_conversations(),
+				mgmt.list_templates(),
+				mgmt.list_template_drafts(),
+			):
+				self.assertEqual(result["success"], False)
+				self.assertEqual(result["error"], "gateway_required")
+		for mock in (lm, lc, lt, ld):
+			mock.assert_not_called()
+
+	def test_gateway_list_is_scoped_to_its_account(self):
+		with (
+			patch.object(bridge, "list_messages", return_value={"success": True, "messages": []}) as lm,
+			patch.object(bridge, "list_conversations", return_value={"success": True, "conversations": []}) as lc,
+			patch.object(bridge, "list_templates", return_value=[]) as lt,
+			patch.object(bridge, "list_drafts", return_value=[]) as ld,
+		):
+			mgmt.list_messages(gateway_name="GW-B", phone="447700900123")
+			mgmt.list_conversations(gateway_name="GW-B")
+			mgmt.list_templates(gateway_name="GW-B")
+			mgmt.list_template_drafts(gateway_name="GW-B")
+		self.assertEqual(lm.call_args.args[0], "ACC-B")
+		self.assertEqual(lc.call_args.args[0], "ACC-B")
+		self.assertEqual(lt.call_args.args[0], "ACC-B")
+		self.assertEqual(ld.call_args.kwargs["account"], "ACC-B")
+
+	def test_non_admin_sees_only_accounts_of_gateways_they_can_read(self):
+		self.frappe.get_list.return_value = []  # no readable gateway uses ACC-B
+		with patch.object(bridge, "list_messages") as lm:
+			with self.assertRaises(PermissionError):
+				mgmt.list_messages(account="ACC-B")
+		lm.assert_not_called()
+		self.gateway_perms["read"] = False
+		self.frappe.get_list.return_value = ["GW-A"]
+		with patch.object(bridge, "list_messages") as lm:
+			with self.assertRaises(PermissionError):
+				mgmt.list_messages(gateway_name="GW-A")
+			with self.assertRaises(PermissionError):
+				mgmt.list_messages(account="ACC-A")
+		lm.assert_not_called()
+
+	def test_non_admin_with_a_readable_gateway_may_pass_its_account(self):
+		self.frappe.get_list.return_value = ["GW-A"]
+		with patch.object(bridge, "list_messages", return_value={"success": True, "messages": []}) as lm:
+			self.assertTrue(mgmt.list_messages(account="ACC-A")["success"])
+		self.assertEqual(lm.call_args.args[0], "ACC-A")
+
+	def test_admin_may_pass_any_account_and_a_mismatched_account_is_refused(self):
+		self.roles = ["Huf Admin"]
+		with patch.object(bridge, "list_messages", return_value={"success": True, "messages": []}) as lm:
+			self.assertTrue(mgmt.list_messages(account="ACC-Z")["success"])
+			self.assertEqual(
+				mgmt.list_messages(gateway_name="GW-A", account="ACC-B")["error"], "account_mismatch"
+			)
+		self.assertEqual(lm.call_count, 1)
+
+	def test_template_detail_of_an_unreadable_account_is_refused(self):
+		self.frappe.get_list.return_value = []
+		with patch.object(bridge, "get_template", return_value={"success": True, "whatsapp_account": "ACC-B"}):
+			with self.assertRaises(PermissionError):
+				mgmt.get_template(name="hello-en_US")
 
 
 if __name__ == "__main__":

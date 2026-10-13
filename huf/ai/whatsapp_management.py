@@ -65,6 +65,84 @@ def _require_admin() -> None:
 		raise frappe.PermissionError(_("System Manager or Huf Admin role required"))
 
 
+def _is_admin() -> bool:
+	return bool(set(frappe.get_roles() or []).intersection(ADMIN_ROLES))
+
+
+def _can_manage_integrations() -> bool:
+	"""Admin role, or the Huf ``system.integrations.manage`` capability."""
+	if _is_admin():
+		return True
+	try:
+		from huf.permissions import has_capability
+
+		return bool(has_capability(frappe.session.user, "system.integrations.manage"))
+	except Exception:
+		return False
+
+
+def _gateway_write_allowed(gateway_name: str) -> bool:
+	"""Write-level authority on a Gateway: the doctype write permission or integrations management."""
+	return _can_manage_integrations() or bool(frappe.has_permission("Gateway", "write", doc=gateway_name))
+
+
+def _gateway_read_allowed(gateway_name: str) -> bool:
+	return _can_manage_integrations() or bool(frappe.has_permission("Gateway", "read", doc=gateway_name))
+
+
+def _account_readable(account: str) -> bool:
+	"""Admins see every account; others only accounts of Gateways they can read."""
+	if _can_manage_integrations():
+		return True
+	rows = frappe.get_list("Gateway", filters={"whatsapp_account": account}, pluck="name", limit_page_length=50)
+	return any(_gateway_read_allowed(name) for name in rows or [])
+
+
+def _error(code: str, message: str = "") -> dict[str, Any]:
+	out: dict[str, Any] = {"success": False, "error": code}
+	if message:
+		out["message"] = message
+	return out
+
+
+def _gateway_required() -> dict[str, Any]:
+	return _error(
+		"gateway_required",
+		"Choose a WhatsApp gateway (or an account you may access). Data is never listed across accounts.",
+	)
+
+
+def _account_from(gateway_name: str | None, account: str | None) -> str | dict[str, Any]:
+	"""Account of a Gateway (preferred) or an explicit account; never a default. No permission checks."""
+	if gateway_name:
+		if not frappe.db.exists("Gateway", gateway_name):
+			return _error("not_found", "Gateway not found.")
+		linked = _gateway_whatsapp_account(gateway_name)
+		if not linked:
+			return _error("no_account", "This gateway is not linked to a WhatsApp Account.")
+		if account and account != linked:
+			return _error("account_mismatch", "That account does not belong to this gateway.")
+		return linked
+	if account:
+		return account
+	return _gateway_required()
+
+
+def _read_account(gateway_name: str | None, account: str | None) -> str | dict[str, Any]:
+	"""Account the caller may READ: via a readable Gateway, or an explicit account they can see."""
+	if gateway_name:
+		if not frappe.db.exists("Gateway", gateway_name):
+			return _error("not_found", "Gateway not found.")
+		if not _gateway_read_allowed(gateway_name):
+			raise frappe.PermissionError(_("Not permitted to read this Gateway"))
+		return _account_from(gateway_name, account)
+	if account:
+		if not _account_readable(account):
+			raise frappe.PermissionError(_("Not permitted to read this WhatsApp account"))
+		return account
+	return _gateway_required()
+
+
 def _clamp_limit(limit: Any) -> int:
 	try:
 		value = int(limit)
@@ -113,7 +191,7 @@ def _resolve_account_name(account: str | None) -> str | dict[str, Any]:
 	"""Return the resolved WhatsApp Account name, or an error dict."""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
-	acct = bridge.resolve_account(account)
+	acct = bridge.resolve_account(account) if account else {"error": "no_account"}
 	if not acct or acct.get("error"):
 		return {"success": False, "error": "no_account"}
 	return acct["name"]
@@ -183,6 +261,7 @@ def _gateway_status(gateway: dict[str, Any]) -> dict[str, Any]:
 		"name": gateway["name"],
 		"enabled": bool(gateway.get("is_enabled")),
 		"whatsapp_account": gateway.get("whatsapp_account"),
+		"phone_number_id": gateway.get("phone_number_id") or "",
 		"app_secret_present": presence["app_secret"],
 		"app_secret_missing": not presence["app_secret"],
 		"verify_token_present": presence["webhook_verify_token"],
@@ -211,7 +290,7 @@ def get_setup_status(gateway_name: str | None = None) -> dict[str, Any]:
 	gateways_raw = frappe.get_all(
 		"Gateway",
 		filters=filters,
-		fields=["name", "is_enabled", "integration_settings"],
+		fields=["name", "is_enabled", "integration_settings", "phone_number_id"],
 		limit_page_length=100,
 	)
 	gateways = []
@@ -231,12 +310,17 @@ def get_setup_status(gateway_name: str | None = None) -> dict[str, Any]:
 
 @frappe.whitelist()
 @_bridge_guard
-def list_templates(account: str | None = None, status: str | None = None) -> dict[str, Any]:
-	"""List WhatsApp Templates, optionally filtered by account or status."""
+def list_templates(
+	gateway_name: str | None = None, account: str | None = None, status: str | None = None
+) -> dict[str, Any]:
+	"""List one account's WhatsApp Templates (from ``gateway_name``'s account, or an account you may see)."""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	_has_doctype_permission("WhatsApp Templates", "read")
-	templates = bridge.list_templates(account, status)
+	account_name = _read_account(gateway_name, account)
+	if isinstance(account_name, dict):
+		return account_name
+	templates = bridge.list_templates(account_name, status)
 	try:
 		buttons = bridge.template_buttons([t["name"] for t in templates])
 		if isinstance(buttons, dict):
@@ -246,7 +330,7 @@ def list_templates(account: str | None = None, status: str | None = None) -> dic
 		pass  # buttons are informational for the send dialog; never fail the listing
 	business_id = ""
 	try:
-		acct = bridge.resolve_account(account)
+		acct = bridge.resolve_account(account_name)
 		if acct and not acct.get("error"):
 			business_id = acct.get("business_id") or ""
 	except Exception:
@@ -261,8 +345,11 @@ def list_templates(account: str | None = None, status: str | None = None) -> dic
 
 @frappe.whitelist(methods=["POST"])
 @_bridge_guard
-def create_template(account: str | None = None, payload: Any = None) -> dict[str, Any]:
-	"""Create a WhatsApp Template; its doctype hook pushes it to Meta."""
+def create_template(
+	account: str | None = None, payload: Any = None, gateway_name: str | None = None
+) -> dict[str, Any]:
+	"""Admin: create a WhatsApp Template; its doctype hook pushes it to Meta."""
+	_require_admin()
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	parsed = _parse_json_arg(payload, "payload")
@@ -271,7 +358,10 @@ def create_template(account: str | None = None, payload: Any = None) -> dict[str
 	name_error = _validate_template_name(parsed.get("template_name") or parsed.get("name"))
 	if name_error:
 		return name_error
-	account_name = _resolve_account_name(account)
+	derived = _account_from(gateway_name, account)
+	if isinstance(derived, dict):
+		return derived
+	account_name = _resolve_account_name(derived)
 	if isinstance(account_name, dict):
 		return account_name
 	return bridge.create_template(account_name, parsed)
@@ -285,13 +375,18 @@ def get_template(name: str | None = None) -> dict[str, Any]:
 		return {"success": False, "error": "bridge_unavailable"}
 	if not name or not str(name).strip():
 		return {"success": False, "error": "invalid_name", "message": "Template name is required."}
-	return bridge.get_template(str(name).strip())
+	result = bridge.get_template(str(name).strip())
+	owner = result.get("whatsapp_account") if result.get("success") else None
+	if owner and not _account_readable(owner):
+		raise frappe.PermissionError(_("Not permitted to read this WhatsApp account"))
+	return result
 
 
 @frappe.whitelist(methods=["POST"])
 @_bridge_guard
 def edit_template(name: str | None = None, payload: Any = None) -> dict[str, Any]:
-	"""Edit a template on Meta (full components) under Meta's edit rules; it goes back to PENDING review."""
+	"""Admin: edit a template on Meta (full components) under Meta's edit rules; it goes back to PENDING review."""
+	_require_admin()
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	if not name or not str(name).strip():
@@ -304,28 +399,48 @@ def edit_template(name: str | None = None, payload: Any = None) -> dict[str, Any
 
 @frappe.whitelist()
 @_bridge_guard
-def list_template_drafts(status: str | None = None) -> dict[str, Any]:
-	"""Template drafts awaiting (or past) human approval."""
-	return {"success": True, "drafts": bridge.list_drafts(status or None)}
+def list_template_drafts(
+	gateway_name: str | None = None, account: str | None = None, status: str | None = None
+) -> dict[str, Any]:
+	"""One account's template drafts awaiting (or past) human approval.
+
+	Sites without frappe_whatsapp have no accounts; their drafts live in one unscoped bucket.
+	"""
+	_has_doctype_permission(bridge.DRAFT_DOCTYPE, "read")
+	if not bridge.is_available():
+		return {"success": True, "drafts": bridge.list_drafts(status or None, account="")}
+	account_name = _read_account(gateway_name, account)
+	if isinstance(account_name, dict):
+		return account_name
+	return {"success": True, "drafts": bridge.list_drafts(status or None, account=account_name)}
 
 
 @frappe.whitelist(methods=["POST"])
 @_bridge_guard
-def create_template_draft(account: str | None = None, payload: Any = None, submit_for_review: Any = 1) -> dict[str, Any]:
-	"""Save a template as a draft (same validation as create_template); nothing is sent to Meta."""
+def create_template_draft(
+	account: str | None = None, payload: Any = None, submit_for_review: Any = 1, gateway_name: str | None = None
+) -> dict[str, Any]:
+	"""Save a template as a draft (same validation as create_template); nothing is sent to Meta.
+
+	The non-admin "request" path: needs the draft doctype's create permission or an admin role.
+	"""
+	if not _is_admin() and not frappe.has_permission(bridge.DRAFT_DOCTYPE, "create"):
+		raise frappe.PermissionError(_("Not permitted to request WhatsApp templates"))
 	parsed = _parse_json_arg(payload, "payload")
 	if not isinstance(parsed, dict):
 		return {"success": False, "error": "invalid_payload", "message": "payload must be an object"}
 	name_error = _validate_template_name(parsed.get("template_name") or parsed.get("name"))
 	if name_error:
 		return name_error
-	account_name = ""
+	account_name = ""  # sites without frappe_whatsapp have no accounts: one unscoped bucket
 	if bridge.is_available():
-		resolved = bridge.resolve_account(account)
-		if resolved and not resolved.get("error"):
-			account_name = resolved["name"]
-		elif account:
+		derived = _account_from(gateway_name, account)
+		if isinstance(derived, dict):
+			return derived
+		resolved = bridge.resolve_account(derived)
+		if not resolved or resolved.get("error"):
 			return {"success": False, "error": "no_account"}
+		account_name = resolved["name"]
 	review = str(submit_for_review).strip().lower() not in ("0", "false", "no", "")
 	return bridge.create_draft(
 		parsed, requested_by=frappe.session.user, via="User", account=account_name,
@@ -356,7 +471,8 @@ def reject_template_draft(name: str | None = None, note: str | None = None) -> d
 @frappe.whitelist(methods=["POST"])
 @_bridge_guard
 def delete_template(name: str | None = None) -> dict[str, Any]:
-	"""Delete a WhatsApp Template by document name."""
+	"""Admin: delete a WhatsApp Template by document name."""
+	_require_admin()
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	if not name or not str(name).strip():
@@ -366,11 +482,15 @@ def delete_template(name: str | None = None) -> dict[str, Any]:
 
 @frappe.whitelist(methods=["POST"])
 @_bridge_guard
-def sync_templates(account: str | None = None) -> dict[str, Any]:
-	"""Sync templates for one WhatsApp Account from Meta: import ones missing in Huf, refresh status/category of existing."""
+def sync_templates(account: str | None = None, gateway_name: str | None = None) -> dict[str, Any]:
+	"""Admin: sync templates for one WhatsApp Account from Meta: import ones missing in Huf, refresh status/category of existing."""
+	_require_admin()
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
-	account_name = _resolve_account_name(account)
+	derived = _account_from(gateway_name, account)
+	if isinstance(derived, dict):
+		return derived
+	account_name = _resolve_account_name(derived)
 	if isinstance(account_name, dict):
 		return account_name
 	return bridge.sync_templates(account_name)
@@ -384,11 +504,14 @@ def send_template_message(
 	template_name: str | None = None,
 	body_params: Any = None,
 	header_params: Any = None,
-	account: str | None = None,
 	button_params: Any = None,
 	language_code: str | None = None,
+	gateway_name: str | None = None,
 ) -> dict[str, Any]:
-	"""Send an approved template to a number. Allowed outside the 24h window.
+	"""Send an approved template to a number from a Gateway. Allowed outside the 24h window.
+
+	``gateway_name`` is required and the caller needs write authority on that Gateway; the
+	WhatsApp Account is the Gateway's own, never supplied by the caller.
 
 	``header_params`` is one text value or one ``{"type": "image|document", "link": ...}``
 	media object; ``button_params`` is ``[{"index": 0, "sub_type": "url", "text": "<suffix>"}]``
@@ -397,6 +520,9 @@ def send_template_message(
 	"""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
+	refused = _send_authority(gateway_name)
+	if refused:
+		return refused
 	phone = _validate_recipient(to)
 	if isinstance(phone, dict):
 		return phone
@@ -413,7 +539,7 @@ def send_template_message(
 		header = [header]
 	if not isinstance(body, list) or not isinstance(header, list) or not isinstance(buttons, list):
 		return {"success": False, "error": "invalid_params", "message": "Params must be lists"}
-	account_name = _resolve_account_name(account)
+	account_name = _resolve_account_name(_gateway_whatsapp_account(gateway_name))
 	if isinstance(account_name, dict):
 		return account_name
 	return bridge.send_template(
@@ -428,11 +554,9 @@ def send_text_message(gateway_name: str | None = None, to: str | None = None, te
 	"""Send a free-form text, only while the 24h customer-service window is open."""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
-	if not gateway_name:
-		return {"success": False, "error": "invalid_gateway", "message": "gateway_name is required."}
-	if not frappe.db.exists("Gateway", gateway_name):
-		return {"success": False, "error": "not_found", "message": "Gateway not found."}
-	_has_doctype_permission("Gateway", "read")
+	refused = _send_authority(gateway_name)
+	if refused:
+		return refused
 	phone = _validate_recipient(to)
 	if isinstance(phone, dict):
 		return phone
@@ -453,6 +577,17 @@ def send_text_message(gateway_name: str | None = None, to: str | None = None, te
 	if isinstance(account_name, dict):
 		return account_name
 	return bridge.send_text(account_name, phone, str(text))
+
+
+def _send_authority(gateway_name: str | None) -> dict[str, Any] | None:
+	"""Validate the sending Gateway: required, existing, and WRITE-level authority on it (read is not enough)."""
+	if not gateway_name:
+		return {"success": False, "error": "invalid_gateway", "message": "gateway_name is required."}
+	if not frappe.db.exists("Gateway", gateway_name):
+		return {"success": False, "error": "not_found", "message": "Gateway not found."}
+	if not _gateway_write_allowed(gateway_name):
+		raise frappe.PermissionError(_("Not permitted to send from this Gateway"))
+	return None
 
 
 def _public_file_link(file_url: str) -> str | dict[str, Any]:
@@ -484,11 +619,9 @@ def send_media_message(
 	"""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
-	if not gateway_name:
-		return {"success": False, "error": "invalid_gateway", "message": "gateway_name is required."}
-	if not frappe.db.exists("Gateway", gateway_name):
-		return {"success": False, "error": "not_found", "message": "Gateway not found."}
-	_has_doctype_permission("Gateway", "read")
+	refused = _send_authority(gateway_name)
+	if refused:
+		return refused
 	phone = _validate_recipient(to)
 	if isinstance(phone, dict):
 		return phone
@@ -514,19 +647,29 @@ def send_media_message(
 
 @frappe.whitelist()
 @_bridge_guard
-def list_messages(account: str | None = None, phone: str | None = None, limit: int = 50) -> dict[str, Any]:
-	"""List recent WhatsApp Messages, newest first."""
+def list_messages(
+	gateway_name: str | None = None, phone: str | None = None, limit: int = 50, account: str | None = None
+) -> dict[str, Any]:
+	"""List recent WhatsApp Messages of one gateway's account, newest first."""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	_has_doctype_permission("WhatsApp Message", "read")
-	return bridge.list_messages(account, phone, _clamp_limit(limit))
+	account_name = _read_account(gateway_name, account)
+	if isinstance(account_name, dict):
+		return account_name
+	return bridge.list_messages(account_name, phone, _clamp_limit(limit))
 
 
 @frappe.whitelist()
 @_bridge_guard
-def list_conversations(account: str | None = None, limit: int = 50) -> dict[str, Any]:
-	"""Group recent WhatsApp Messages by counterparty number."""
+def list_conversations(
+	gateway_name: str | None = None, limit: int = 50, account: str | None = None
+) -> dict[str, Any]:
+	"""Group one gateway's recent WhatsApp Messages by counterparty number."""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	_has_doctype_permission("WhatsApp Message", "read")
-	return bridge.list_conversations(account, _clamp_limit(limit))
+	account_name = _read_account(gateway_name, account)
+	if isinstance(account_name, dict):
+		return account_name
+	return bridge.list_conversations(account_name, _clamp_limit(limit))
