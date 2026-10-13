@@ -23,6 +23,7 @@ from urllib.parse import quote
 
 import frappe
 from frappe import _
+from frappe.rate_limiter import rate_limit
 
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 from huf.ai.gateway_adapters.whatsapp_bridge import BridgeError
@@ -30,9 +31,9 @@ from huf.ai.gateway_adapters.whatsapp_bridge import BridgeError
 ADMIN_ROLES = ("System Manager", "Huf Admin")
 WHATSAPP_PROVIDER = "WhatsApp"
 CALLBACK_WARNING = (
-	"Meta allows one callback URL per app. The callback must be Huf's webhook "
-	"URL shown above, not frappe_whatsapp's webhook route. Setting frappe_whatsapp's "
-	"route as the callback bypasses Huf's signature verification."
+	"Meta allows one callback URL per app. Use the webhook URL shown above as the callback, "
+	"not the WhatsApp Business app connector's own webhook route. Using the connector's route "
+	"bypasses Huf's signature verification."
 )
 _TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 _MIN_PHONE_DIGITS = 7
@@ -253,6 +254,7 @@ def sync_templates(account: str | None = None) -> dict[str, Any]:
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
 @_bridge_guard
 def send_template_message(
 	to: str | None = None,
@@ -284,6 +286,7 @@ def send_template_message(
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
 @_bridge_guard
 def send_text_message(gateway_name: str | None = None, to: str | None = None, text: str | None = None) -> dict[str, Any]:
 	"""Send a free-form text, only while the 24h customer-service window is open."""

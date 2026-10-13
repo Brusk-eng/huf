@@ -180,6 +180,8 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 		frappe.local.request = SimpleNamespace(args={"gateway_name": self.gateway.name})
 		if not getattr(frappe.local, "response", None):
 			frappe.local.response = frappe._dict()
+		self._prev_request_ip = getattr(frappe.local, "request_ip", None)
+		frappe.local.request_ip = "127.0.0.1"  # rate_limit on whitelisted endpoints needs an identity
 		self.addCleanup(self._restore_request)
 		# no worker is running; never really enqueue
 		enq = patch("frappe.enqueue")
@@ -191,6 +193,7 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 
 	def _restore_request(self):
 		frappe.local.request = self._prev_request
+		frappe.local.request_ip = self._prev_request_ip
 
 	def _meta_get(self, url, **kwargs):
 		self.meta.calls.append({"method": "GET", "url": url, "body": None, "headers": kwargs.get("headers", {})})

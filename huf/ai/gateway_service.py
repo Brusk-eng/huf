@@ -948,14 +948,14 @@ def test_gateway_send(gateway_name: str, test_recipient_id: str) -> dict:
 		}
 
 	except _whatsapp_send_errors(gateway.provider if gateway is not None else None) as exc:
-		error_msg = _whatsapp_error_text(exc)
+		error_msg = _redact_error_text(_whatsapp_error_text(exc))
 		return {
 			"success": False,
 			"message": f"Failed to send test message: {error_msg}",
 			"provider_response": error_msg,
 		}
 	except Exception as exc:
-		error_msg = str(exc)
+		error_msg = _redact_error_text(str(exc))
 		return {
 			"success": False,
 			"message": f"Failed to send test message: {error_msg}",

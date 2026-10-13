@@ -152,7 +152,7 @@ class TestWhatsAppManagement(unittest.TestCase):
 			gateway["webhook_url"],
 			"https://huf.example.com/api/method/huf.ai.gateway_webhook.handle_gateway_webhook?gateway_name=GW-1",
 		)
-		self.assertIn("frappe_whatsapp", gateway["callback_warning"])
+		self.assertIn("connector", gateway["callback_warning"])
 		self.assertNotIn("verify-me", json.dumps(result))
 
 	def test_setup_status_requires_admin_role(self):

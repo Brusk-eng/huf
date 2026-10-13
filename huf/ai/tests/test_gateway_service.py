@@ -1170,7 +1170,7 @@ class TestWhatsAppGatewayService(unittest.TestCase):
 
         mock_frappe.has_permission.return_value = True
         mock_frappe.get_doc.return_value = SimpleNamespace(
-            enabled=1, provider="WhatsApp", integration_settings="IS-1"
+            is_enabled=1, provider="WhatsApp", integration_settings="IS-1"
         )
         adapter = MagicMock()
         adapter.send_reply.side_effect = WhatsAppWindowClosed("window closed for 1234567890")
