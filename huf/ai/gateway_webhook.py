@@ -229,8 +229,102 @@ def _text_response(value: str) -> None:
 	)
 
 
+def _ingest_rate_gate() -> None:
+	"""Count one request against the per-gateway ingest rate limit (100/60s).
+
+	This used to be a decorator on ``handle_gateway_webhook``, which counted
+	every POST. Providers that batch and interleave delivery receipts
+	(WhatsApp) must not have status-only traffic consume the ingest budget, so
+	the same ``rate_limit`` is now applied explicitly: up front for
+	single-event providers (unchanged), and only for forged requests or
+	payloads that actually carry messages for ``parse_payload`` providers.
+	"""
+
+
+_ingest_rate_gate = rate_limit(key="gateway_name", limit=100, seconds=60)(_ingest_rate_gate)
+
+
+def _supports_batch_parse(adapter) -> bool:
+	# Class-level lookup so duck-typed/mock adapters do not accidentally qualify.
+	return callable(getattr(type(adapter), "parse_payload", None))
+
+
+def _handle_batched_payload(gateway, adapter, request) -> dict:
+	"""Fan out one verified, possibly batched, provider delivery (WhatsApp)."""
+	from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+	from huf.ai.gateway_service import ingest_gateway_event
+
+	try:
+		parsed = adapter.parse_payload(request)
+	except ValueError:
+		frappe.local.response.http_status_code = 400
+		return {"success": False, "error": "Invalid payload"}
+
+	if parsed.messages:
+		_ingest_rate_gate()
+
+	ingested = duplicates = 0
+	results: list[dict] = []
+	first_error = None
+	account_name = None
+	for event in parsed.messages:
+		try:
+			result = ingest_gateway_event(
+				gateway.name,
+				event.provider_event_id,
+				_event_context(event),
+				verified_sender=True,
+				raw_payload=dict(event.raw_payload),
+			)
+		except Exception as exc:  # keep fanning out; re-raised below so the provider retries (deduped)
+			frappe.log_error(frappe.get_traceback(), "WhatsApp gateway ingest failed")
+			first_error = first_error or exc
+			continue
+		results.append(result)
+		if result.get("duplicate"):
+			duplicates += 1
+			continue
+		ingested += 1
+		if result.get("status") == "Rejected":
+			continue
+		try:  # best-effort mirror into frappe_whatsapp (A4)
+			if account_name is None:
+				account_name = (getattr(gateway, "whatsapp_account", "") or "").strip()
+				if not account_name:
+					resolved = bridge.resolve_account(None)
+					account_name = (resolved or {}).get("name") or ""
+			message = (event.raw_payload or {}).get("message")
+			if account_name and isinstance(message, dict):
+				bridge.record_incoming(account_name, message, getattr(event, "display_name", "") or None)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "WhatsApp record_incoming failed")
+
+	forwarded = 0
+	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
+	changes += [{"field": "message_template_status_update", "value": dict(update)} for update in parsed.template_updates]
+	for change in changes:
+		try:
+			if bridge.forward_status(change):
+				forwarded += 1
+		except Exception:
+			pass  # best effort, never fail the ack
+
+	if first_error is not None:
+		raise first_error
+	return {
+		"success": True,
+		"messages": len(parsed.messages),
+		"ingested": ingested,
+		"duplicates": duplicates,
+		"statuses": len(parsed.statuses),
+		"template_updates": len(parsed.template_updates),
+		"forwarded": forwarded,
+		"ignored": parsed.ignored,
+		"results": results,
+	}
+
+
 @frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
-@rate_limit(key="gateway_name", limit=100, seconds=60)
 def handle_gateway_webhook() -> dict | None:
 	"""Verify a native provider callback, then hand only normalized data to Gateway.
 
@@ -263,11 +357,23 @@ def handle_gateway_webhook() -> dict | None:
 	adapter = get_gateway_adapter(gateway)
 	request = _inbound_request()
 	if request.method == "GET" and hasattr(adapter, "verify_url"):
-		_text_response(adapter.verify_url(request) or "")
+		try:
+			challenge = adapter.verify_url(request) or ""
+		except frappe.PermissionError:
+			frappe.local.response.http_status_code = 403
+			return {"success": False, "error": "Webhook verification failed"}
+		_text_response(challenge)
 		return None
+	batched = _supports_batch_parse(adapter)
+	if not batched:
+		_ingest_rate_gate()
 	if not adapter.verify_inbound(request):
+		if batched:
+			_ingest_rate_gate()  # forged/unsigned traffic still consumes the budget
 		frappe.local.response.http_status_code = 401
 		return {"success": False, "error": "Provider verification failed"}
+	if batched:
+		return _handle_batched_payload(gateway, adapter, request)
 
 	event = adapter.normalize_inbound(request)
 	result = ingest_gateway_event(
@@ -285,6 +391,17 @@ def send_gateway_reply(gateway, event, text: str):
 	from huf.ai.gateway_adapters.types import GatewayReply
 
 	adapter = get_gateway_adapter(gateway)
+	if gateway.provider == "WhatsApp":
+		# A2: WhatsApp never fragments conversations by thread; the reply quotes
+		# the inbound wamid, which is the event's provider_event_id.
+		return adapter.send_reply(
+			GatewayReply(
+				conversation_id=event.conversation_id,
+				text=text,
+				thread_id=None,
+				reply_to_provider_message_id=event.provider_event_id or None,
+			)
+		)
 	return adapter.send_reply(
 		GatewayReply(
 			conversation_id=event.conversation_id,
