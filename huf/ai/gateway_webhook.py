@@ -182,7 +182,18 @@ def _gateway_credentials(gateway) -> dict[str, str]:
 
 def get_gateway_adapter(gateway):
 	"""Instantiate the configured adapter without exposing stored credentials."""
-	return _adapter_class_for_provider(gateway.provider)(_gateway_credentials(gateway))
+	adapter_class = _adapter_class_for_provider(gateway.provider)
+	credentials = _gateway_credentials(gateway)
+	if gateway.provider == "WhatsApp":
+		return adapter_class(
+			credentials,
+			gateway_context={
+				"gateway_name": gateway.name,
+				"whatsapp_account": (gateway.get("whatsapp_account") or "").strip(),
+				"fallback_template": (gateway.get("fallback_template") or "").strip(),
+			},
+		)
+	return adapter_class(credentials)
 
 
 def _inbound_request():
