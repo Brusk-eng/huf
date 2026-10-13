@@ -912,7 +912,7 @@ def test_gateway_send(gateway_name: str, test_recipient_id: str) -> dict:
 	try:
 		gateway = frappe.get_doc("Gateway", gateway_name)
 
-		if not gateway.enabled:
+		if not gateway.is_enabled:
 			return {
 				"success": False,
 				"message": "Gateway is disabled. Enable it to test.",
