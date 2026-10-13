@@ -336,12 +336,11 @@ class TestFlowTriggerApi(_Base):
 		self.assertFalse(out["enabled"])
 		self.assertEqual(flow_api.get_flow_trigger(flow_id)["automation"], out["automation"])
 
-		# Same flow + same definition re-uses the procedure version; switching to an
-		# interval replaces the trigger in place (still exactly one).
-		again = flow_api.set_flow_trigger(flow_id, "schedule", interval="Daily", interval_count=2)
+		# Same flow + same definition re-uses the procedure version; re-setting the
+		# schedule replaces the trigger in place (still exactly one).
+		again = flow_api.set_flow_trigger(flow_id, "schedule", cron="0 9 * * *")
 		self.assertEqual(again["procedure"], out["procedure"])
-		self.assertEqual(again["interval"], "Daily")
-		self.assertIsNone(again["cron"])
+		self.assertEqual(again["cron"], "0 9 * * *")
 		self.assertEqual(frappe.db.count("Automation Trigger", {"automation": out["automation"]}), 1)
 
 		# Once the procedure is enabled, re-setting activates the automation.
@@ -387,11 +386,15 @@ class TestFlowTriggerApi(_Base):
 			{"trigger_type": "webhook"},
 			{"trigger_type": "schedule"},
 			{"trigger_type": "schedule", "cron": "* * *"},
-			{"trigger_type": "schedule", "interval": "Fortnightly"},
 			{"trigger_type": "doc_event"},
 		):
 			with self.assertRaises(frappe.ValidationError):
 				flow_api.set_flow_trigger(flow_id, **kwargs)
+
+	def test_interval_schedules_are_not_supported(self):
+		flow_id = self._flow()
+		with self.assertRaises(TypeError):
+			flow_api.set_flow_trigger(flow_id, "schedule", interval="Daily")
 
 	def test_legacy_flow_scheduling_is_gone(self):
 		for name in ("schedule_flow", "unschedule_flow", "get_flow_schedule", "execute_scheduled_flow"):

@@ -682,8 +682,6 @@ def _flow_trigger_summary(flow_id: str) -> dict | None:
 		out.update(
 			schedule_type=trigger.schedule_type,
 			cron=trigger.cron_expression,
-			interval=trigger.scheduled_interval,
-			interval_count=trigger.interval_count,
 		)
 	else:
 		out.update(
@@ -699,8 +697,6 @@ def set_flow_trigger(
 	flow_id: str,
 	trigger_type: str,
 	cron: str | None = None,
-	interval: str | None = None,
-	interval_count: int = 1,
 	reference_doctype: str | None = None,
 	doc_event: str | None = None,
 	condition: str | None = None,
@@ -716,8 +712,9 @@ def set_flow_trigger(
 	Args:
 	    flow_id: Flow Definition name.
 	    trigger_type: "schedule" or "doc_event".
-	    cron / interval: for schedule -- a 5-part cron expression, or one of
-	        Hourly/Daily/Weekly/Monthly/Yearly (with ``interval_count``).
+	    cron: for schedule -- a 5-part cron expression (evaluated in system time). Cron
+	        only: the Flow's trigger.schedule node config needs ``cron``, so interval
+	        schedules could not be mirrored into it.
 	    reference_doctype / doc_event / condition: for doc_event.
 	    run_as_user: identity the Procedure runs as (default: the caller).
 
@@ -739,18 +736,11 @@ def set_flow_trigger(
 
 	trigger_fields: dict = {"trigger_type": resolved_type}
 	if resolved_type == "Schedule":
-		if cron:
-			if len(cron.split()) != 5:
-				frappe.throw(_("Invalid cron expression. Expected 5 parts (minute hour day month day_of_week)."))
-			trigger_fields.update(schedule_type="Cron", cron_expression=cron)
-		elif interval:
-			if interval not in ("Hourly", "Daily", "Weekly", "Monthly", "Yearly"):
-				frappe.throw(_("interval must be one of Hourly, Daily, Weekly, Monthly, Yearly"))
-			trigger_fields.update(
-				schedule_type="Interval", scheduled_interval=interval, interval_count=int(interval_count or 1)
-			)
-		else:
-			frappe.throw(_("A schedule trigger needs either cron or interval."))
+		if not cron:
+			frappe.throw(_("A schedule trigger needs a cron expression."))
+		if len(cron.split()) != 5:
+			frappe.throw(_("Invalid cron expression. Expected 5 parts (minute hour day month day_of_week)."))
+		trigger_fields.update(schedule_type="Cron", cron_expression=cron)
 		trigger_fields["next_execution"] = None
 	else:
 		if not reference_doctype or not doc_event:
