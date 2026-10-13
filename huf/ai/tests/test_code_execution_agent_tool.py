@@ -58,8 +58,12 @@ class TestCodeExecutionArgPinning(FrappeTestCase):
 
 		with patch.object(sdk_tools, "get_function_from_name", return_value=fake_run_python):
 			tool = sdk_tools.create_function_tool(
-				"run_python", "d", RUN_PYTHON_PATH, {"type": "object", "properties": {}},
-				extra_args=extra_args, tool_type="Code Execution",
+				"run_python",
+				"d",
+				RUN_PYTHON_PATH,
+				{"type": "object", "properties": {}},
+				extra_args=extra_args,
+				tool_type="Code Execution",
 			)
 		asyncio.run(tool.on_invoke_tool(ctx, json.dumps(model_args)))
 		return captured
@@ -100,8 +104,9 @@ class TestCodeExecutionGates(FrappeTestCase):
 				code_execution.run_python("print(1)", agent_doc=_agent())
 
 	def test_dispatch_gate_missing_capability(self):
-		with patch.object(code_execution, "_is_site_enabled", return_value=True), patch.object(
-			code_execution, "has_capability", return_value=False
+		with (
+			patch.object(code_execution, "_is_site_enabled", return_value=True),
+			patch.object(code_execution, "has_capability", return_value=False),
 		):
 			with self.assertRaises(frappe.PermissionError):
 				code_execution.run_python("print(1)", agent_doc=_agent())
@@ -109,9 +114,11 @@ class TestCodeExecutionGates(FrappeTestCase):
 	def test_dispatch_gate_agent_not_enabled_hallucinated_call(self):
 		# A never-offered / hallucinated call reaches run_python for an agent
 		# that has code execution off: refused with no audit row created.
-		with patch.object(code_execution, "_is_site_enabled", return_value=True), patch.object(
-			code_execution, "has_capability", return_value=True
-		), patch.object(code_execution.frappe, "get_doc") as get_doc:
+		with (
+			patch.object(code_execution, "_is_site_enabled", return_value=True),
+			patch.object(code_execution, "has_capability", return_value=True),
+			patch.object(code_execution.frappe, "get_doc") as get_doc,
+		):
 			with self.assertRaises(frappe.ValidationError):
 				code_execution.run_python("print(1)", agent_doc=_agent(allow_code_execution=0))
 			get_doc.assert_not_called()
@@ -122,27 +129,41 @@ class TestCodeExecutionGates(FrappeTestCase):
 			self.assertFalse(PermissionAwareToolRegistry._allows_code_execution(tool, _agent(), "u@x.com"))
 		with patch("huf.permissions.has_capability", return_value=True):
 			self.assertFalse(
-				PermissionAwareToolRegistry._allows_code_execution(tool, _agent(allow_code_execution=0), "u@x.com")
+				PermissionAwareToolRegistry._allows_code_execution(
+					tool, _agent(allow_code_execution=0), "u@x.com"
+				)
 			)
 			self.assertFalse(PermissionAwareToolRegistry._allows_code_execution(tool, _agent(), "u@x.com"))
 
 	def test_guest_refused_at_offer_and_dispatch(self):
 		tool = SimpleNamespace(types="Code Execution", is_read_only=0, allowed_for_guest=0)
 		self.assertFalse(PermissionAwareToolRegistry._can_use_tool(tool, "Guest"))
-		with patch.object(code_execution, "_is_site_enabled", return_value=True), patch.object(
-			code_execution, "has_capability", return_value=False
+		with (
+			patch.object(code_execution, "_is_site_enabled", return_value=True),
+			patch.object(code_execution, "has_capability", return_value=False),
 		):
 			with self.assertRaises(frappe.PermissionError):
 				code_execution.run_python("print(1)", agent_doc=_agent())
 
 	def test_deterministic_path_refuses_code_execution(self):
 		# Flows/procedures have no agent: caller-supplied agent_doc must never be honoured.
-		doc = {"name": "x", "tool_name": "run_python", "types": "Code Execution", "function_path": None,
-			"reference_doctype": None, "reference_report": None, "agent": None, "function_name": None,
-			"allowed_for_guest": 0, "blocking": 0, "base_url": None}
-		with patch.object(tool_invocation, "resolve_tool_doc", return_value=doc), patch.object(
-			tool_invocation, "get_function_from_name"
-		) as getter:
+		doc = {
+			"name": "x",
+			"tool_name": "run_python",
+			"types": "Code Execution",
+			"function_path": None,
+			"reference_doctype": None,
+			"reference_report": None,
+			"agent": None,
+			"function_name": None,
+			"allowed_for_guest": 0,
+			"blocking": 0,
+			"base_url": None,
+		}
+		with (
+			patch.object(tool_invocation, "resolve_tool_doc", return_value=doc),
+			patch.object(tool_invocation, "get_function_from_name") as getter,
+		):
 			res = asyncio.run(tool_invocation.invoke_tool("run_python", {"code": "1", "agent_doc": "A"}))
 		self.assertFalse(res.success)
 		self.assertTrue(res.denied)
