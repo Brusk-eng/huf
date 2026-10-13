@@ -237,6 +237,13 @@ def list_templates(account: str | None = None, status: str | None = None) -> dic
 		return {"success": False, "error": "bridge_unavailable"}
 	_has_doctype_permission("WhatsApp Templates", "read")
 	templates = bridge.list_templates(account, status)
+	try:
+		buttons = bridge.template_buttons([t["name"] for t in templates])
+		if isinstance(buttons, dict):
+			for template in templates:
+				template["buttons"] = buttons.get(template["name"], [])
+	except Exception:
+		pass  # buttons are informational for the send dialog; never fail the listing
 	return {"success": True, "templates": templates}
 
 
@@ -290,8 +297,16 @@ def send_template_message(
 	body_params: Any = None,
 	header_params: Any = None,
 	account: str | None = None,
+	button_params: Any = None,
+	language_code: str | None = None,
 ) -> dict[str, Any]:
-	"""Send an approved template to a number. Allowed outside the 24h window."""
+	"""Send an approved template to a number. Allowed outside the 24h window.
+
+	``header_params`` is one text value or one ``{"type": "image|document", "link": ...}``
+	media object; ``button_params`` is ``[{"index": 0, "sub_type": "url", "text": "<suffix>"}]``
+	for dynamic URL buttons. Validation failures return ``validation_failed`` with
+	an ``errors`` list.
+	"""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	phone = _validate_recipient(to)
@@ -303,14 +318,19 @@ def send_template_message(
 	try:
 		body = _parse_json_arg(body_params, "body_params") or []
 		header = _parse_json_arg(header_params, "header_params") or []
+		buttons = _parse_json_arg(button_params, "button_params") or []
 	except ValueError as exc:
 		return {"success": False, "error": "invalid_params", "message": str(exc)}
-	if not isinstance(body, list) or not isinstance(header, list):
+	if isinstance(header, (str, dict)):
+		header = [header]
+	if not isinstance(body, list) or not isinstance(header, list) or not isinstance(buttons, list):
 		return {"success": False, "error": "invalid_params", "message": "Params must be lists"}
 	account_name = _resolve_account_name(account)
 	if isinstance(account_name, dict):
 		return account_name
-	return bridge.send_template(account_name, phone, template_name, body, header)
+	return bridge.send_template(
+		account_name, phone, template_name, body, header, button_params=buttons, language_code=language_code or None
+	)
 
 
 @frappe.whitelist(methods=["POST"])
@@ -345,6 +365,63 @@ def send_text_message(gateway_name: str | None = None, to: str | None = None, te
 	if isinstance(account_name, dict):
 		return account_name
 	return bridge.send_text(account_name, phone, str(text))
+
+
+def _public_file_link(file_url: str) -> str | dict[str, Any]:
+	"""Absolute link for an uploaded *public* File (Meta must be able to fetch it), or an error dict."""
+	file_url = str(file_url or "").strip()
+	if file_url.startswith("/private/") or not file_url.startswith("/files/"):
+		return {"success": False, "error": "invalid_file", "message": "Only public uploaded files (/files/...) can be sent."}
+	row = frappe.db.get_value("File", {"file_url": file_url}, ["name", "is_private"], as_dict=True)
+	if not row or row.get("is_private"):
+		return {"success": False, "error": "invalid_file", "message": "Uploaded public file not found."}
+	return frappe.utils.get_url() + quote(file_url, safe="/")
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+@_bridge_guard
+def send_media_message(
+	gateway_name: str | None = None,
+	to: str | None = None,
+	kind: str | None = None,
+	link: str | None = None,
+	file_url: str | None = None,
+	caption: str | None = None,
+	filename: str | None = None,
+) -> dict[str, Any]:
+	"""Send an image/document/audio/video, only while the 24h customer-service window is open.
+
+	Give a public ``link`` (https URL) or the ``file_url`` of a public uploaded File.
+	"""
+	if not bridge.is_available():
+		return {"success": False, "error": "bridge_unavailable"}
+	if not gateway_name:
+		return {"success": False, "error": "invalid_gateway", "message": "gateway_name is required."}
+	if not frappe.db.exists("Gateway", gateway_name):
+		return {"success": False, "error": "not_found", "message": "Gateway not found."}
+	_has_doctype_permission("Gateway", "read")
+	phone = _validate_recipient(to)
+	if isinstance(phone, dict):
+		return phone
+	if file_url and not link:
+		resolved = _public_file_link(file_url)
+		if isinstance(resolved, dict):
+			return resolved
+		link = resolved
+	state = bridge.window_state(gateway_name, phone)
+	if not state.get("open"):
+		return {
+			"success": False,
+			"error": "window_closed",
+			"message": "The 24-hour customer-service window is closed for this number.",
+			"hint": "Send an approved template with send_template_message instead.",
+			"expires_at": state.get("expires_at"),
+		}
+	account_name = _resolve_account_name(_gateway_whatsapp_account(gateway_name))
+	if isinstance(account_name, dict):
+		return account_name
+	return bridge.send_media(account_name, phone, kind or "", link=link, caption=caption, filename=filename)
 
 
 @frappe.whitelist()

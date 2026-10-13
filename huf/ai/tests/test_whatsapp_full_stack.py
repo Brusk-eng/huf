@@ -230,6 +230,7 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 			"language": "en",
 			"language_code": "en_US",
 			"body": "Hello {{1}}",
+			"sample_values": "Ann",
 		}
 		values.update(extra)
 		return mgmt.create_template(account=self.account.name, payload=values)
@@ -398,8 +399,8 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 		frappe.set_user(EXEC_USER)
 		try:
 			with self.assertRaises(frappe.PermissionError):
-				bridge.send_template(self.account.name, SENDER, "fs_trusted_tpl")
-			result = bridge.send_template(self.account.name, SENDER, "fs_trusted_tpl", trusted=True)
+				bridge.send_template(self.account.name, SENDER, "fs_trusted_tpl", ["Ann"])
+			result = bridge.send_template(self.account.name, SENDER, "fs_trusted_tpl", ["Ann"], trusted=True)
 		finally:
 			frappe.set_user("Administrator")
 		self.assertTrue(result["success"], result)

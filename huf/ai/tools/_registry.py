@@ -223,15 +223,17 @@ WHATSAPP_TOOLS = [
 			"Manage WhatsApp Business messaging via the Meta Cloud API. Actions: "
 			"send_message (to/recipient/phone_number, message/text; free-form sends outside the "
 			"24h window may be refused), "
-			"send_template (to/recipient, template_name, language_code, parameters), "
+			"send_media (to, kind image|document|audio|video, link, caption, filename; same 24h window rules as send_message), "
+			"send_template (to/recipient, template_name, language_code, parameters, header_params, button_params), "
 			"list_messages (to, from, limit), get_account_info, "
 			"list_templates (whatsapp_account, status), "
-			"create_template (template_name, category, language_code, body; may be refused by server policy)."
+			"create_template (template_name, category, language_code, body, sample_values, optional header_type/header/sample, "
+			"footer, buttons; may be refused by server policy)."
 		),
 		"function_path": "huf.ai.tools.whatsapp.handle_action",
 		"category": "Communication Tools",
 		"parameters": [
-			_action("send_message|send_template|list_messages|get_account_info|list_templates|create_template"),
+			_action("send_message|send_media|send_template|list_messages|get_account_info|list_templates|create_template"),
 			_p("to", description="Recipient phone number (E.164). Alias: recipient, phone_number."),
 			_p("recipient", description="Alias for 'to'."),
 			_p("phone_number", description="Alias for 'to'."),
@@ -244,6 +246,22 @@ WHATSAPP_TOOLS = [
 			),
 			_p("language_code", description="Template language code, e.g. 'en' or 'en_US' (default 'en')."),
 			_p("body", description="Template body text for create_template. Use {{1}}, {{2}} for variables."),
+			_p("sample_values", description="Comma-separated example values for the body placeholders (create_template)."),
+			_p("header_type", description="Optional template header type for create_template: TEXT, IMAGE or DOCUMENT."),
+			_p("header", description="Header text for a TEXT header (at most one {{1}} variable, 60 chars)."),
+			_p("sample", description="Header example: example value for a TEXT header variable, or an https URL of a sample file for IMAGE/DOCUMENT."),
+			_p("footer", description="Optional template footer (60 chars, no variables)."),
+			_p(
+				"buttons",
+				type="array",
+				description="Template buttons: [{type: QUICK_REPLY|URL|PHONE_NUMBER, text (25 chars), url, example, phone_number}]. Max 3 quick replies or 2 call-to-action buttons.",
+			),
+			_p("header_params", type="array", description="send_template header parameter: one text value, or one {type: image|document, link} object."),
+			_p("button_params", type="array", description="send_template URL button parameters: [{index: 0, sub_type: 'url', text: '<url suffix>'}]."),
+			_p("kind", description="Media kind for send_media: image, document, audio or video."),
+			_p("link", description="Public https URL of the media for send_media."),
+			_p("caption", description="Caption for send_media (not for audio)."),
+			_p("filename", description="Filename shown for a document in send_media."),
 			_p("limit", type="integer", description="Max messages to return for list_messages (default 20)."),
 			_p("whatsapp_account", description="WhatsApp Account name to use for list_templates, create_template or send_message."),
 			_p("status", description="Filter for list_templates by approval status, e.g. APPROVED or PENDING."),

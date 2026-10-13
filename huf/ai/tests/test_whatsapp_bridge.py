@@ -245,14 +245,28 @@ class TestBridge(unittest.TestCase):
 		with avail(), patch.object(wb, "resolve_account", return_value=ACCT), patch.object(frappe, "get_doc", return_value=doc) as gd, patch.object(
 			wb, "_template_docname", return_value="hello_tpl-en_US"
 		), patch.object(frappe.db, "commit") as commit:
-			wb.send_template("ACC", "+1 415", "hello_tpl", ["a", "b"], ["h"])
+			wb.send_template("ACC", "+1 415", "hello_tpl", ["a", "b"])
 		v = gd.call_args.args[0]
 		self.assertEqual(v["use_template"], 1)
 		self.assertEqual(v["template"], "hello_tpl-en_US")
 		self.assertEqual(v["template_parameters"], "a,b")
-		self.assertEqual(v["template_header_parameters"], "h")
 		self.assertEqual(doc.insert_kwargs, {"ignore_permissions": False})
 		commit.assert_not_called()  # user-initiated path never commits
+
+	def test_send_template_with_header_param_posts_to_graph_and_mirrors_without_resend(self):
+		doc = FakeDoc()
+		with avail(), patch.object(wb, "resolve_account", return_value=ACCT), patch.object(
+			frappe, "get_doc", return_value=doc
+		) as gd, patch.object(wb, "_template_docname", return_value="hello_tpl-en_US"), patch.object(
+			wb, "_graph_post_message", return_value="wamid.G1"
+		) as post, patch.object(frappe, "has_permission", return_value=True):
+			res = wb.send_template("ACC", "+1 415", "hello_tpl", ["a", "b"], ["h"])
+		self.assertEqual(res["message_id"], "wamid.G1")
+		components = post.call_args.args[1]["template"]["components"]
+		self.assertEqual(components[0], {"type": "header", "parameters": [{"type": "text", "text": "h"}]})
+		v = gd.call_args.args[0]
+		self.assertEqual(v["message_id"], "wamid.G1")  # preset message_id: frappe_whatsapp will not send again
+		self.assertEqual(v["template_header_parameters"], "h")
 
 	def test_trusted_sends_commit_right_after_insert(self):
 		for send in (
@@ -302,7 +316,7 @@ class TestBridge(unittest.TestCase):
 			self.assertEqual(gl.call_args.kwargs["filters"], {"whatsapp_account": "ACC", "status": "APPROVED"})
 
 	def test_create_template(self):
-		good = {"template_name": "promo_1", "category": "marketing", "language_code": "en_US", "template": "Hi {{1}}"}
+		good = {"template_name": "promo_1", "category": "marketing", "language_code": "en_US", "template": "Hi {{1}}", "sample_values": "Ann"}
 		with avail(False):
 			self.assertEqual(wb.create_template("ACC", good)["error"], "bridge_unavailable")
 		with avail(), patch.object(frappe, "has_permission", return_value=False):
@@ -324,11 +338,21 @@ class TestBridge(unittest.TestCase):
 		with avail(), patch.object(frappe, "has_permission", return_value=False):
 			with self.assertRaises(frappe.PermissionError):
 				wb.delete_template("T")
+
+		def exists(doctype, *a, **k):
+			return doctype != "WhatsApp Message"  # the template exists and has no sent messages
+
 		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
-			frappe.db, "exists", return_value=True
+			frappe.db, "exists", side_effect=exists
 		), patch.object(frappe, "delete_doc") as dd:
 			self.assertTrue(wb.delete_template("T")["success"])
 			dd.assert_called_once_with("WhatsApp Templates", "T")
+		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
+			frappe.db, "exists", return_value=True
+		), patch.object(frappe, "delete_doc") as dd:
+			res = wb.delete_template("T")  # sent messages reference it: refuse before Meta is touched
+			self.assertEqual(res["error"], "template_in_use")
+			dd.assert_not_called()
 
 	def test_sync_templates(self):
 		calls = []

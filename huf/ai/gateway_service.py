@@ -243,7 +243,15 @@ def _save_whatsapp_media(event, gateway) -> list[str]:
 
         from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 
-        downloaded = bridge.download_media((getattr(gateway, "whatsapp_account", "") or "").strip() or None, media_id)
+        account = (getattr(gateway, "whatsapp_account", "") or "").strip() or None
+        direct = None
+        if not account:
+            # Direct mode (no WhatsApp Account): use the gateway's own Meta credentials.
+            from huf.ai.gateway_webhook import _gateway_credentials
+
+            creds = _gateway_credentials(gateway)
+            direct = {"token": creds.get("access_token"), "url": bridge.graph_base_url(creds.get("graph_api_url"))}
+        downloaded = bridge.download_media(account, media_id, credentials=direct)
         name = os.path.basename(str(downloaded.get("filename") or media_id))
         name = _MEDIA_SAFE_NAME.sub("_", name).lstrip(".")[:100] or "media"
         file_doc = frappe.get_doc(

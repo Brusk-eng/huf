@@ -6,8 +6,8 @@
 Single consolidated tool that performs WhatsApp Cloud API actions via an
 `action` parameter.
 
-Actions: send_message, send_template, list_messages, get_account_info,
-list_templates, create_template.
+Actions: send_message, send_media, send_template, list_messages,
+get_account_info, list_templates, create_template.
 
 Privilege gating (A8)
 ---------------------
@@ -30,6 +30,9 @@ Credentials (``access_token``, ``phone_number_id``) are never tool
 parameters: tool arguments are persisted in Agent Tool Call, so any such
 keys supplied in a call are popped and discarded.
 
+``send_media`` (image/document/audio/video by public ``link``) is free-form
+too and follows exactly the same proactive logic and flags as ``send_message``.
+
 A free-form ``send_message`` is proactive unless ``gateway_name`` is given
 and ``bridge.window_state(gateway_name, to)`` reports an open window. When a
 gateway is named, the message is sent from that gateway's own WhatsApp
@@ -49,6 +52,7 @@ import frappe
 import requests
 
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+from huf.ai.gateway_adapters import whatsapp_templates as wt
 
 META_GRAPH_URL = f"https://graph.facebook.com/{bridge.GRAPH_DEFAULT_VERSION}"
 
@@ -95,6 +99,21 @@ def _server_flag(name: str) -> bool:
 	return False
 
 
+def _graph_root() -> str:
+	"""Versioned Graph root; the optional ``graph_api_url`` credential only counts under tests."""
+	override = ""
+	try:
+		settings_list = frappe.get_all("Integration Settings", filters={"service": "whatsapp", "is_active": 1}, limit=1)
+		if settings_list:
+			doc = frappe.get_doc("Integration Settings", settings_list[0].name)
+			for row in doc.credentials or []:
+				if row.key == "graph_api_url":
+					override = row.get_password("value") or ""
+	except Exception:
+		override = ""
+	return f"{bridge.graph_base_url(override)}/{bridge.GRAPH_DEFAULT_VERSION}"
+
+
 def _get_whatsapp_credentials(kwargs: dict | None = None) -> tuple[str, str]:
 	"""Get phone_number_id and access_token from server-side configuration only."""
 	phone_number_id = ""
@@ -133,6 +152,8 @@ def handle_action(action: str, **kwargs: Any) -> str:
 
 	if action == "send_message":
 		return _send_message(kwargs)
+	elif action == "send_media":
+		return _send_media(kwargs)
 	elif action == "send_template":
 		return _send_template(kwargs)
 	elif action == "list_messages":
@@ -145,7 +166,7 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		return _create_template(kwargs)
 	else:
 		return _error(
-			f"Unknown action '{action}'. Supported actions: send_message, send_template, "
+			f"Unknown action '{action}'. Supported actions: send_message, send_media, send_template, "
 			"list_messages, get_account_info, list_templates, create_template"
 		)
 
@@ -234,7 +255,7 @@ def _send_message(kwargs: dict) -> str:
 	if not phone_number_id or not access_token:
 		return _error("WhatsApp credentials not found")
 
-	url = f"{META_GRAPH_URL}/{phone_number_id}/messages"
+	url = f"{_graph_root()}/{phone_number_id}/messages"
 	headers = {
 		"Authorization": f"Bearer {access_token}",
 		"Content-Type": "application/json",
@@ -275,6 +296,76 @@ def _send_message(kwargs: dict) -> str:
 		return _error(f"Failed to send WhatsApp message: {str(e)}")
 
 
+def _json_list(value: Any) -> Optional[list]:
+	"""A list argument that may arrive as a JSON string; None when it is not a list."""
+	if value in (None, ""):
+		return []
+	if isinstance(value, str):
+		try:
+			value = json.loads(value)
+		except ValueError:
+			return None
+	if isinstance(value, dict):
+		return [value]
+	return value if isinstance(value, list) else None
+
+
+def _send_media(kwargs: dict) -> str:
+	"""Send an image/document/audio/video by public link (window / proactive gated like send_message)."""
+	recipient = bridge.normalize_phone(kwargs.get("to") or kwargs.get("recipient") or kwargs.get("phone_number") or "")
+	if not recipient:
+		return _error("Recipient phone number ('to') is required")
+	media, errors = wt.validate_media_request(
+		kwargs.get("kind") or kwargs.get("media_type"),
+		kwargs.get("link") or kwargs.get("url"),
+		kwargs.get("media_id"),
+		kwargs.get("caption"),
+		kwargs.get("filename"),
+	)
+	if errors:
+		return json.dumps(wt.validation_error(errors), default=str)
+
+	if _is_proactive_send(kwargs, recipient) and not (
+		_server_flag("allow_proactive") or _server_flag("allow_whatsapp_management")
+	):
+		return _refused(
+			"proactive_send_not_permitted",
+			"No open 24h window for this number. Enable allow_proactive to send free-form media.",
+		)
+
+	acct = _resolve_bridge_account(kwargs)
+	if acct:
+		try:
+			res = bridge.send_media(
+				acct["name"], recipient, media["kind"], link=media["link"], media_id=media["media_id"],
+				caption=media["caption"], filename=media["filename"],
+			)
+		except bridge.BridgeError as e:
+			return json.dumps(e.payload, default=str)
+		except frappe.PermissionError:
+			return _refused("permission_denied", "Not permitted to send WhatsApp messages")
+		except Exception as e:
+			return _error(f"Failed to send WhatsApp media: {str(e)}")
+		return _success({"message_id": res.get("message_id"), "recipient": recipient, "status": "sent", "name": res.get("name")})
+
+	phone_number_id, access_token = _get_whatsapp_credentials()
+	if not phone_number_id or not access_token:
+		return _error("WhatsApp credentials not found")
+	try:
+		res = requests.post(
+			f"{_graph_root()}/{phone_number_id}/messages",
+			json=wt.build_media_payload(recipient, media),
+			headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+			timeout=15,
+		)
+		data = res.json()
+		if res.status_code != 200 or "error" in data:
+			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+		return _success({"message_id": data.get("messages", [{}])[0].get("id"), "recipient": recipient, "status": "sent"})
+	except Exception as e:
+		return _error(f"Failed to send WhatsApp media: {str(e)}")
+
+
 def _send_template(kwargs: dict) -> str:
 	"""Send a pre-approved WhatsApp template message.
 
@@ -288,16 +379,27 @@ def _send_template(kwargs: dict) -> str:
 	template_name = (kwargs.get("template_name") or "").strip()
 	language_code = (kwargs.get("language_code") or "en").strip()
 	parameters = kwargs.get("parameters") or []
+	header_params = _json_list(kwargs.get("header_params"))
+	button_params = _json_list(kwargs.get("button_params"))
 
 	if not recipient or not template_name:
 		return _error("Recipient ('to') and 'template_name' are required")
 	if not isinstance(parameters, list):
 		return _error("'parameters' must be a list of strings")
+	if header_params is None or button_params is None:
+		return _error("'header_params' and 'button_params' must be lists (or JSON lists)")
 
 	acct = _resolve_bridge_account(kwargs)
 	if acct:
 		try:
-			res = bridge.send_template(acct["name"], recipient, template_name, [str(p) for p in parameters])
+			extra: dict[str, Any] = {}
+			if header_params:
+				extra["header_params"] = header_params
+			if button_params:
+				extra["button_params"] = button_params
+			if kwargs.get("language_code"):
+				extra["language_code"] = language_code
+			res = bridge.send_template(acct["name"], recipient, template_name, [str(p) for p in parameters], **extra)
 		except bridge.BridgeError as e:
 			return json.dumps(e.payload, default=str)
 		except frappe.PermissionError:
@@ -310,22 +412,27 @@ def _send_template(kwargs: dict) -> str:
 	if not phone_number_id or not access_token:
 		return _error("WhatsApp credentials not found")
 
-	url = f"{META_GRAPH_URL}/{phone_number_id}/messages"
+	url = f"{_graph_root()}/{phone_number_id}/messages"
 	headers = {
 		"Authorization": f"Bearer {access_token}",
 		"Content-Type": "application/json",
 	}
+	errors: list[dict[str, str]] = []
+	body_n = [wt.validate_param_text(f"parameters[{i}]", p, errors) for i, p in enumerate(parameters)]
+	headers_n, herr = wt.normalize_header_params(header_params)
+	buttons_n, berr = wt.normalize_button_params(button_params)
+	errors += herr + berr
+	if any(isinstance(h, dict) and not h.get("type") for h in headers_n):
+		errors.append(wt._e("header_params", "invalid_type", "Media header needs a type (image, document or video)."))
+	if errors:
+		return json.dumps(wt.validation_error(errors), default=str)
 	template: dict[str, Any] = {
 		"name": template_name,
 		"language": {"code": language_code},
 	}
-	if parameters:
-		template["components"] = [
-			{
-				"type": "body",
-				"parameters": [{"type": "text", "text": str(value)} for value in parameters],
-			}
-		]
+	components = wt.build_template_components(body_n, headers_n, buttons_n)
+	if components:
+		template["components"] = components
 	payload = {
 		"messaging_product": "whatsapp",
 		"recipient_type": "individual",
@@ -374,7 +481,7 @@ def _get_account_info(kwargs: dict) -> str:
 	if not phone_number_id or not access_token:
 		return _error("WhatsApp credentials not found")
 
-	url = f"{META_GRAPH_URL}/{phone_number_id}"
+	url = f"{_graph_root()}/{phone_number_id}"
 	headers = {"Authorization": f"Bearer {access_token}"}
 
 	try:
@@ -407,7 +514,9 @@ def _create_template(kwargs: dict) -> str:
 
 	Requires ``allow_whatsapp_management`` enabled in
 	the server-side Integration Settings. Accepted fields: ``template_name``,
-	``category`` (MARKETING/UTILITY), ``language_code``, ``body``.
+	``category`` (MARKETING/UTILITY), ``language_code``, ``body`` (+ ``sample_values``),
+	optional ``header_type``/``header``/``sample``, ``footer`` and ``buttons``
+	(QUICK_REPLY, URL, PHONE_NUMBER). Validation errors are returned structured.
 	"""
 	if not _server_flag("allow_whatsapp_management"):
 		return _refused(
@@ -422,9 +531,17 @@ def _create_template(kwargs: dict) -> str:
 
 	payload = {
 		key: kwargs[key]
-		for key in ("template_name", "category", "language_code", "body")
+		for key in (
+			"template_name", "category", "language_code", "body", "template", "sample_values",
+			"header", "header_type", "sample", "footer", "buttons",
+		)
 		if kwargs.get(key) is not None
 	}
+	if isinstance(payload.get("buttons"), str):
+		try:
+			payload["buttons"] = json.loads(payload["buttons"])
+		except ValueError:
+			return _error("'buttons' must be a list (or JSON list)")
 	try:
 		result = bridge.create_template(acct["name"], payload)
 	except bridge.BridgeError as e:

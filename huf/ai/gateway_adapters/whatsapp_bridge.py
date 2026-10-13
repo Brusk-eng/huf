@@ -25,6 +25,9 @@ from urllib.parse import quote, urlparse
 import frappe
 import frappe.utils
 
+from huf.ai.gateway_adapters import whatsapp_templates as wt
+
+GRAPH_HOST = "https://graph.facebook.com"
 GRAPH_DEFAULT_VERSION = "v21.0"
 WINDOW_HOURS = 24
 DEFAULT_MAX_MEDIA_BYTES = 16 * 1024 * 1024
@@ -45,9 +48,31 @@ def _redact(text: Any) -> str:
 	return _URL_RE.sub("[url]", out)
 
 
+def _test_hosts() -> set[str]:
+	"""Extra ``host:port`` entries, honoured ONLY while running tests.
+
+	``frappe.flags.whatsapp_test_media_hosts`` lets integration tests point media
+	downloads at a local fake Graph server. It is ignored unless
+	``frappe.flags.in_test`` is set, so production allowlists cannot be widened
+	through it.
+	"""
+	if not getattr(frappe.flags, "in_test", False):
+		return set()
+	return {str(h).lower() for h in (getattr(frappe.flags, "whatsapp_test_media_hosts", None) or ())}
+
+
+def graph_base_url(override: str | None = None) -> str:
+	"""Graph API host; ``override`` (a credential) is honoured only while running tests."""
+	if override and getattr(frappe.flags, "in_test", False):
+		return str(override).strip().rstrip("/")
+	return GRAPH_HOST
+
+
 def _is_media_host(url: str) -> bool:
 	parsed = urlparse(url)
 	host = (parsed.hostname or "").lower()
+	if host and parsed.netloc.lower() in _test_hosts():
+		return parsed.scheme in ("http", "https")
 	if parsed.scheme != "https" or not host:
 		return False
 	return any(host == suf or host.endswith("." + suf) for suf in _MEDIA_HOST_SUFFIXES)
@@ -337,6 +362,97 @@ def template_language(account_name: str, template_name: str, preferred: str | No
 	return None
 
 
+def _default_post(*args: Any, **kwargs: Any) -> Any:
+	import requests
+
+	kwargs.setdefault("timeout", _HTTP_TIMEOUT)
+	return requests.post(*args, **kwargs)
+
+
+def graph_error_message(resp: Any) -> str:
+	"""Readable, token-free message from a Meta Graph error response."""
+	try:
+		err = (resp.json() or {}).get("error") or {}
+	except Exception:
+		err = {}
+	if err:
+		details = (err.get("error_data") or {}).get("details")
+		parts = [f"({err.get('code')})" if err.get("code") is not None else "", str(err.get("message") or "")]
+		if details:
+			parts.append(str(details))
+		return _redact(" ".join(p for p in parts if p).strip())
+	return _redact(getattr(resp, "text", "") or f"HTTP {getattr(resp, 'status_code', '?')}")
+
+
+def _graph_post_message(acct: dict[str, Any], data: dict[str, Any], http_post: Callable[..., Any] | None = None) -> str:
+	"""POST a ``/messages`` body with the account credentials; returns the wamid or raises BridgeError."""
+	http_post = http_post or _default_post
+	url = f"{acct['url']}/{acct['version']}/{acct['phone_id']}/messages"
+	try:
+		resp = http_post(
+			url,
+			json=data,
+			headers={"Authorization": f"Bearer {acct['token']}", "Content-Type": "application/json"},
+			timeout=_HTTP_TIMEOUT,
+		)
+	except Exception as exc:
+		raise BridgeError(_err("send_failed", message=_redact(exc))) from exc
+	status = getattr(resp, "status_code", 200)
+	if isinstance(status, int) and status >= 400:
+		raise BridgeError(_err("send_failed", message=graph_error_message(resp)))
+	try:
+		return str(resp.json()["messages"][0]["id"])
+	except Exception as exc:
+		raise BridgeError(_err("send_failed", message="Unexpected response from WhatsApp.")) from exc
+
+
+def _template_row(docname: str) -> dict[str, Any] | None:
+	"""Header/body/button definition of a WhatsApp Templates document (None if unknown)."""
+	if not frappe.db.exists("WhatsApp Templates", docname):
+		return None
+	row = frappe.db.get_value(
+		"WhatsApp Templates",
+		docname,
+		["template", "header_type", "header", "sample", "actual_name", "template_name", "language_code", "status"],
+		as_dict=True,
+	)
+	row["buttons"] = frappe.get_all(
+		"WhatsApp Button",
+		filters={"parent": docname, "parenttype": "WhatsApp Templates"},
+		fields=["button_type", "button_label", "url_type", "website_url"],
+		order_by="idx asc",
+	)
+	return row
+
+
+def _mirror_template_send(acct: dict[str, Any], docname: str, to: str, wamid: str, values: dict[str, Any], trusted: bool) -> dict[str, Any]:
+	"""Record a Graph-sent template as an Outgoing ``WhatsApp Message`` without sending again.
+
+	``message_id`` is preset, which makes frappe_whatsapp skip its own send.
+	"""
+	doc_values = {
+		"doctype": "WhatsApp Message",
+		"type": "Outgoing",
+		"to": normalize_phone(to),
+		"use_template": 1,
+		"template": docname,
+		"whatsapp_account": acct["name"],
+		"content_type": "text",
+		"message_id": wamid,
+		"status": "Success",
+		**values,
+	}
+	try:
+		doc = frappe.get_doc(doc_values)
+		doc.insert(ignore_permissions=bool(trusted))
+		if trusted:
+			frappe.db.commit()
+		return {"success": True, "name": doc.name, "message_id": wamid, "status": doc.get("status")}
+	except Exception:
+		# The template is already delivered; a failed audit row must not fail the send.
+		return {"success": True, "name": None, "message_id": wamid, "status": "Success", "mirrored": False}
+
+
 def send_template(
 	account_name: str,
 	to: str,
@@ -345,35 +461,193 @@ def send_template(
 	header_params: list | None = None,
 	trusted: bool = False,
 	language_code: str | None = None,
+	button_params: list | None = None,
+	http_post: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-	"""Send an approved template via an Outgoing ``WhatsApp Message`` (use_template=1).
+	"""Send an approved template.
 
-	Permission-checked unless ``trusted=True``, which is only for the
-	gateway-internal reply path (the Gateway's service user does not hold
-	WhatsApp Message create rights). Raises :class:`BridgeError`.
+	Plain body-only sends use an Outgoing ``WhatsApp Message`` (use_template=1),
+	which frappe_whatsapp sends. Sends with header or button parameters (text
+	header variable, media header link, dynamic URL suffix) need components that
+	frappe_whatsapp cannot build without a reference document, so those are
+	posted to Graph with the account credentials and mirrored into
+	``WhatsApp Message`` without a second send.
+
+	``header_params``: one text string or one ``{"type": image|document|video,
+	"link": ..., "filename"?: ...}``. ``button_params``: ``[{"index": 0,
+	"sub_type": "url", "text": "<suffix>"}]`` (a bare string is the URL suffix at
+	its list position). Permission-checked unless ``trusted=True`` (gateway-internal
+	reply path). Raises :class:`BridgeError` (``.payload`` is the error dict).
 	"""
-	_account_or_error(account_name)
-	params = [str(p) for p in (body_params or [])]
+	acct = _account_or_error(account_name)
+	errors: list[dict[str, str]] = []
+	params = [wt.validate_param_text(f"body_params[{i}]", p, errors) for i, p in enumerate(body_params or [])]
+	headers_n, header_errors = wt.normalize_header_params(header_params)
+	buttons_n, button_errors = wt.normalize_button_params(button_params)
+	errors += header_errors + button_errors
+	docname = _template_docname(account_name, template_name, language_code)
+	tpl = _template_row(docname)
+	if tpl:
+		errors += _check_send_against_template(tpl, params, headers_n, buttons_n)
+	if errors:
+		raise BridgeError(wt.validation_error(errors))
+
+	header_type = (tpl or {}).get("header_type") or ""
+	if (
+		tpl
+		and header_type in wt.MEDIA_HEADER_TYPES
+		and not headers_n
+		and not (header_type == "IMAGE" and wt.is_http_url(str(tpl.get("sample") or "")))
+	):
+		raise BridgeError(
+			wt.validation_error(
+				[wt._e("header_params", "required", f"This template has an {header_type} header; provide a media link.")]
+			)
+		)
+
+	if headers_n or buttons_n or (tpl and _has_dynamic_url(tpl)):
+		if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+			raise frappe.PermissionError("Not permitted to send WhatsApp messages")
+		for item in headers_n:
+			if isinstance(item, dict) and not item.get("type"):
+				item["type"] = header_type.lower() if header_type else "image"
+		template_payload: dict[str, Any] = {
+			"name": (tpl or {}).get("actual_name") or (tpl or {}).get("template_name") or template_name,
+			"language": {"code": (tpl or {}).get("language_code") or language_code or "en_US"},
+		}
+		components = wt.build_template_components(params, headers_n, buttons_n, header_type, always_body=bool(params))
+		if components:
+			template_payload["components"] = components
+		wamid = _graph_post_message(
+			acct,
+			{
+				"messaging_product": "whatsapp",
+				"recipient_type": "individual",
+				"to": normalize_phone(to),
+				"type": "template",
+				"template": template_payload,
+			},
+			http_post,
+		)
+		mirror: dict[str, Any] = {"template_parameters": ",".join(params)}
+		if params:
+			mirror["body_param"] = json.dumps({str(i + 1): p for i, p in enumerate(params)})
+		media = next((h for h in headers_n if isinstance(h, dict)), None)
+		if media:
+			mirror["attach"] = media["link"]
+		elif headers_n:
+			mirror["template_header_parameters"] = str(headers_n[0])
+		return _mirror_template_send(acct, docname, to, wamid, mirror, trusted)
+
 	values: dict[str, Any] = {
 		"doctype": "WhatsApp Message",
 		"type": "Outgoing",
 		"to": normalize_phone(to),
 		"use_template": 1,
-		"template": _template_docname(account_name, template_name, language_code),
+		"template": docname,
 		"whatsapp_account": account_name,
 		"content_type": "text",
 		"template_parameters": ",".join(params),
 		# frappe_whatsapp builds the Meta payload from body_param (JSON dict values)
 		"body_param": json.dumps({str(i + 1): p for i, p in enumerate(params)}),
 	}
-	if header_params:
-		values["template_header_parameters"] = ",".join(str(p) for p in header_params)
 	try:
 		doc = frappe.get_doc(values)
 		doc.insert(ignore_permissions=bool(trusted))
 		if trusted:
 			# Gateway reply path runs in a background job: persist the outgoing row
 			# now so Meta's status webhook can match its wamid straight away.
+			frappe.db.commit()
+	except frappe.PermissionError:
+		raise
+	except Exception as exc:
+		raise BridgeError(_err("send_failed", message=_redact(exc))) from exc
+	return _readback(doc)
+
+
+def _has_dynamic_url(tpl: dict[str, Any]) -> bool:
+	return any(b.get("button_type") == "Visit Website" and b.get("url_type") == "Dynamic" for b in tpl.get("buttons") or [])
+
+
+def _check_send_against_template(
+	tpl: dict[str, Any], params: list[str], headers_n: list[Any], buttons_n: list[dict[str, Any]]
+) -> list[dict[str, str]]:
+	errors: list[dict[str, str]] = []
+	expected = len(wt.placeholders(tpl.get("template") or ""))
+	if expected != len(params):
+		errors.append(wt._e("body_params", "param_count_mismatch", f"This template takes {expected} body parameter(s); got {len(params)}."))
+	header_type = tpl.get("header_type") or ""
+	header_vars = len(wt.placeholders(tpl.get("header") or "")) if header_type == "TEXT" else 0
+	if header_type == "TEXT":
+		if header_vars and not headers_n:
+			errors.append(wt._e("header_params", "required", "This template header has a variable; provide one header parameter."))
+		elif not header_vars and headers_n:
+			errors.append(wt._e("header_params", "not_expected", "This template header takes no parameter."))
+		elif headers_n and isinstance(headers_n[0], dict):
+			errors.append(wt._e("header_params", "invalid_type", "This template header needs text, not media."))
+	elif header_type in wt.MEDIA_HEADER_TYPES:
+		if headers_n and not isinstance(headers_n[0], dict):
+			errors.append(wt._e("header_params", "invalid_type", f"This template has an {header_type} header; provide a media link."))
+		elif headers_n and headers_n[0].get("type") and headers_n[0]["type"] != header_type.lower():
+			errors.append(wt._e("header_params", "invalid_type", f"This template has an {header_type} header."))
+	elif headers_n:
+		errors.append(wt._e("header_params", "not_expected", "This template has no header."))
+	buttons = tpl.get("buttons") or []
+	dynamic = {i for i, b in enumerate(buttons) if b.get("button_type") == "Visit Website" and b.get("url_type") == "Dynamic"}
+	given = set()
+	for bp in buttons_n:
+		idx = bp["index"]
+		if bp["sub_type"] == "url":
+			if idx not in dynamic:
+				errors.append(wt._e("button_params", "unexpected", f"Button {idx} is not a dynamic URL button."))
+			given.add(idx)
+		elif idx >= len(buttons) or buttons[idx].get("button_type") != "Quick Reply":
+			errors.append(wt._e("button_params", "unexpected", f"Button {idx} is not a quick-reply button."))
+	for idx in sorted(dynamic - given):
+		errors.append(wt._e("button_params", "required", f"Button {idx} is a dynamic URL button and needs its URL suffix."))
+	return errors
+
+
+def send_media(
+	account_name: str,
+	to: str,
+	kind: str,
+	link: str | None = None,
+	media_id: str | None = None,
+	caption: str | None = None,
+	filename: str | None = None,
+	reply_to: str | None = None,
+	trusted: bool = False,
+) -> dict[str, Any]:
+	"""Send an image/document/audio/video as an Outgoing ``WhatsApp Message`` (it performs the send).
+
+	frappe_whatsapp's ``send_outgoing`` takes the media from ``attach`` (a public
+	link) and the caption from ``message``. It cannot send an uploaded media id or
+	a document filename, so those are rejected / ignored here. The caller is
+	responsible for the 24h window check; free-form media is subject to it.
+	"""
+	_account_or_error(account_name)
+	media, errors = wt.validate_media_request(kind, link, media_id, caption, filename)
+	if not errors and media["media_id"]:
+		errors.append(wt._e("media_id", "unsupported_in_bridge", "Bridge mode sends media by link; media_id needs direct mode."))
+	if errors:
+		raise BridgeError(wt.validation_error(errors))
+	values = {
+		"doctype": "WhatsApp Message",
+		"type": "Outgoing",
+		"to": normalize_phone(to),
+		"message": media["caption"],
+		"content_type": media["kind"],
+		"attach": media["link"],
+		"whatsapp_account": account_name,
+	}
+	if reply_to:
+		values["is_reply"] = 1
+		values["reply_to_message_id"] = reply_to
+	try:
+		doc = frappe.get_doc(values)
+		doc.insert(ignore_permissions=bool(trusted))
+		if trusted:
 			frappe.db.commit()
 	except frappe.PermissionError:
 		raise
@@ -394,14 +668,86 @@ def list_templates(account_name: str | None = None, status: str | None = None) -
 	return frappe.get_list(
 		"WhatsApp Templates",
 		filters=filters,
-		fields=["name", "template_name", "actual_name", "category", "language_code", "status", "id", "whatsapp_account", "template"],
+		fields=[
+			"name", "template_name", "actual_name", "category", "language_code", "status", "id",
+			"whatsapp_account", "template", "header_type", "header", "footer", "sample_values",
+		],
 		order_by="modified desc",
 		limit_page_length=500,
 	)
 
 
+def _check_sample_reference(sample: str) -> dict[str, str] | None:
+	"""Media header sample must be fetchable by frappe_whatsapp: public http(s) URL or an existing File."""
+	if wt.is_http_url(sample):
+		parsed = urlparse(sample)
+		if getattr(frappe.flags, "in_test", False):
+			return None
+		if parsed.scheme != "https" or _is_private_host(parsed.hostname or ""):
+			return wt._e("sample", "invalid_sample", "Sample URL must be a public https URL.")
+		return None
+	if not frappe.db.exists("File", {"file_url": sample}):
+		return wt._e("sample", "sample_not_found", "No uploaded file matches this sample path.")
+	return None
+
+
+def _is_private_host(host: str) -> bool:
+	import ipaddress
+	import socket
+
+	host = host.strip("[]").lower()
+	if host in ("localhost", "") or host.endswith(".localhost") or host.endswith(".local"):
+		return True
+	try:
+		addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+	except OSError:
+		return False  # unresolved here; the fetch will fail and be reported by frappe_whatsapp
+	for addr in addrs:
+		ip = ipaddress.ip_address(addr)
+		if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+			return True
+	return False
+
+
+def _language_link(language_code: str, given: Any) -> str | None:
+	"""``WhatsApp Templates.language`` (Link to Language) for a Meta language code."""
+	if given:
+		return str(given)
+	for candidate in (language_code.replace("_", "-"), language_code, language_code.split("_")[0]):
+		if frappe.db.exists("Language", candidate):
+			return candidate
+	return None
+
+
+_TEMPLATE_PASSTHROUGH = ("field_names", "for_doctype")
+
+
+def template_buttons(names: list[str]) -> dict[str, list[dict[str, Any]]]:
+	"""Button rows (``WhatsApp Button``) of the given templates, keyed by template name."""
+	if not names or not is_available():
+		return {}
+	rows = frappe.get_all(
+		"WhatsApp Button",
+		filters={"parent": ["in", list(names)], "parenttype": "WhatsApp Templates"},
+		fields=["parent", "button_type", "button_label", "url_type", "website_url", "phone_number"],
+		order_by="idx asc",
+	)
+	out: dict[str, list[dict[str, Any]]] = {}
+	for row in rows:
+		out.setdefault(row.pop("parent"), []).append(row)
+	return out
+
+
 def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-	"""Create a WhatsApp Templates row (its after_insert pushes to Meta). Permission-checked (A8)."""
+	"""Create a WhatsApp Templates row (its after_insert pushes to Meta). Permission-checked (A8).
+
+	Supports an optional header (TEXT with at most one variable, or IMAGE/DOCUMENT
+	with a sample file), footer and up to 3 quick-reply / 2 call-to-action
+	buttons, validated against Meta limits first. Field mapping follows the
+	``WhatsApp Templates`` / ``WhatsApp Button`` doctypes: ``header_type``,
+	``header``, ``sample``, ``footer``, ``sample_values`` and ``buttons`` child
+	rows. Validation failures return ``{"error": "validation_failed", "errors": [...]}``.
+	"""
 	if not is_available():
 		return _err("bridge_unavailable")
 	if not frappe.has_permission("WhatsApp Templates", "create"):
@@ -415,18 +761,42 @@ def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any
 		return _err("invalid_category", message="Category must be one of " + ", ".join(TEMPLATE_CATEGORIES))
 	if not language_code:
 		return _err("invalid_language", message="language_code is required")
-	values = {k: v for k, v in payload.items() if k not in ("name",)}
+	if len(name) > 512:
+		return wt.validation_error([wt._e("template_name", "too_long", "Template name is longer than 512 characters.")])
+	spec, errors = wt.validate_template_spec(payload)
+	if spec["header_type"] in wt.MEDIA_HEADER_TYPES and spec["header_sample"] and not errors:
+		problem = _check_sample_reference(spec["header_sample"])
+		if problem:
+			errors.append(problem)
+	language = _language_link(language_code, payload.get("language"))
+	if not language:
+		errors.append(wt._e("language_code", "unknown_language", f"Language {language_code} is not installed on this site."))
+	if errors:
+		return wt.validation_error(errors)
+	values: dict[str, Any] = {k: payload[k] for k in _TEMPLATE_PASSTHROUGH if payload.get(k)}
 	values.update(
 		{
 			"doctype": "WhatsApp Templates",
 			"template_name": name,
 			"category": category,
+			"language": language,
 			"language_code": language_code,
 			"whatsapp_account": account_name,
+			"template": spec["body"],
+			"sample_values": ",".join(spec["sample_values"]),
 		}
 	)
-	if "template" not in values and payload.get("body"):
-		values["template"] = payload["body"]
+	if spec["header_type"]:
+		values["header_type"] = spec["header_type"]
+		if spec["header_type"] == "TEXT":
+			values["header"] = spec["header_text"]
+		if spec["header_sample"]:
+			values["sample"] = spec["header_sample"]
+	if spec["footer"]:
+		values["footer"] = spec["footer"]
+	rows = wt.button_rows(spec)
+	if rows:
+		values["buttons"] = rows
 	try:
 		doc = frappe.get_doc(values)
 		doc.insert()
@@ -445,6 +815,13 @@ def delete_template(name: str) -> dict[str, Any]:
 		raise frappe.PermissionError("Not permitted to delete WhatsApp Templates")
 	if not frappe.db.exists("WhatsApp Templates", name):
 		return _err("not_found")
+	# frappe_whatsapp's on_trash deletes the template on Meta *before* Frappe's link check
+	# rejects the local delete, which would leave Meta and Huf out of sync. Check first.
+	if frappe.db.exists("WhatsApp Message", {"template": name}):
+		return _err(
+			"template_in_use",
+			message="This template has been used in sent messages and cannot be deleted.",
+		)
 	try:
 		frappe.delete_doc("WhatsApp Templates", name)
 	except frappe.PermissionError:
@@ -554,9 +931,21 @@ def download_media(
 	max_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
 	allowed_mime_prefixes: tuple[str, ...] = DEFAULT_MIME_PREFIXES,
 	http_get: Callable[..., Any] | None = None,
+	credentials: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-	"""Fetch media by id at call time. Raises ValueError on caps/mime/failure."""
-	acct = resolve_account(account_name)
+	"""Fetch media by id at call time. Raises ValueError on caps/mime/failure.
+
+	``credentials`` (``token``, optional ``url``/``version``) serves direct-mode
+	gateways that have no WhatsApp Account; otherwise the account is resolved.
+	"""
+	if credentials and credentials.get("token"):
+		acct = {
+			"token": credentials["token"],
+			"url": str(credentials.get("url") or GRAPH_HOST).rstrip("/"),
+			"version": credentials.get("version") or GRAPH_DEFAULT_VERSION,
+		}
+	else:
+		acct = resolve_account(account_name)
 	if not acct or acct.get("error"):
 		raise ValueError("no_account")
 	http_get = http_get or _default_get

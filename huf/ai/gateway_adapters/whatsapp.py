@@ -17,6 +17,7 @@ from typing import Any
 
 import frappe
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+from huf.ai.gateway_adapters import whatsapp_templates as wt
 from huf.ai.gateway_adapters.adapter import GatewayAdapter
 from huf.ai.gateway_adapters.types import (
 	GatewayAttachment,
@@ -73,7 +74,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		frozenset({"webhook"}),
 		supports_text_reply=True,
 		supports_thread_reply=False,  # A2: quoting never fragments the conversation
-		supports_media_reply=False,  # GW-32: send_reply only sends text today
+		supports_media_reply=True,  # send_media() and GatewayReply.attachments (url / media-id attachments)
 		max_outbound_messages_per_second=80,
 	)
 
@@ -91,6 +92,8 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		self._access_token = str(credentials["access_token"]).strip()
 		self._verify_token = str(credentials["webhook_verify_token"]).strip()
 		self._app_secret = str(credentials.get("app_secret") or "").strip()
+		# optional, honoured only under frappe.flags.in_test (see bridge.graph_base_url)
+		self._graph_url = f"{bridge.graph_base_url(str(credentials.get('graph_api_url') or ''))}/{GRAPH_VERSION}"
 		self._http_post = http_post
 		ctx = gateway_context or {}
 		self._gateway_name = str(ctx.get("gateway_name") or "").strip()
@@ -285,6 +288,9 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					"or wait for the customer to message again."
 				)
 
+		if reply.attachments:
+			return self._send_reply_media(reply)
+
 		if self._bridge_mode():
 			result = bridge.send_text(
 				self._account,
@@ -306,6 +312,94 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			data["context"] = {"message_id": reply.reply_to_provider_message_id}
 		return self._graph_send(data)
 
+	def _send_reply_media(self, reply: GatewayReply) -> OutboundDelivery:
+		"""Send the first attachment of a reply (caption = reply text), then audio's text separately."""
+		att = reply.attachments[0]
+		kind = (att.kind if att.kind in wt.MEDIA_KINDS else "") or _kind_from_mime(att.mime_type)
+		is_audio = kind == "audio"
+		delivery = self._deliver_media(
+			reply.conversation_id,
+			kind,
+			link=att.url,
+			media_id=None if att.url else att.file_id,
+			caption=None if is_audio else reply.text,
+			filename=att.filename or None,
+			reply_to=reply.reply_to_provider_message_id,
+			trusted=True,
+		)
+		if is_audio:
+			# Audio cannot carry a caption: follow with the text as a normal message.
+			text = self._send_text(reply)
+			return OutboundDelivery(
+				provider_message_id=text.provider_message_id,
+				provider_response={**dict(text.provider_response), "media_message_id": delivery.provider_message_id},
+			)
+		return delivery
+
+	def _send_text(self, reply: GatewayReply) -> OutboundDelivery:
+		if self._bridge_mode():
+			return _delivery_from_bridge(
+				bridge.send_text(
+					self._account,
+					reply.conversation_id,
+					reply.text,
+					reply_to=reply.reply_to_provider_message_id,
+					trusted=True,
+				)
+			)
+		data: dict[str, Any] = {
+			"messaging_product": "whatsapp",
+			"recipient_type": "individual",
+			"to": bridge.normalize_phone(reply.conversation_id),
+			"type": "text",
+			"text": {"preview_url": False, "body": reply.text},
+		}
+		if reply.reply_to_provider_message_id:
+			data["context"] = {"message_id": reply.reply_to_provider_message_id}
+		return self._graph_send(data)
+
+	def send_media(
+		self,
+		to: str,
+		kind: str,
+		link: str | None = None,
+		media_id: str | None = None,
+		caption: str | None = None,
+		filename: str | None = None,
+		reply_to: str | None = None,
+		trusted: bool = False,
+	) -> OutboundDelivery:
+		"""Send an image/document/audio/video (by public link or uploaded media id).
+
+		Free-form media is subject to the same 24h customer-service window as text:
+		a closed window raises :class:`WhatsAppWindowClosed` (there is no template
+		fallback for media). Bridge mode sends by link only.
+		"""
+		self._ensure_window(to)
+		return self._deliver_media(to, kind, link, media_id, caption, filename, reply_to, trusted)
+
+	def _ensure_window(self, to: str) -> None:
+		if self._gateway_name and not bridge.window_state(self._gateway_name, to).get("open"):
+			raise WhatsAppWindowClosed(
+				f"WhatsApp 24-hour customer-service window is closed for {to}. "
+				"Free-form media is not allowed; send an approved template or wait for the customer to message again."
+			)
+
+	def _deliver_media(
+		self, to, kind, link=None, media_id=None, caption=None, filename=None, reply_to=None, trusted=False
+	) -> OutboundDelivery:
+		if self._bridge_mode():
+			return _delivery_from_bridge(
+				bridge.send_media(
+					self._account, to, kind, link=link, media_id=media_id, caption=caption,
+					filename=filename, reply_to=reply_to, trusted=trusted,
+				)
+			)
+		media, errors = wt.validate_media_request(kind, link, media_id, caption, filename)
+		if errors:
+			raise bridge.BridgeError(wt.validation_error(errors))
+		return self._graph_send(wt.build_media_payload(bridge.normalize_phone(to), media, reply_to))
+
 	def send_template(
 		self,
 		to: str,
@@ -313,19 +407,34 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		language_code: str = DEFAULT_TEMPLATE_LANGUAGE,
 		body_params: list | tuple | None = None,
 		trusted: bool = False,
+		header_params: list | tuple | None = None,
+		button_params: list | tuple | None = None,
 	) -> OutboundDelivery:
-		"""Send an approved template (always allowed, window-independent)."""
+		"""Send an approved template (always allowed, window-independent).
+
+		``header_params``: a text variable string or a ``{"type", "link"}`` media dict.
+		``button_params``: ``[{"index": 0, "sub_type": "url", "text": "<suffix>"}]``.
+		"""
 		params = [str(p) for p in (body_params or [])]
 		if self._bridge_mode():
 			result = bridge.send_template(
-				self._account, to, template_name, params, trusted=trusted, language_code=language_code
+				self._account, to, template_name, params, header_params=list(header_params or []),
+				trusted=trusted, language_code=language_code, button_params=list(button_params or []),
 			)
 			return _delivery_from_bridge(result)
+		errors: list[dict[str, str]] = []
+		params = [wt.validate_param_text(f"body_params[{i}]", p, errors) for i, p in enumerate(params)]
+		headers_n, herr = wt.normalize_header_params(list(header_params or []))
+		buttons_n, berr = wt.normalize_button_params(list(button_params or []))
+		errors += herr + berr
+		if any(isinstance(h, dict) and not h.get("type") for h in headers_n):
+			errors.append(wt._e("header_params", "invalid_type", "Media header needs a type (image, document or video)."))
+		if errors:
+			raise bridge.BridgeError(wt.validation_error(errors))
 		template: dict[str, Any] = {"name": template_name, "language": {"code": language_code or DEFAULT_TEMPLATE_LANGUAGE}}
-		if params:
-			template["components"] = [
-				{"type": "body", "parameters": [{"type": "text", "text": p} for p in params]}
-			]
+		components = wt.build_template_components(params, headers_n, buttons_n)
+		if components:
+			template["components"] = components
 		return self._graph_send(
 			{
 				"messaging_product": "whatsapp",
@@ -337,12 +446,15 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		)
 
 	def _graph_send(self, data: dict[str, Any]) -> OutboundDelivery:
-		url = f"https://graph.facebook.com/{GRAPH_VERSION}/{self._phone_number_id}/messages"
+		url = f"{self._graph_url}/{self._phone_number_id}/messages"
 		headers = {
 			"Authorization": f"Bearer {self._access_token}",
 			"Content-Type": "application/json",
 		}
 		response = self._http_post(url, json=data, headers=headers, timeout=15)
+		status = getattr(response, "status_code", 200)
+		if isinstance(status, int) and status >= 400:
+			raise ValueError(f"WhatsApp API error {status}: {bridge.graph_error_message(response)}")
 		if hasattr(response, "raise_for_status"):
 			response.raise_for_status()
 		body = response.json() if hasattr(response, "json") else response
@@ -357,6 +469,11 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		except (UnicodeDecodeError, json.JSONDecodeError):
 			return None
 		return payload if isinstance(payload, dict) else None
+
+
+def _kind_from_mime(mime: str) -> str:
+	prefix = (mime or "").split("/")[0].lower()
+	return prefix if prefix in ("image", "audio", "video") else "document"
 
 
 def _as_list(value: Any) -> list:
