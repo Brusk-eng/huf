@@ -19,7 +19,7 @@ export type EditorMode = 'create' | 'edit';
 
 interface Props {
   mode: EditorMode;
-  account?: string;
+  gateway?: string;
   /** Required in edit mode: the template being edited. */
   detail?: TemplateDetail;
   isAdmin: boolean;
@@ -53,7 +53,7 @@ function initialForm(detail?: TemplateDetail) {
   };
 }
 
-export function TemplateEditor({ mode, account, detail, isAdmin, onCancel, onSaved }: Props) {
+export function TemplateEditor({ mode, gateway, detail, isAdmin, onCancel, onSaved }: Props) {
   const editing = mode === 'edit';
   const [state, setState] = useState(() => initialForm(detail));
   const [busy, setBusy] = useState<'submit' | 'draft' | ''>('');
@@ -110,9 +110,9 @@ export function TemplateEditor({ mode, account, detail, isAdmin, onCancel, onSav
     if (editing && detail && kind === 'submit') {
       res = await editTemplate(detail.name, buildEditPayload(valid));
     } else if (kind === 'draft') {
-      res = await createTemplateDraft(account, buildTemplatePayload(valid));
+      res = await createTemplateDraft(gateway ?? '', buildTemplatePayload(valid));
     } else {
-      res = await createTemplate(account, buildTemplatePayload(valid));
+      res = await createTemplate(gateway ?? '', buildTemplatePayload(valid));
     }
     setBusy('');
     if (!res.success) return setServerError(errorText(res));

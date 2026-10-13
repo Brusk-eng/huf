@@ -1,8 +1,20 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { post, get } = vi.hoisted(() => ({ post: vi.fn(), get: vi.fn() }));
+vi.mock('@/lib/frappe-sdk', () => ({ call: { post, get }, file: {} }));
+
 import {
   buildEditPayload,
   buildTemplatePayload,
+  createTemplate,
+  createTemplateDraft,
+  listConversations,
+  listMessages,
+  listTemplateDrafts,
+  listTemplates,
+  sendTemplateMessage,
+  syncTemplates,
   templateNameProblem,
   errorText,
   extractPlaceholders,
@@ -133,5 +145,46 @@ describe('whatsappApi helpers', () => {
     expect(validateTemplateForm(f)).toBeNull();
     expect('header_type' in buildEditPayload(f)).toBe(false);
     expect(validateTemplateForm({ ...f, keepExistingMedia: false })).toMatch(/sample file/);
+  });
+});
+
+describe('gateway-scoped calls', () => {
+  beforeEach(() => {
+    post.mockReset().mockResolvedValue({ message: { success: true } });
+    get.mockReset().mockResolvedValue({ message: { success: true } });
+  });
+
+  it('always names the gateway for lists, so the server never lists across accounts', async () => {
+    await listMessages('GW-A', '15551234567', 20);
+    await listConversations('GW-A');
+    await listTemplates('GW-A', 'APPROVED');
+    await listTemplateDrafts('GW-A');
+    const args = get.mock.calls.map((c) => c[1] as Record<string, unknown>);
+    expect(args.map((a) => a.gateway_name)).toEqual(['GW-A', 'GW-A', 'GW-A', 'GW-A']);
+    for (const a of args) expect('account' in a).toBe(false);
+  });
+
+  it('manages templates for a gateway, not a caller-chosen account', async () => {
+    await createTemplate('GW-A', { template_name: 'a_b', category: 'UTILITY', language_code: 'en_US', template: 'Hi' });
+    await createTemplateDraft('GW-A', { template_name: 'a_b', category: 'UTILITY', language_code: 'en_US', template: 'Hi' });
+    await syncTemplates('GW-A');
+    for (const c of post.mock.calls) {
+      expect((c[1] as Record<string, unknown>).gateway_name).toBe('GW-A');
+      expect('account' in (c[1] as object)).toBe(false);
+    }
+  });
+
+  it('sends templates from a gateway and no longer passes an account', async () => {
+    await sendTemplateMessage({ gateway_name: 'GW-B', to: '15551234567', template_name: 'welcome', body_params: ['Ann'] });
+    const [method, args] = post.mock.calls[0] as [string, Record<string, unknown>];
+    expect(method).toBe('huf.ai.whatsapp_management.send_template_message');
+    expect(args.gateway_name).toBe('GW-B');
+    expect('account' in args).toBe(false);
+    expect(args.body_params).toBe('["Ann"]');
+  });
+
+  it('explains the multi-gateway error codes', () => {
+    expect(errorText({ success: false, error: 'gateway_required' })).toMatch(/gateway/i);
+    expect(errorText({ success: false, error: 'template_name_taken_by_other_account' })).toMatch(/different name/);
   });
 });

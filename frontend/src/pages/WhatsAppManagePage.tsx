@@ -10,8 +10,6 @@ import { SetupTab } from '@/components/whatsapp/SetupTab';
 import { TemplatesTab } from '@/components/whatsapp/TemplatesTab';
 import { MessagesTab } from '@/components/whatsapp/MessagesTab';
 
-const ALL = '__all__';
-
 export default function WhatsAppManagePage() {
   const [params] = useSearchParams();
   const gatewayParam = params.get('gateway') || undefined;
@@ -19,7 +17,7 @@ export default function WhatsAppManagePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [unavailable, setUnavailable] = useState(false);
-  const [account, setAccount] = useState<string>(ALL);
+  const [selectedGateway, setSelectedGateway] = useState<string | undefined>(gatewayParam);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -35,19 +33,18 @@ export default function WhatsAppManagePage() {
 
   useEffect(() => { void load(); }, [load]);
 
-  const gateway = (status?.gateways.find((g) => g.name === gatewayParam) ?? status?.gateways[0])?.name;
-  const accountArg = account === ALL ? undefined : account;
+  // Every tab acts for exactly one gateway: nothing is listed or sent across WhatsApp accounts.
+  const gateway = (status?.gateways.find((g) => g.name === selectedGateway) ?? status?.gateways[0])?.name;
 
   return (
     <PageFrame
       title="Manage WhatsApp"
       actions={
-        status && status.accounts.length > 0 ? (
-          <Select value={account} onValueChange={setAccount}>
-            <SelectTrigger className="w-48" aria-label="WhatsApp account"><SelectValue /></SelectTrigger>
+        status && status.gateways.length > 0 ? (
+          <Select value={gateway} onValueChange={setSelectedGateway}>
+            <SelectTrigger className="w-56" aria-label="WhatsApp gateway"><SelectValue placeholder="Choose a gateway" /></SelectTrigger>
             <SelectContent>
-              <SelectItem value={ALL}>All accounts</SelectItem>
-              {status.accounts.map((a) => <SelectItem key={a.name} value={a.name}>{a.name}</SelectItem>)}
+              {status.gateways.map((g) => <SelectItem key={g.name} value={g.name}>{g.name}</SelectItem>)}
             </SelectContent>
           </Select>
         ) : undefined
@@ -70,10 +67,10 @@ export default function WhatsAppManagePage() {
               {unavailable && <div className="mt-6"><BridgeUnavailable /></div>}
             </TabsContent>
             <TabsContent value="templates" className="pt-4">
-              {unavailable ? <BridgeUnavailable /> : <TemplatesTab account={accountArg} />}
+              {unavailable ? <BridgeUnavailable /> : <TemplatesTab gateway={gateway} />}
             </TabsContent>
             <TabsContent value="messages" className="pt-4">
-              {unavailable ? <BridgeUnavailable /> : <MessagesTab account={accountArg} gateway={gateway} />}
+              {unavailable ? <BridgeUnavailable /> : <MessagesTab gateway={gateway} />}
             </TabsContent>
           </Tabs>
         )}

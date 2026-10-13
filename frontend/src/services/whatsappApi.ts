@@ -226,7 +226,10 @@ export function isBridgeUnavailable(res: { success: boolean; error?: string }): 
 export function errorText(res: WhatsAppError): string {
   const map: Record<string, string> = {
     bridge_unavailable: 'The optional frappe_whatsapp app is not installed on this site.',
-    no_account: 'No WhatsApp Account could be resolved. Select an account first.',
+    no_account: 'This gateway is not linked to a WhatsApp Account.',
+    gateway_required: 'Choose a WhatsApp gateway first.',
+    template_name_taken_by_other_account: 'Another WhatsApp account already uses this template name. Choose a different name.',
+    template_not_found: 'This template does not belong to the selected gateway.',
     window_closed: 'The 24-hour customer-service window is closed for this number.',
     invalid_recipient: 'Enter a phone number with 7 to 15 digits.',
     invalid_name: 'Template name may only contain lowercase letters, digits and underscores.',
@@ -408,10 +411,12 @@ export function validateMediaSend(f: { kind: MediaKind; link?: string; fileUrl?:
 export const getSetupStatus = (gatewayName?: string) =>
   invoke<SetupStatus>('get_setup_status', gatewayName ? { gateway_name: gatewayName } : {}, 'get');
 
-export const listTemplates = (account?: string, status?: string) =>
+// Every list/send/manage call names the Gateway it acts for: the server derives the WhatsApp
+// account from that Gateway and never lists or sends across accounts.
+export const listTemplates = (gatewayName: string, status?: string) =>
   invoke<{ templates: WhatsAppTemplate[]; manager_url?: string; business_id?: string }>(
     'list_templates',
-    { account, status },
+    { gateway_name: gatewayName, status },
     'get',
   );
 
@@ -424,13 +429,13 @@ export const editTemplate = (name: string, payload: EditTemplatePayload) =>
     'post',
   );
 
-export const listTemplateDrafts = (status?: string) =>
-  invoke<{ drafts: TemplateDraft[] }>('list_template_drafts', { status }, 'get');
+export const listTemplateDrafts = (gatewayName: string, status?: string) =>
+  invoke<{ drafts: TemplateDraft[] }>('list_template_drafts', { gateway_name: gatewayName, status }, 'get');
 
-export const createTemplateDraft = (account: string | undefined, payload: TemplatePayload) =>
+export const createTemplateDraft = (gatewayName: string, payload: TemplatePayload) =>
   invoke<{ name: string; status: string; draft: TemplateDraft }>(
     'create_template_draft',
-    { account, payload: JSON.stringify(payload) },
+    { gateway_name: gatewayName, payload: JSON.stringify(payload) },
     'post',
   );
 
@@ -444,35 +449,36 @@ export const approveTemplateDraft = (name: string, note?: string) =>
 export const rejectTemplateDraft = (name: string, note?: string) =>
   invoke<{ name: string; status: string }>('reject_template_draft', { name, note }, 'post');
 
-export const createTemplate = (account: string | undefined, payload: TemplatePayload) =>
+export const createTemplate = (gatewayName: string, payload: TemplatePayload) =>
   invoke<{ name: string; status?: string; id?: string }>(
     'create_template',
-    { account, payload: JSON.stringify(payload) },
+    { gateway_name: gatewayName, payload: JSON.stringify(payload) },
     'post',
   );
 
 export const deleteTemplate = (name: string) => invoke<Record<string, unknown>>('delete_template', { name }, 'post');
 
-export const syncTemplates = (account?: string) =>
-  invoke<Record<string, unknown>>('sync_templates', { account }, 'post');
+export const syncTemplates = (gatewayName: string) =>
+  invoke<Record<string, unknown>>('sync_templates', { gateway_name: gatewayName }, 'post');
 
 export const sendTemplateMessage = (args: {
+  /** The Gateway to send from; its WhatsApp account is used, never one chosen by the caller. */
+  gateway_name: string;
   to: string;
   template_name: string;
   body_params?: string[];
   header_params?: HeaderParam[];
   button_params?: ButtonParam[];
-  account?: string;
 }) =>
   invoke<Record<string, unknown>>(
     'send_template_message',
     {
+      gateway_name: args.gateway_name,
       to: args.to,
       template_name: args.template_name,
       body_params: JSON.stringify(args.body_params ?? []),
       header_params: JSON.stringify(args.header_params ?? []),
       button_params: JSON.stringify(args.button_params ?? []),
-      account: args.account,
     },
     'post',
   );
@@ -480,11 +486,11 @@ export const sendTemplateMessage = (args: {
 export const sendTextMessage = (gatewayName: string, to: string, text: string) =>
   invoke<Record<string, unknown>>('send_text_message', { gateway_name: gatewayName, to, text }, 'post');
 
-export const listMessages = (account?: string, phone?: string, limit = 50) =>
-  invoke<{ messages: WhatsAppMessage[] }>('list_messages', { account, phone, limit }, 'get');
+export const listMessages = (gatewayName: string, phone?: string, limit = 50) =>
+  invoke<{ messages: WhatsAppMessage[] }>('list_messages', { gateway_name: gatewayName, phone, limit }, 'get');
 
-export const listConversations = (account?: string, limit = 50) =>
-  invoke<{ conversations: WhatsAppConversation[] }>('list_conversations', { account, limit }, 'get');
+export const listConversations = (gatewayName: string, limit = 50) =>
+  invoke<{ conversations: WhatsAppConversation[] }>('list_conversations', { gateway_name: gatewayName, limit }, 'get');
 
 export const sendMediaMessage = (
   gatewayName: string,

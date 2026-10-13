@@ -11,7 +11,7 @@ import {
 import { TemplatePreview } from './TemplatePreview';
 import { rowToPreviewInput } from './templateModel';
 
-export function SendTemplateDialog({ template, onClose, account }: { template: WhatsAppTemplate | null; onClose: () => void; account?: string }) {
+export function SendTemplateDialog({ template, onClose, gateway }: { template: WhatsAppTemplate | null; onClose: () => void; gateway?: string }) {
   const [to, setTo] = useState('');
   const [params, setParams] = useState<string[]>([]);
   const [headerValue, setHeaderValue] = useState('');
@@ -27,7 +27,7 @@ export function SendTemplateDialog({ template, onClose, account }: { template: W
     .filter(({ b }) => b.button_type === 'Visit Website' && b.url_type === 'Dynamic');
 
   const send = async () => {
-    if (!template) return;
+    if (!template || !gateway) return;
     setBusy(true);
     setErr('');
     const header_params: HeaderParam[] = headerNeedsText
@@ -37,12 +37,12 @@ export function SendTemplateDialog({ template, onClose, account }: { template: W
         : [];
     const button_params: ButtonParam[] = dynamicUrlButtons.map(({ index }) => ({ index, sub_type: 'url', text: urlSuffixes[index] ?? '' }));
     const res = await sendTemplateMessage({
+      gateway_name: gateway,
       to,
       template_name: template.template_name || template.name,
       body_params: holes.map((_, i) => params[i] ?? ''),
       header_params,
       button_params,
-      account: account || template.whatsapp_account,
     });
     setBusy(false);
     if (res.success) {

@@ -31,7 +31,7 @@ const STATUS_EVENT = 'whatsapp_template_status';
 
 type View = { kind: 'browse' } | { kind: 'create' } | { kind: 'edit'; detail: TemplateDetail };
 
-export function TemplatesTab({ account }: { account?: string }) {
+export function TemplatesTab({ gateway }: { gateway?: string }) {
   const { hufRole } = usePermissions();
   const isAdmin = hufRole === 'Huf Admin';
   const socket = useSocket();
@@ -52,14 +52,20 @@ export function TemplatesTab({ account }: { account?: string }) {
   const [toSend, setToSend] = useState<WhatsAppTemplate | null>(null);
 
   const loadDrafts = useCallback(async () => {
-    const res = await listTemplateDrafts();
+    if (!gateway) return;
+    const res = await listTemplateDrafts(gateway);
     if (res.success) setDrafts(res.drafts);
-  }, []);
+  }, [gateway]);
 
   const load = useCallback(async () => {
+    if (!gateway) {
+      setRows([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError('');
-    const res = await listTemplates(account);
+    const res = await listTemplates(gateway);
     if (res.success) {
       setRows(res.templates);
       setManager({ url: res.manager_url ?? '', businessId: res.business_id ?? '' });
@@ -70,7 +76,7 @@ export function TemplatesTab({ account }: { account?: string }) {
       setError(errorText(res));
     }
     setLoading(false);
-  }, [account]);
+  }, [gateway]);
 
   useEffect(() => {
     void load();
@@ -100,8 +106,9 @@ export function TemplatesTab({ account }: { account?: string }) {
   }, [socket, load, loadDrafts, rowsRef]);
 
   const sync = async () => {
+    if (!gateway) return;
     setSyncing(true);
-    const res = await syncTemplates(account);
+    const res = await syncTemplates(gateway);
     setSyncing(false);
     if (res.success) {
       toast.success(`Templates synced: ${res.imported ?? 0} imported, ${res.updated ?? 0} updated`);
@@ -134,7 +141,7 @@ export function TemplatesTab({ account }: { account?: string }) {
     return (
       <TemplateEditor
         mode={view.kind}
-        account={account}
+        gateway={gateway}
         detail={view.kind === 'edit' ? view.detail : undefined}
         isAdmin={isAdmin}
         onCancel={() => setView({ kind: 'browse' })}
@@ -167,7 +174,7 @@ export function TemplatesTab({ account }: { account?: string }) {
           </TabsList>
           <div className="flex flex-wrap items-center gap-2">
             <ManagerLink url={manager.url} businessId={manager.businessId} />
-            <Button variant="outline" size="sm" onClick={sync} disabled={syncing || !account}>
+            <Button variant="outline" size="sm" onClick={sync} disabled={syncing || !gateway}>
               {syncing ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
               Sync
             </Button>
@@ -176,7 +183,7 @@ export function TemplatesTab({ account }: { account?: string }) {
             </Button>
           </div>
         </div>
-        {!account && <p className="pt-2 text-xs text-steel">Select an account above to sync templates.</p>}
+        {!gateway && <p className="pt-2 text-xs text-steel">Choose a WhatsApp gateway above to see and sync its templates.</p>}
 
         <TabsContent value="templates" className="pt-4">
           {error && <LoadError message={error} onRetry={load} />}
@@ -282,7 +289,7 @@ export function TemplatesTab({ account }: { account?: string }) {
         </TabsContent>
       </Tabs>
 
-      <SendTemplateDialog template={toSend} onClose={() => setToSend(null)} account={account} />
+      <SendTemplateDialog template={toSend} onClose={() => setToSend(null)} gateway={gateway} />
 
       <AlertDialog open={!!toDelete} onOpenChange={(o) => !o && setToDelete(null)}>
         <AlertDialogContent>

@@ -12,7 +12,7 @@ import {
 } from '@/services/whatsappApi';
 import { BridgeUnavailable, LoadError } from './BridgeUnavailable';
 
-export function MessagesTab({ account, gateway }: { account?: string; gateway?: string }) {
+export function MessagesTab({ gateway }: { gateway?: string }) {
   const [convs, setConvs] = useState<WhatsAppConversation[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<WhatsAppMessage[]>([]);
@@ -31,23 +31,29 @@ export function MessagesTab({ account, gateway }: { account?: string; gateway?: 
   const [uploading, setUploading] = useState(false);
 
   const loadConvs = useCallback(async () => {
+    if (!gateway) {
+      setConvs([]);
+      setLoadingConvs(false);
+      return;
+    }
     setLoadingConvs(true);
     setError('');
-    const res = await listConversations(account);
+    const res = await listConversations(gateway);
     if (res.success) setConvs(res.conversations);
     else if (isBridgeUnavailable(res)) setUnavailable(true);
     else setError(errorText(res));
     setLoadingConvs(false);
-  }, [account]);
+  }, [gateway]);
 
   const loadMsgs = useCallback(async (phone: string) => {
+    if (!gateway) return;
     setLoadingMsgs(true);
-    const res = await listMessages(account, phone);
+    const res = await listMessages(gateway, phone);
     if (res.success) setMessages([...res.messages].reverse());
     else if (isBridgeUnavailable(res)) setUnavailable(true);
     else setError(errorText(res));
     setLoadingMsgs(false);
-  }, [account]);
+  }, [gateway]);
 
   useEffect(() => { void loadConvs(); }, [loadConvs]);
   useEffect(() => { if (selected) void loadMsgs(selected); }, [selected, loadMsgs]);
