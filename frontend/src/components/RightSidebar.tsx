@@ -6,6 +6,7 @@ import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { buildBranchOptionLabels, findUpstreamNodeIds } from '@/lib/flowBranchTargets';
+import { isInvalidJsonString } from '@/lib/flowHttpJson';
 import { Label } from './ui/label';
 import { Combobox } from './ui/combobox';
 import { Checkbox } from './ui/checkbox';
@@ -1205,6 +1206,11 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                         }}
                         placeholder='{"Authorization": "Bearer {{token}}"}'
                       />
+                      {isInvalidJsonString(config.headers) && (
+                        <p className="text-[10px] text-destructive mt-1">
+                          Not valid JSON — saved as plain text.
+                        </p>
+                      )}
                     </div>
                     <div>
                       <Label htmlFor="http-body" size="sm">Body</Label>
@@ -1223,6 +1229,11 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                         }}
                         placeholder='{"key": "{{context.value}}"}'
                       />
+                      {isInvalidJsonString(config.body) && (
+                        <p className="text-[10px] text-destructive mt-1">
+                          Not valid JSON — saved as plain text.
+                        </p>
+                      )}
                     </div>
                     <div>
                       <Label htmlFor="http-timeout" size="sm">Timeout (seconds)</Label>
