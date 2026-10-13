@@ -251,7 +251,7 @@ def _save_whatsapp_media(event, gateway) -> list[str]:
 
             creds = _gateway_credentials(gateway)
             direct = {"token": creds.get("access_token"), "url": bridge.graph_base_url(creds.get("graph_api_url"))}
-        downloaded = bridge.download_media(account, media_id, credentials=direct)
+        downloaded = bridge.download_media(account, media_id, credentials=direct, kind=msg_type)
         name = os.path.basename(str(downloaded.get("filename") or media_id))
         name = _MEDIA_SAFE_NAME.sub("_", name).lstrip(".")[:100] or "media"
         file_doc = frappe.get_doc(

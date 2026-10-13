@@ -28,10 +28,32 @@ import frappe.utils
 from huf.ai.gateway_adapters import whatsapp_templates as wt
 
 GRAPH_HOST = "https://graph.facebook.com"
-GRAPH_DEFAULT_VERSION = "v21.0"
+# Newest Graph version that is >= ~3 months old (v25.0 released 2026-02-18; v26.0 is too new).
+GRAPH_DEFAULT_VERSION = "v25.0"
 WINDOW_HOURS = 24
-DEFAULT_MAX_MEDIA_BYTES = 16 * 1024 * 1024
-DEFAULT_MIME_PREFIXES = ("image/", "audio/", "video/", "application/pdf", "text/plain")
+_MB = 1024 * 1024
+# Meta's inbound limits: documents 100 MB, images 5 MB, audio/video 16 MB, stickers 500 KB.
+MEDIA_LIMITS_BY_KIND = {
+	"document": 100 * _MB,
+	"image": 5 * _MB,
+	"audio": 16 * _MB,
+	"video": 16 * _MB,
+	"sticker": 500 * 1024,
+}
+DEFAULT_MAX_MEDIA_BYTES = MEDIA_LIMITS_BY_KIND["document"]  # absolute ceiling; per-kind limits apply
+DEFAULT_MIME_PREFIXES = (
+	"image/",
+	"audio/",
+	"video/",
+	"application/pdf",
+	"text/plain",
+	"application/msword",
+	"application/vnd.openxmlformats-officedocument.",
+	"application/vnd.ms-excel",
+	"application/vnd.ms-powerpoint",
+)
+# Never allowed even though a prefix above would match (active content).
+_BLOCKED_MIME_PREFIXES = ("image/svg", "text/html", "application/xhtml")
 # AUTHENTICATION is intentionally unsupported: Meta requires OTP button components.
 TEMPLATE_CATEGORIES = ("MARKETING", "UTILITY")
 FORWARD_RETRY_DELAY_SECONDS = 5
@@ -925,15 +947,32 @@ def retry_forward_status(change: dict[str, Any]) -> bool:
 	return forward_status(change, _retry=True)
 
 
+def media_limit_for_mime(mime: str) -> int:
+	"""Meta's inbound size limit for the media kind a MIME type belongs to."""
+	mime = (mime or "").lower()
+	if mime.startswith("image/"):
+		return MEDIA_LIMITS_BY_KIND["image"]
+	if mime.startswith("audio/"):
+		return MEDIA_LIMITS_BY_KIND["audio"]
+	if mime.startswith("video/"):
+		return MEDIA_LIMITS_BY_KIND["video"]
+	return MEDIA_LIMITS_BY_KIND["document"]
+
+
 def download_media(
 	account_name: str,
 	media_id: str,
-	max_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
+	max_bytes: int | None = None,
 	allowed_mime_prefixes: tuple[str, ...] = DEFAULT_MIME_PREFIXES,
 	http_get: Callable[..., Any] | None = None,
 	credentials: dict[str, Any] | None = None,
+	kind: str | None = None,
 ) -> dict[str, Any]:
 	"""Fetch media by id at call time. Raises ValueError on caps/mime/failure.
+
+	The size cap is ``max_bytes`` when given, else Meta's per-kind limit (``kind``
+	when known, e.g. sticker, otherwise derived from the MIME type); declared and
+	streamed sizes are both enforced.
 
 	``credentials`` (``token``, optional ``url``/``version``) serves direct-mode
 	gateways that have no WhatsApp Account; otherwise the account is resolved.
@@ -959,8 +998,14 @@ def download_media(
 	meta_resp.raise_for_status()
 	meta = meta_resp.json()
 	mime = str(meta.get("mime_type") or "").split(";")[0].strip().lower()
-	if not mime or not any(mime.startswith(p) for p in allowed_mime_prefixes):
+	if (
+		not mime
+		or mime.startswith(_BLOCKED_MIME_PREFIXES)
+		or not any(mime.startswith(p) for p in allowed_mime_prefixes)
+	):
 		raise ValueError(f"mime_not_allowed: {mime or 'unknown'}")
+	if max_bytes is None:
+		max_bytes = MEDIA_LIMITS_BY_KIND.get(str(kind or "").lower()) or media_limit_for_mime(mime)
 	declared = meta.get("file_size")
 	if declared is not None and int(declared) > max_bytes:
 		raise ValueError("media_too_large")

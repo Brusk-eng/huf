@@ -19,7 +19,7 @@ ACCT = {
 	"app_id": "APP",
 	"token": "tok",
 	"url": "https://graph.facebook.com",
-	"version": "v21.0",
+	"version": "v25.0",
 	"webhook_verify_token": "v",
 	"status": "Active",
 }
@@ -65,7 +65,7 @@ def avail(value=True):
 
 class TestBridge(unittest.TestCase):
 	def test_constants_and_import_without_app(self):
-		self.assertEqual(wb.GRAPH_DEFAULT_VERSION, "v21.0")
+		self.assertEqual(wb.GRAPH_DEFAULT_VERSION, "v25.0")
 		# The bench may load frappe_whatsapp itself; the bridge must never import it at module level.
 		import ast, inspect
 
@@ -102,7 +102,7 @@ class TestBridge(unittest.TestCase):
 		), patch.object(frappe, "get_doc", return_value=doc):
 			acct = wb.resolve_account()
 		self.assertEqual(acct["token"], "secret")
-		self.assertEqual(acct["version"], "v21.0")
+		self.assertEqual(acct["version"], "v25.0")
 		self.assertEqual(acct["url"], "https://graph.facebook.com")
 
 	def test_resolve_account_none_and_unavailable(self):
@@ -325,6 +325,11 @@ class TestBridge(unittest.TestCase):
 		with avail(), patch.object(frappe, "has_permission", return_value=True):
 			self.assertEqual(wb.create_template("ACC", {**good, "template_name": "Bad Name"})["error"], "invalid_name")
 			self.assertEqual(wb.create_template("ACC", {**good, "category": "X"})["error"], "invalid_category")
+			too_long = wb.create_template("ACC", {**good, "template_name": "a" * 513})
+			self.assertEqual(too_long["error"], "validation_failed")
+			self.assertEqual(too_long["errors"][0]["code"], "too_long")
+			with patch.object(frappe, "get_doc", return_value=FakeDoc(status="PENDING", id="1")):
+				self.assertTrue(wb.create_template("ACC", {**good, "template_name": "a" * 512})["success"])
 			self.assertEqual(wb.create_template("ACC", {**good, "language_code": ""})["error"], "invalid_language")
 			doc = FakeDoc(status="PENDING", id="1")
 			with patch.object(frappe, "get_doc", return_value=doc) as gd:
@@ -369,7 +374,7 @@ class TestBridge(unittest.TestCase):
 		), patch.object(frappe.db, "get_value", side_effect=get_value), patch.object(frappe.db, "set_value") as sv:
 			res = wb.sync_templates("ACC", http_get=http_get)
 		self.assertEqual(res, {"success": True, "seen": 2, "updated": 1})
-		self.assertEqual(calls[0][0], "https://graph.facebook.com/v21.0/BIZ/message_templates")
+		self.assertEqual(calls[0][0], "https://graph.facebook.com/v25.0/BIZ/message_templates")
 		self.assertEqual(calls[0][1]["headers"]["Authorization"], "Bearer tok")
 		sv.assert_called_once_with("WhatsApp Templates", "T1", {"status": "APPROVED", "id": "9"})
 		with avail(False):
@@ -434,6 +439,32 @@ class TestBridge(unittest.TestCase):
 			with self.assertRaises(ValueError):
 				wb.download_media("ACC", "M1", http_get=self._media_get(meta))
 
+	def test_download_media_per_kind_limits_and_mimes(self):
+		def meta(mime, size, **kw):
+			return {"mime_type": mime, "url": "https://lookaside.fbsbx.com/x", "file_size": size, **kw}
+
+		mb = 1024 * 1024
+		self.assertEqual(wb.MEDIA_LIMITS_BY_KIND, {"document": 100 * mb, "image": 5 * mb, "audio": 16 * mb, "video": 16 * mb, "sticker": 500 * 1024})
+		with patch.object(wb, "resolve_account", return_value=ACCT):
+			dl = lambda m, **kw: wb.download_media("ACC", "M1", http_get=self._media_get(m), **kw)
+			self.assertEqual(dl(meta("application/pdf", 50 * mb))["mime_type"], "application/pdf")
+			for mime in (
+				"application/msword",
+				"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+				"application/vnd.ms-excel",
+				"application/vnd.ms-powerpoint",
+			):
+				self.assertEqual(dl(meta(mime, 1))["mime_type"], mime)
+			for mime, size in (("image/jpeg", 6 * mb), ("audio/ogg", 17 * mb), ("video/mp4", 17 * mb), ("application/pdf", 101 * mb)):
+				with self.assertRaisesRegex(ValueError, "media_too_large"):
+					dl(meta(mime, size))
+			self.assertEqual(dl(meta("image/jpeg", 5 * mb))["mime_type"], "image/jpeg")
+			with self.assertRaisesRegex(ValueError, "media_too_large"):
+				dl(meta("image/webp", 600 * 1024), kind="sticker")
+			for mime in ("image/svg+xml", "text/html", "application/x-msdownload", "application/x-sh"):
+				with self.assertRaisesRegex(ValueError, "mime_not_allowed"):
+					dl(meta(mime, 1))
+
 	def test_download_media_rejects_bad_hosts(self):
 		meta = {"mime_type": "image/jpeg", "file_size": 4}
 		with patch.object(wb, "resolve_account", return_value=ACCT):
@@ -447,7 +478,7 @@ class TestBridge(unittest.TestCase):
 
 		def http_get(url, **kw):
 			seen.append((url, kw))
-			if "/v21.0/" in url:
+			if "/v25.0/" in url:
 				return FakeResp({"mime_type": "image/jpeg", "url": "https://x.fbcdn.net/a"})
 			return FakeResp(content=b"ab")
 
