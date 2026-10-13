@@ -368,9 +368,11 @@ def run_automation_for_doc(trigger, doc, event_name, initiating_user=None, origi
 			"event_name": event_name,
 			"reference_doctype": doc_dict.get("doctype"),
 			"reference_name": doc_dict.get("name"),
-			"doc": clean_doc,
 			"_doc_event_supplement": "\n\n".join(supplement_parts),
 		}
+		if not agent_name:
+			# Procedure targets have no prompt to carry the doc, so they get it structured.
+			trigger_context["doc"] = clean_doc
 
 		run_automation(
 			trigger["automation"],
