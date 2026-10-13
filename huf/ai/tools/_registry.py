@@ -221,22 +221,36 @@ WHATSAPP_TOOLS = [
 		"tool_name": "whatsapp",
 		"description": (
 			"Manage WhatsApp Business messaging via the Meta Cloud API. Actions: "
-			"send_message (to/recipient/phone_number, message/text), "
+			"send_message (to/recipient/phone_number, message/text; free-form sends outside the "
+			"24h window may be refused), "
 			"send_template (to/recipient, template_name, language_code), "
-			"list_messages (to, from, limit), get_account_info."
+			"list_messages (to, from, limit), get_account_info, "
+			"list_templates (whatsapp_account, status), "
+			"create_template (template_name, category, language_code, body; may be refused by server policy)."
 		),
 		"function_path": "huf.ai.tools.whatsapp.handle_action",
 		"category": "Communication Tools",
 		"parameters": [
-			_action("send_message|send_template|list_messages|get_account_info"),
+			_action("send_message|send_template|list_messages|get_account_info|list_templates|create_template"),
 			_p("to", description="Recipient phone number (E.164). Alias: recipient, phone_number."),
 			_p("recipient", description="Alias for 'to'."),
 			_p("phone_number", description="Alias for 'to'."),
 			_p("message", description="Message text for send_message. Alias: text."),
 			_p("text", description="Alias for 'message'."),
-			_p("template_name", description="Template name for send_template."),
-			_p("language_code", description="Template language code for send_template (default 'en')."),
+			_p("template_name", description="Template name for send_template, or the new template's name for create_template."),
+			_p(
+				"category",
+				description="Template category for create_template: MARKETING, UTILITY or AUTHENTICATION.",
+			),
+			_p("language_code", description="Template language code, e.g. 'en' or 'en_US' (default 'en')."),
+			_p("body", description="Template body text for create_template. Use {{1}}, {{2}} for variables."),
 			_p("limit", type="integer", description="Max messages to return for list_messages (default 20)."),
+			_p("whatsapp_account", description="WhatsApp Account name to use for list_templates, create_template or send_message."),
+			_p("status", description="Filter for list_templates by approval status, e.g. APPROVED or PENDING."),
+			_p(
+				"gateway_name",
+				description="Gateway name for send_message; when the 24h customer-service window is open, free-form sends are allowed.",
+			),
 			_p("phone_number_id", description="Override the configured WhatsApp Phone Number ID."),
 			_p("access_token", description="Override the configured Meta access token."),
 		],

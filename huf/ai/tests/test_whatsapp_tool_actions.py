@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
@@ -26,6 +27,25 @@ class FakeResponse:
 		return self._body
 
 
+class _Row:
+	def __init__(self, key, value):
+		self.key = key
+		self.value = value
+
+	def get_password(self, fieldname):
+		return self.value
+
+
+def _settings(**flags):
+	"""Patch the active WhatsApp Integration Settings to carry these credential rows."""
+	doc = SimpleNamespace(credentials=[_Row(key, value) for key, value in flags.items()])
+	return patch.multiple(
+		whatsapp.frappe,
+		get_all=MagicMock(return_value=[SimpleNamespace(name="IS-1")]),
+		get_doc=MagicMock(return_value=doc),
+	)
+
+
 def _account(name="WA-1"):
 	return {"name": name, "phone_id": "PN1", "token": "t", "url": "https://graph.facebook.com", "version": "v21.0"}
 
@@ -36,8 +56,9 @@ class TestWhatsAppToolGating(unittest.TestCase):
 			patch.object(bridge, "is_available", return_value=False),
 			patch.object(bridge, "resolve_account", return_value=None),
 			patch.object(bridge, "window_state", return_value={"open": False}),
+			_settings(),
 		]
-		self.mock_available, self.mock_resolve, self.mock_window = (p.start() for p in self._patches)
+		self.mock_available, self.mock_resolve, self.mock_window, _ = (p.start() for p in self._patches)
 		self.post = patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.9"}]})).start()
 		self.addCleanup(patch.stopall)
 
@@ -52,13 +73,44 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		self.assertEqual(result["error"], "proactive_send_not_permitted")
 		self.post.assert_not_called()
 
-	def test_proactive_send_allowed_with_allow_proactive(self):
+	def test_llm_supplied_allow_proactive_is_ignored(self):
 		result = self._send(allow_proactive=True)
+		self.assertEqual(result["error"], "proactive_send_not_permitted")
+		self.post.assert_not_called()
+
+	def test_llm_supplied_management_flag_does_not_enable_proactive_send(self):
+		result = self._send(allow_whatsapp_management=True)
+		self.assertEqual(result["error"], "proactive_send_not_permitted")
+		self.post.assert_not_called()
+
+	def test_llm_supplied_flags_are_ignored_even_when_server_setting_is_off(self):
+		with _settings(allow_proactive="false"):
+			result = self._send(allow_proactive=True, allow_whatsapp_management=True)
+		self.assertEqual(result["error"], "proactive_send_not_permitted")
+		self.post.assert_not_called()
+
+	def test_server_setting_allows_proactive_send(self):
+		with _settings(allow_proactive="1"):
+			result = self._send()
 		self.assertTrue(result["success"])
 		self.post.assert_called_once()
 
-	def test_string_false_does_not_enable_flag(self):
-		result = self._send(allow_proactive="false")
+	def test_server_setting_truthy_and_falsy_values(self):
+		for value, allowed in (("1", True), ("true", True), ("YES", True), ("on", False), ("false", False), ("0", False), ("", False)):
+			with self.subTest(value=value), _settings(allow_proactive=value):
+				self.post.reset_mock()
+				result = self._send()
+				self.assertEqual(result.get("success", False), allowed)
+				self.assertEqual(self.post.called, allowed)
+
+	def test_server_management_setting_also_allows_proactive_send(self):
+		with _settings(allow_whatsapp_management="yes"):
+			result = self._send()
+		self.assertTrue(result["success"])
+
+	def test_settings_read_failure_fails_closed(self):
+		with patch.object(whatsapp.frappe, "get_all", side_effect=RuntimeError("db down")):
+			result = self._send(allow_proactive=True)
 		self.assertEqual(result["error"], "proactive_send_not_permitted")
 		self.post.assert_not_called()
 
@@ -99,6 +151,31 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		self.assertEqual(result["error"], "management_not_permitted")
 		mock_create.assert_not_called()
 
+	def test_create_template_ignores_llm_supplied_management_flag(self):
+		with (
+			patch.object(bridge, "is_available", return_value=True),
+			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "create_template") as mock_create,
+		):
+			result = json.loads(
+				whatsapp.handle_action(
+					"create_template", allow_whatsapp_management=True, allow_proactive=True, template_name="promo"
+				)
+			)
+		self.assertEqual(result["error"], "management_not_permitted")
+		mock_create.assert_not_called()
+
+	def test_create_template_allowed_by_server_setting(self):
+		with (
+			_settings(allow_whatsapp_management="true"),
+			patch.object(bridge, "is_available", return_value=True),
+			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "create_template", return_value={"success": True, "name": "TPL-3"}) as mock_create,
+		):
+			result = json.loads(whatsapp.handle_action("create_template", template_name="promo", category="MARKETING"))
+		self.assertTrue(result["success"])
+		mock_create.assert_called_once()
+
 	def test_list_templates_without_bridge_returns_bridge_unavailable(self):
 		result = json.loads(whatsapp.handle_action("list_templates"))
 		self.assertFalse(result["success"])
@@ -106,6 +183,12 @@ class TestWhatsAppToolGating(unittest.TestCase):
 
 
 class TestWhatsAppToolBridgeRouting(unittest.TestCase):
+	def setUp(self):
+		# Proactive sends are allowed by the server-side setting, not by LLM kwargs.
+		self._settings = _settings(allow_proactive="1")
+		self._settings.start()
+		self.addCleanup(self._settings.stop)
+
 	def test_send_message_uses_bridge_send_text_when_account_resolvable(self):
 		with (
 			patch.object(bridge, "is_available", return_value=True),
@@ -113,9 +196,7 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 			patch.object(bridge, "send_text", return_value={"success": True, "name": "WM-1", "message_id": "wamid.1", "status": "Sent"}) as mock_send,
 			patch.object(whatsapp.requests, "post") as mock_post,
 		):
-			result = json.loads(
-				whatsapp.handle_action("send_message", to="+1 555-123-4567", message="hello", allow_proactive=True)
-			)
+			result = json.loads(whatsapp.handle_action("send_message", to="+1 555-123-4567", message="hello"))
 		self.assertTrue(result["success"])
 		self.assertEqual(result["data"]["message_id"], "wamid.1")
 		mock_send.assert_called_once_with("WA-1", "15551234567", "hello")
@@ -127,7 +208,7 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 			patch.object(bridge, "resolve_account", return_value=_account()),
 			patch.object(bridge, "send_text", side_effect=bridge.BridgeError({"success": False, "error": "send_failed"})),
 		):
-			result = json.loads(whatsapp.handle_action("send_message", to="15551234567", message="hi", allow_proactive=True))
+			result = json.loads(whatsapp.handle_action("send_message", to="15551234567", message="hi"))
 		self.assertEqual(result, {"success": False, "error": "send_failed"})
 
 	def test_send_message_falls_back_to_graph_when_no_account(self):
@@ -143,7 +224,6 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 					access_token="token",
 					to="15551234567",
 					message="hi",
-					allow_proactive=True,
 				)
 			)
 		self.assertTrue(result["success"])
@@ -156,9 +236,7 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 			patch.object(bridge, "is_available", return_value=False),
 			patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.3"}]})) as mock_post,
 		):
-			whatsapp.handle_action(
-				"send_message", phone_number_id="PN1", access_token="token", to="15551234567", message="hi", allow_proactive=True
-			)
+			whatsapp.handle_action("send_message", phone_number_id="PN1", access_token="token", to="15551234567", message="hi")
 		self.assertTrue(mock_post.call_args.args[0].startswith(f"https://graph.facebook.com/{bridge.GRAPH_DEFAULT_VERSION}/"))
 
 	def test_send_template_normalizes_recipient(self):
@@ -185,8 +263,9 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 		self.assertEqual(result["data"], rows)
 		mock_list.assert_called_once_with("WA-1", "APPROVED")
 
-	def test_create_template_with_management_flag_calls_bridge(self):
+	def test_create_template_with_management_setting_calls_bridge(self):
 		with (
+			_settings(allow_whatsapp_management="1"),
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
 			patch.object(
@@ -198,7 +277,6 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 			result = json.loads(
 				whatsapp.handle_action(
 					"create_template",
-					allow_whatsapp_management=True,
 					template_name="promo",
 					category="MARKETING",
 					language_code="en_US",
@@ -213,11 +291,13 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 		self.assertEqual(payload["body"], "Hello {{1}}")
 
 	def test_create_template_bridge_unavailable(self):
-		with patch.object(bridge, "is_available", return_value=False):
+		with (
+			_settings(allow_whatsapp_management="1"),
+			patch.object(bridge, "is_available", return_value=False),
+		):
 			result = json.loads(
 				whatsapp.handle_action(
 					"create_template",
-					allow_whatsapp_management=True,
 					template_name="promo",
 					category="MARKETING",
 					language_code="en",

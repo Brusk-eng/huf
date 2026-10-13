@@ -11,11 +11,14 @@ list_templates, create_template.
 
 Privilege gating (A8)
 ---------------------
-Two tool-config flags gate privileged behaviour. They are read from the
-call's kwargs (the agent tool configuration supplies them) and are off by
-default. A flag counts only when its value is truthy: ``True``, ``1``,
-``"1"``, ``"true"``, ``"yes"`` or ``"on"`` (case-insensitive). ``"false"``,
-``"0"``, ``""`` and ``None`` do not count.
+Two flags gate privileged behaviour. They are read server-side from the
+active WhatsApp Integration Settings ``credentials`` rows and are off by
+default. The LLM controls tool-call kwargs, so any ``allow_proactive`` or
+``allow_whatsapp_management`` key supplied in a call is popped and discarded
+in ``handle_action``. A setting counts only when its value is truthy: ``1``,
+``"1"``, ``"true"`` or ``"yes"`` (case-insensitive). ``"false"``,
+``"0"``, ``""`` and missing rows do not count. Any error while reading the
+settings fails closed (flag off).
 
 * ``allow_proactive``: permits free-form ``send_message`` to a number with no
   open 24h customer-service window (see below).
@@ -39,7 +42,7 @@ from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 
 META_GRAPH_URL = f"https://graph.facebook.com/{bridge.GRAPH_DEFAULT_VERSION}"
 
-_TRUTHY_STRINGS = {"1", "true", "yes", "on"}
+_TRUTHY_STRINGS = {"1", "true", "yes"}
 
 
 def _error(msg: str) -> str:
@@ -54,15 +57,30 @@ def _refused(code: str, message: str) -> str:
 	return json.dumps({"success": False, "error": code, "message": message}, default=str)
 
 
-def _flag(kwargs: dict, *names: str) -> bool:
-	"""True when any named flag in kwargs is truthy (see module docstring)."""
-	for name in names:
-		value = kwargs.get(name)
-		if isinstance(value, str):
-			if value.strip().lower() in _TRUTHY_STRINGS:
-				return True
-		elif value:
-			return True
+_PRIVILEGE_FLAGS = ("allow_proactive", "allow_whatsapp_management")
+
+
+def _is_truthy(value: Any) -> bool:
+	return str(value or "").strip().lower() in _TRUTHY_STRINGS
+
+
+def _server_flag(name: str) -> bool:
+	"""Read a privilege flag from the active WhatsApp Integration Settings.
+
+	Fails closed: any error, or no active settings row, returns False.
+	"""
+	try:
+		settings_list = frappe.get_all(
+			"Integration Settings", filters={"service": "whatsapp", "is_active": 1}, limit=1
+		)
+		if not settings_list:
+			return False
+		doc = frappe.get_doc("Integration Settings", settings_list[0].name)
+		for row in doc.credentials or []:
+			if row.key == name:
+				return _is_truthy(row.get_password("value") or row.value or "")
+	except Exception:
+		return False
 	return False
 
 
@@ -98,6 +116,9 @@ def _get_whatsapp_credentials(kwargs: dict) -> tuple[str, str]:
 def handle_action(action: str, **kwargs: Any) -> str:
 	"""Handle WhatsApp agent tool invocation."""
 	action = (action or "").strip().lower()
+	# Privilege flags are server-side only: discard anything the LLM supplied.
+	for name in _PRIVILEGE_FLAGS:
+		kwargs.pop(name, None)
 
 	if action == "send_message":
 		return _send_message(kwargs)
@@ -157,7 +178,9 @@ def _send_message(kwargs: dict) -> str:
 	if not message:
 		return _error("Message text ('message') is required")
 
-	if _is_proactive_send(kwargs, recipient) and not _flag(kwargs, "allow_proactive", "allow_whatsapp_management"):
+	if _is_proactive_send(kwargs, recipient) and not (
+		_server_flag("allow_proactive") or _server_flag("allow_whatsapp_management")
+	):
 		return _refused(
 			"proactive_send_not_permitted",
 			"No open 24h window for this number. Enable allow_proactive to send a free-form message.",
@@ -337,11 +360,11 @@ def _list_templates(kwargs: dict) -> str:
 def _create_template(kwargs: dict) -> str:
 	"""Create a WhatsApp template via the bridge (management; A8 gated).
 
-	Requires ``allow_whatsapp_management`` (or ``allow_proactive``) truthy in
-	kwargs. Accepted fields: ``template_name``, ``category``
-	(MARKETING/UTILITY/AUTHENTICATION), ``language_code``, ``body``.
+	Requires ``allow_whatsapp_management`` (or ``allow_proactive``) enabled in
+	the server-side Integration Settings. Accepted fields: ``template_name``,
+	``category`` (MARKETING/UTILITY/AUTHENTICATION), ``language_code``, ``body``.
 	"""
-	if not _flag(kwargs, "allow_whatsapp_management", "allow_proactive"):
+	if not (_server_flag("allow_whatsapp_management") or _server_flag("allow_proactive")):
 		return _refused(
 			"management_not_permitted",
 			"Template creation is disabled. Enable allow_whatsapp_management in the tool config.",
