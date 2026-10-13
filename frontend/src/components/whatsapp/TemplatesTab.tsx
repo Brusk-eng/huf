@@ -13,8 +13,9 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import {
-  TEMPLATE_CATEGORIES, buildTemplatePayload, createTemplate, deleteTemplate, errorText, extractPlaceholders,
-  isBridgeUnavailable, listTemplates, sendTemplateMessage, syncTemplates, validateTemplateForm,
+  HEADER_TYPES, TEMPLATE_CATEGORIES, TEMPLATE_LIMITS, buildTemplatePayload, createTemplate, deleteTemplate, errorText,
+  extractPlaceholders, isBridgeUnavailable, listTemplates, sendTemplateMessage, syncTemplates, validateTemplateForm,
+  type ButtonParam, type HeaderParam, type HeaderType, type TemplateButton, type TemplateButtonType,
   type TemplateCategory, type WhatsAppTemplate,
 } from '@/services/whatsappApi';
 import { BridgeUnavailable, LoadError } from './BridgeUnavailable';
@@ -151,31 +152,43 @@ function CreateDialog(props: { open: boolean; onOpenChange: (o: boolean) => void
   const [category, setCategory] = useState<TemplateCategory>('UTILITY');
   const [language, setLanguage] = useState('en_US');
   const [body, setBody] = useState('');
+  const [headerType, setHeaderType] = useState<HeaderType | ''>('');
   const [header, setHeader] = useState('');
+  const [headerSample, setHeaderSample] = useState('');
   const [footer, setFooter] = useState('');
+  const [buttons, setButtons] = useState<TemplateButton[]>([]);
   const [samples, setSamples] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState('');
   const holes = extractPlaceholders(body);
+  const headerHasVariable = headerType === 'TEXT' && extractPlaceholders(header).length > 0;
+  const quickCount = buttons.filter((b) => b.type === 'QUICK_REPLY').length;
+  const linkCount = buttons.length - quickCount;
+
+  const form = { name, category, language, body, samples, headerType, header, headerSample, footer, buttons };
 
   const submit = async () => {
-    const problem = validateTemplateForm({ name, language, body, samples });
+    const problem = validateTemplateForm(form);
     if (problem) return setFormError(problem);
     setFormError('');
     setBusy(true);
-    const res = await createTemplate(props.account, buildTemplatePayload({ name, category, language, body, header, footer, samples }));
+    const res = await createTemplate(props.account, buildTemplatePayload(form));
     setBusy(false);
     if (res.success) {
       toast.success('Template submitted');
       props.onOpenChange(false);
-      setName(''); setBody(''); setHeader(''); setFooter(''); setSamples([]);
+      setName(''); setBody(''); setHeaderType(''); setHeader(''); setHeaderSample(''); setFooter(''); setButtons([]); setSamples([]);
       props.onCreated();
     } else setFormError(errorText(res));
   };
 
+  const updateButton = (i: number, patch: Partial<TemplateButton>) =>
+    setButtons((list) => list.map((b, idx) => (idx === i ? { ...b, ...patch } : b)));
+  const addButton = (type: TemplateButtonType) => setButtons((list) => [...list, { type, text: '' }]);
+
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent>
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Create template</DialogTitle>
           <DialogDescription>Submitted to Meta for review once created.</DialogDescription>
@@ -200,8 +213,29 @@ function CreateDialog(props: { open: boolean; onOpenChange: (o: boolean) => void
             </div>
           </div>
           <div className="space-y-1">
-            <Label htmlFor="wa-tpl-header">Header (optional)</Label>
-            <Input id="wa-tpl-header" value={header} onChange={(e) => setHeader(e.target.value)} />
+            <Label>Header (optional)</Label>
+            <Select value={headerType || 'none'} onValueChange={(v) => setHeaderType(v === 'none' ? '' : (v as HeaderType))}>
+              <SelectTrigger aria-label="Header type"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">No header</SelectItem>
+                {HEADER_TYPES.map((h) => <SelectItem key={h} value={h}>{h === 'TEXT' ? 'Text' : h === 'IMAGE' ? 'Image' : 'Document'}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            {headerType === 'TEXT' && (
+              <>
+                <Input id="wa-tpl-header" aria-label="Header text" value={header} onChange={(e) => setHeader(e.target.value)} placeholder="Order {{1}}" />
+                <p className="text-[11px] text-steel">{header.length}/{TEMPLATE_LIMITS.header} characters. One variable, {'{{1}}'}, is allowed.</p>
+              </>
+            )}
+            {headerHasVariable && (
+              <Input aria-label="Header example" value={headerSample} onChange={(e) => setHeaderSample(e.target.value)} placeholder="Example value for {{1}}" />
+            )}
+            {(headerType === 'IMAGE' || headerType === 'DOCUMENT') && (
+              <>
+                <Input aria-label="Header sample link" value={headerSample} onChange={(e) => setHeaderSample(e.target.value)} placeholder="https://example.com/sample.png" />
+                <p className="text-[11px] text-steel">A public link to a sample {headerType === 'IMAGE' ? 'image' : 'document'} for review.</p>
+              </>
+            )}
           </div>
           <div className="space-y-1">
             <Label htmlFor="wa-tpl-body">Body</Label>
@@ -220,6 +254,44 @@ function CreateDialog(props: { open: boolean; onOpenChange: (o: boolean) => void
           <div className="space-y-1">
             <Label htmlFor="wa-tpl-footer">Footer (optional)</Label>
             <Input id="wa-tpl-footer" value={footer} onChange={(e) => setFooter(e.target.value)} />
+            <p className="text-[11px] text-steel">{footer.length}/{TEMPLATE_LIMITS.footer} characters.</p>
+          </div>
+          <div className="space-y-2">
+            <Label>Buttons (optional)</Label>
+            {buttons.map((b, i) => (
+              <div key={i} className="space-y-1 rounded-sm border border-line p-2">
+                <div className="flex items-center justify-between text-[11px] uppercase text-steel">
+                  <span>{b.type === 'QUICK_REPLY' ? 'Quick reply' : b.type === 'URL' ? 'Link' : 'Phone'}</span>
+                  <Button variant="ghost" size="icon" aria-label={`Remove button ${i + 1}`} onClick={() => setButtons((l) => l.filter((_, idx) => idx !== i))}>
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+                <Input aria-label={`Button ${i + 1} text`} value={b.text} maxLength={TEMPLATE_LIMITS.button} onChange={(e) => updateButton(i, { text: e.target.value })} placeholder="Button text" />
+                {b.type === 'URL' && (
+                  <>
+                    <Input aria-label={`Button ${i + 1} link`} value={b.url ?? ''} onChange={(e) => updateButton(i, { url: e.target.value })} placeholder="https://example.com/track/{{1}}" />
+                    {(b.url ?? '').includes('{{') && (
+                      <Input aria-label={`Button ${i + 1} example link`} value={b.example ?? ''} onChange={(e) => updateButton(i, { example: e.target.value })} placeholder="https://example.com/track/123" />
+                    )}
+                  </>
+                )}
+                {b.type === 'PHONE_NUMBER' && (
+                  <Input aria-label={`Button ${i + 1} phone`} value={b.phone_number ?? ''} onChange={(e) => updateButton(i, { phone_number: e.target.value })} placeholder="+15551234567" />
+                )}
+              </div>
+            ))}
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" variant="outline" size="sm" disabled={quickCount >= TEMPLATE_LIMITS.quickReplies} onClick={() => addButton('QUICK_REPLY')}>
+                Add quick reply
+              </Button>
+              <Button type="button" variant="outline" size="sm" disabled={linkCount >= TEMPLATE_LIMITS.cta} onClick={() => addButton('URL')}>
+                Add link
+              </Button>
+              <Button type="button" variant="outline" size="sm" disabled={linkCount >= TEMPLATE_LIMITS.cta || buttons.some((b) => b.type === 'PHONE_NUMBER')} onClick={() => addButton('PHONE_NUMBER')}>
+                Add phone
+              </Button>
+            </div>
+            <p className="text-[11px] text-steel">Up to {TEMPLATE_LIMITS.quickReplies} quick replies, or {TEMPLATE_LIMITS.cta} link or phone buttons.</p>
           </div>
           {formError && <p role="alert" className="text-xs text-destructive">{formError}</p>}
         </div>
@@ -235,31 +307,47 @@ function CreateDialog(props: { open: boolean; onOpenChange: (o: boolean) => void
 function SendDialog({ template, onClose, account }: { template: WhatsAppTemplate | null; onClose: () => void; account?: string }) {
   const [to, setTo] = useState('');
   const [params, setParams] = useState<string[]>([]);
+  const [headerValue, setHeaderValue] = useState('');
+  const [urlSuffixes, setUrlSuffixes] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const holes = extractPlaceholders(template?.template || '');
+  const headerType = template?.header_type || '';
+  const headerNeedsText = headerType === 'TEXT' && extractPlaceholders(template?.header || '').length > 0;
+  const headerNeedsMedia = headerType === 'IMAGE' || headerType === 'DOCUMENT';
+  const dynamicUrlButtons = (template?.buttons ?? [])
+    .map((b, index) => ({ b, index }))
+    .filter(({ b }) => b.button_type === 'Visit Website' && b.url_type === 'Dynamic');
 
   const send = async () => {
     if (!template) return;
     setBusy(true);
     setErr('');
+    const header_params: HeaderParam[] = headerNeedsText
+      ? [headerValue]
+      : headerNeedsMedia && headerValue.trim()
+        ? [{ type: headerType === 'IMAGE' ? 'image' : 'document', link: headerValue.trim() }]
+        : [];
+    const button_params: ButtonParam[] = dynamicUrlButtons.map(({ index }) => ({ index, sub_type: 'url', text: urlSuffixes[index] ?? '' }));
     const res = await sendTemplateMessage({
       to,
       template_name: template.template_name || template.name,
       body_params: holes.map((_, i) => params[i] ?? ''),
+      header_params,
+      button_params,
       account: account || template.whatsapp_account,
     });
     setBusy(false);
     if (res.success) {
       toast.success('Template sent');
-      setTo(''); setParams([]);
+      setTo(''); setParams([]); setHeaderValue(''); setUrlSuffixes({});
       onClose();
     } else setErr(errorText(res));
   };
 
   return (
     <Dialog open={!!template} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent>
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Send template</DialogTitle>
           <DialogDescription className="font-mono">{template?.template_name}</DialogDescription>
@@ -269,10 +357,28 @@ function SendDialog({ template, onClose, account }: { template: WhatsAppTemplate
             <Label htmlFor="wa-send-to">Recipient</Label>
             <Input id="wa-send-to" value={to} onChange={(e) => setTo(e.target.value)} placeholder="+15551234567" className="font-mono" />
           </div>
+          {headerNeedsText && (
+            <div className="space-y-1">
+              <Label htmlFor="wa-send-header">Header value</Label>
+              <Input id="wa-send-header" value={headerValue} onChange={(e) => setHeaderValue(e.target.value)} />
+            </div>
+          )}
+          {headerNeedsMedia && (
+            <div className="space-y-1">
+              <Label htmlFor="wa-send-header">{headerType === 'IMAGE' ? 'Header image link' : 'Header document link'}</Label>
+              <Input id="wa-send-header" value={headerValue} onChange={(e) => setHeaderValue(e.target.value)} placeholder="https://example.com/file" />
+            </div>
+          )}
           {holes.map((n, i) => (
             <div key={n} className="space-y-1">
               <Label htmlFor={`wa-send-p-${n}`}>{`{{${n}}}`}</Label>
               <Input id={`wa-send-p-${n}`} value={params[i] ?? ''} onChange={(e) => setParams((p) => { const next = [...p]; next[i] = e.target.value; return next; })} />
+            </div>
+          ))}
+          {dynamicUrlButtons.map(({ b, index }) => (
+            <div key={index} className="space-y-1">
+              <Label htmlFor={`wa-send-url-${index}`}>{`${b.button_label || 'Link'} (end of link)`}</Label>
+              <Input id={`wa-send-url-${index}`} value={urlSuffixes[index] ?? ''} onChange={(e) => setUrlSuffixes((u) => ({ ...u, [index]: e.target.value }))} />
             </div>
           ))}
           {err && <p role="alert" className="text-xs text-destructive">{err}</p>}
