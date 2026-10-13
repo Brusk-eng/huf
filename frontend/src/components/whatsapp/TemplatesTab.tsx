@@ -1,41 +1,60 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { Loader2, Plus, RefreshCw, Send, Trash2 } from 'lucide-react';
+import { Loader2, Plus, RefreshCw, Search } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
   AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { usePermissions } from '@/contexts/PermissionsContext';
+import { useSocket } from '@/contexts/SocketContext';
 import {
-  HEADER_TYPES, TEMPLATE_CATEGORIES, TEMPLATE_LIMITS, buildTemplatePayload, createTemplate, deleteTemplate, errorText,
-  extractPlaceholders, isBridgeUnavailable, listTemplates, sendTemplateMessage, syncTemplates, validateTemplateForm,
-  type ButtonParam, type HeaderParam, type HeaderType, type TemplateButton, type TemplateButtonType,
-  type TemplateCategory, type WhatsAppTemplate,
+  deleteTemplate, errorText, isBridgeUnavailable, listTemplateDrafts, listTemplates, syncTemplates,
+  type TemplateDetail, type TemplateDraft, type WhatsAppTemplate,
 } from '@/services/whatsappApi';
 import { BridgeUnavailable, LoadError } from './BridgeUnavailable';
+import { CategoryChangeBadge, QualityBadge, StatusBadge } from './TemplateBadges';
+import { DraftsPanel } from './DraftsPanel';
+import { ManagerLink } from './ManagerLink';
+import { SendTemplateDialog } from './SendTemplateDialog';
+import { TemplateDetailPane } from './TemplateDetailPane';
+import { TemplateEditor } from './TemplateEditor';
+import {
+  ALL_OPTION, OPEN_DRAFT_STATUSES, TEMPLATE_STATUSES, filterTemplates, statusInfo, statusToastText, type TemplateFilters,
+} from './templateModel';
 
-function statusClass(status?: string) {
-  const s = (status || '').toUpperCase();
-  if (s === 'APPROVED') return 'text-good';
-  if (s === 'REJECTED' || s === 'DISABLED') return 'text-destructive';
-  return 'text-signal-ink';
-}
+const STATUS_EVENT = 'whatsapp_template_status';
+
+type View = { kind: 'browse' } | { kind: 'create' } | { kind: 'edit'; detail: TemplateDetail };
 
 export function TemplatesTab({ account }: { account?: string }) {
+  const { hufRole } = usePermissions();
+  const isAdmin = hufRole === 'Huf Admin';
+  const socket = useSocket();
+
   const [rows, setRows] = useState<WhatsAppTemplate[]>([]);
+  const [manager, setManager] = useState({ url: '', businessId: '' });
+  const [drafts, setDrafts] = useState<TemplateDraft[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [unavailable, setUnavailable] = useState(false);
   const [syncing, setSyncing] = useState(false);
-  const [createOpen, setCreateOpen] = useState(false);
+  const [view, setView] = useState<View>({ kind: 'browse' });
+  const [section, setSection] = useState('templates');
+  const [selected, setSelected] = useState('');
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [filters, setFilters] = useState<TemplateFilters>({ search: '', status: ALL_OPTION, category: ALL_OPTION, language: ALL_OPTION });
   const [toDelete, setToDelete] = useState<WhatsAppTemplate | null>(null);
   const [toSend, setToSend] = useState<WhatsAppTemplate | null>(null);
+
+  const loadDrafts = useCallback(async () => {
+    const res = await listTemplateDrafts();
+    if (res.success) setDrafts(res.drafts);
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -43,6 +62,7 @@ export function TemplatesTab({ account }: { account?: string }) {
     const res = await listTemplates(account);
     if (res.success) {
       setRows(res.templates);
+      setManager({ url: res.manager_url ?? '', businessId: res.business_id ?? '' });
       setUnavailable(false);
     } else if (isBridgeUnavailable(res)) {
       setUnavailable(true);
@@ -54,7 +74,30 @@ export function TemplatesTab({ account }: { account?: string }) {
 
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadDrafts();
+  }, [load, loadDrafts]);
+
+  // Refresh and tell the user when WhatsApp reviews a template.
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  useEffect(() => {
+    if (!socket) return;
+    const handler = (data: { template?: string; status?: string }) => {
+      if (!data?.template) return;
+      const known = rowsRef.current.find((r) => r.name === data.template);
+      const toastInfo = statusToastText(known?.template_name || data.template, data.status);
+      if (toastInfo.tone === 'success') toast.success(toastInfo.text);
+      else if (toastInfo.tone === 'error') toast.error(toastInfo.text);
+      else toast(toastInfo.text);
+      void load();
+      void loadDrafts();
+      setRefreshKey((k) => k + 1);
+    };
+    socket.on(STATUS_EVENT, handler);
+    return () => {
+      socket.off(STATUS_EVENT, handler);
+    };
+  }, [socket, load, loadDrafts, rowsRef]);
 
   const sync = async () => {
     setSyncing(true);
@@ -73,61 +116,173 @@ export function TemplatesTab({ account }: { account?: string }) {
     setToDelete(null);
     if (res.success) {
       toast.success('Template deleted');
+      setSelected('');
       void load();
     } else toast.error(errorText(res));
   };
 
+  const filtered = useMemo(() => filterTemplates(rows, filters), [rows, filters]);
+  const languages = useMemo(() => [...new Set(rows.map((r) => r.language_code).filter((l): l is string => !!l))].sort(), [rows]);
+  const current = rows.find((r) => r.name === selected) ?? filtered[0];
+  const openDrafts = drafts.filter((d) => OPEN_DRAFT_STATUSES.includes(d.status)).length;
+  const setFilter = (patch: Partial<TemplateFilters>) => setFilters((f) => ({ ...f, ...patch }));
+  const filtering = filters.search !== '' || filters.status !== ALL_OPTION || filters.category !== ALL_OPTION || filters.language !== ALL_OPTION;
+
   if (unavailable) return <BridgeUnavailable />;
 
-  return (
-    <div className="space-y-3">
-      <div className="flex justify-end gap-2">
-        <Button variant="outline" size="sm" onClick={sync} disabled={syncing || !account}>
-          {syncing ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
-          Sync
-        </Button>
-        <Button size="sm" onClick={() => setCreateOpen(true)}>
-          <Plus className="mr-1.5 h-4 w-4" /> Create template
-        </Button>
-      </div>
-      {!account && <p className="text-xs text-steel">Select an account above to sync or create templates.</p>}
-      {error && <LoadError message={error} onRetry={load} />}
-      {loading ? (
-        <div className="flex items-center gap-2 text-xs text-steel"><Loader2 className="h-4 w-4 animate-spin" /> Loading templates...</div>
-      ) : rows.length === 0 && !error ? (
-        <p className="rounded-sm border border-line p-6 text-center text-xs text-steel">No templates yet.</p>
-      ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Name</TableHead><TableHead>Category</TableHead><TableHead>Language</TableHead>
-              <TableHead>Status</TableHead><TableHead>Account</TableHead><TableHead className="w-24" />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((t) => (
-              <TableRow key={t.name}>
-                <TableCell className="font-mono text-xs">{t.template_name || t.name}</TableCell>
-                <TableCell className="text-xs">{t.category}</TableCell>
-                <TableCell className="font-mono text-xs">{t.language_code}</TableCell>
-                <TableCell className={`font-mono text-xs uppercase ${statusClass(t.status)}`}>{t.status || 'unknown'}</TableCell>
-                <TableCell className="text-xs">{t.whatsapp_account}</TableCell>
-                <TableCell className="flex justify-end gap-1">
-                  <Button variant="ghost" size="icon" aria-label={`Send ${t.template_name}`} onClick={() => setToSend(t)}>
-                    <Send className="h-4 w-4" />
-                  </Button>
-                  <Button variant="ghost" size="icon" aria-label={`Delete ${t.template_name}`} onClick={() => setToDelete(t)}>
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      )}
+  if (view.kind !== 'browse') {
+    return (
+      <TemplateEditor
+        mode={view.kind}
+        account={account}
+        detail={view.kind === 'edit' ? view.detail : undefined}
+        isAdmin={isAdmin}
+        onCancel={() => setView({ kind: 'browse' })}
+        onSaved={(result) => {
+          setView({ kind: 'browse' });
+          if (result.kind === 'draft') {
+            setSection('drafts');
+            void loadDrafts();
+          } else {
+            if (result.kind === 'submitted') setSelected(result.name);
+            setSection('templates');
+            setRefreshKey((k) => k + 1);
+            void load();
+          }
+        }}
+      />
+    );
+  }
 
-      <CreateDialog open={createOpen} onOpenChange={setCreateOpen} account={account} onCreated={load} />
-      <SendDialog template={toSend} onClose={() => setToSend(null)} account={account} />
+  return (
+    <div className="space-y-4">
+      <Tabs value={section} onValueChange={setSection}>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <TabsList>
+            <TabsTrigger value="templates">Templates</TabsTrigger>
+            <TabsTrigger value="drafts" className="gap-1.5">
+              Drafts awaiting approval
+              {openDrafts > 0 && <Badge variant="pill-warning" size="sm">{openDrafts}</Badge>}
+            </TabsTrigger>
+          </TabsList>
+          <div className="flex flex-wrap items-center gap-2">
+            <ManagerLink url={manager.url} businessId={manager.businessId} />
+            <Button variant="outline" size="sm" onClick={sync} disabled={syncing || !account}>
+              {syncing ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
+              Sync
+            </Button>
+            <Button size="sm" onClick={() => setView({ kind: 'create' })}>
+              <Plus className="mr-1.5 h-4 w-4" /> {isAdmin ? 'New template' : 'Request template'}
+            </Button>
+          </div>
+        </div>
+        {!account && <p className="pt-2 text-xs text-steel">Select an account above to sync templates.</p>}
+
+        <TabsContent value="templates" className="pt-4">
+          {error && <LoadError message={error} onRetry={load} />}
+          {loading && rows.length === 0 ? (
+            <div className="flex items-center gap-2 text-xs text-steel"><Loader2 className="h-4 w-4 animate-spin" /> Loading templates...</div>
+          ) : rows.length === 0 && !error ? (
+            <div className="space-y-3 rounded-sm border border-line p-8 text-center">
+              <p className="text-sm font-medium text-ink">No templates yet</p>
+              <p className="text-xs text-steel">Create your first message template, or sync the ones you already have in WhatsApp.</p>
+              <Button size="sm" onClick={() => setView({ kind: 'create' })}>
+                <Plus className="mr-1.5 h-4 w-4" /> {isAdmin ? 'New template' : 'Request template'}
+              </Button>
+            </div>
+          ) : rows.length > 0 ? (
+            <div className="grid gap-5 md:grid-cols-[340px_minmax(0,1fr)]">
+              <div className="space-y-3">
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-steel-soft" />
+                  <Input
+                    aria-label="Search templates" className="pl-8" placeholder="Search templates..."
+                    value={filters.search} onChange={(e) => setFilter({ search: e.target.value })}
+                  />
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <Select value={filters.status} onValueChange={(v) => setFilter({ status: v })}>
+                    <SelectTrigger aria-label="Filter by status"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ALL_OPTION}>Any status</SelectItem>
+                      {TEMPLATE_STATUSES.map((s) => <SelectItem key={s} value={s}>{statusInfo(s).label}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                  <Select value={filters.category} onValueChange={(v) => setFilter({ category: v })}>
+                    <SelectTrigger aria-label="Filter by category"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ALL_OPTION}>Any category</SelectItem>
+                      <SelectItem value="MARKETING">Marketing</SelectItem>
+                      <SelectItem value="UTILITY">Utility</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Select value={filters.language} onValueChange={(v) => setFilter({ language: v })}>
+                    <SelectTrigger aria-label="Filter by language"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ALL_OPTION}>Any language</SelectItem>
+                      {languages.map((l) => <SelectItem key={l} value={l}>{l}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+                {filtered.length === 0 ? (
+                  <p className="rounded-sm border border-line p-4 text-center text-xs text-steel">
+                    No templates match{filtering ? ' these filters' : ''}.
+                  </p>
+                ) : (
+                  <ul className="max-h-[calc(100vh-18rem)] divide-y divide-line overflow-y-auto rounded-sm border border-line">
+                    {filtered.map((t) => {
+                      const active = t.name === current?.name;
+                      return (
+                        <li key={t.name}>
+                          <button
+                            type="button" aria-current={active} onClick={() => setSelected(t.name)}
+                            className={`block w-full space-y-1.5 border-l-2 px-3 py-2.5 text-left hover:bg-paper-deep ${active ? 'border-signal bg-paper-deep' : 'border-transparent'}`}
+                          >
+                            <span className="block truncate font-mono text-xs font-medium text-ink">{t.template_name || t.name}</span>
+                            <span className="block text-[11px] text-steel">
+                              {t.category === 'MARKETING' ? 'Marketing' : t.category === 'UTILITY' ? 'Utility' : t.category} · {t.language_code}
+                            </span>
+                            <span className="flex flex-wrap gap-1">
+                              <StatusBadge status={t.status} />
+                              <QualityBadge score={t.quality_score} />
+                              <CategoryChangeBadge pending={t.category_change_pending} to={t.correct_category} />
+                            </span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+              <div className="min-w-0 rounded-sm border border-line p-4">
+                {current ? (
+                  <TemplateDetailPane
+                    row={current}
+                    refreshKey={refreshKey}
+                    onSend={setToSend}
+                    onEdit={(detail) => setView({ kind: 'edit', detail })}
+                    onDelete={setToDelete}
+                    onUnavailable={() => setUnavailable(true)}
+                  />
+                ) : (
+                  <p className="py-10 text-center text-xs text-steel">Select a template to see its preview and status.</p>
+                )}
+              </div>
+            </div>
+          ) : null}
+        </TabsContent>
+
+        <TabsContent value="drafts" className="pt-4">
+          <DraftsPanel
+            drafts={drafts}
+            isAdmin={isAdmin}
+            onChanged={() => { void loadDrafts(); void load(); }}
+            onUnavailable={() => setUnavailable(true)}
+          />
+        </TabsContent>
+      </Tabs>
+
+      <SendTemplateDialog template={toSend} onClose={() => setToSend(null)} account={account} />
 
       <AlertDialog open={!!toDelete} onOpenChange={(o) => !o && setToDelete(null)}>
         <AlertDialogContent>
@@ -144,250 +299,5 @@ export function TemplatesTab({ account }: { account?: string }) {
         </AlertDialogContent>
       </AlertDialog>
     </div>
-  );
-}
-
-function CreateDialog(props: { open: boolean; onOpenChange: (o: boolean) => void; account?: string; onCreated: () => void }) {
-  const [name, setName] = useState('');
-  const [category, setCategory] = useState<TemplateCategory>('UTILITY');
-  const [language, setLanguage] = useState('en_US');
-  const [body, setBody] = useState('');
-  const [headerType, setHeaderType] = useState<HeaderType | ''>('');
-  const [header, setHeader] = useState('');
-  const [headerSample, setHeaderSample] = useState('');
-  const [footer, setFooter] = useState('');
-  const [buttons, setButtons] = useState<TemplateButton[]>([]);
-  const [samples, setSamples] = useState<string[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [formError, setFormError] = useState('');
-  const holes = extractPlaceholders(body);
-  const headerHasVariable = headerType === 'TEXT' && extractPlaceholders(header).length > 0;
-  const quickCount = buttons.filter((b) => b.type === 'QUICK_REPLY').length;
-  const linkCount = buttons.length - quickCount;
-
-  const form = { name, category, language, body, samples, headerType, header, headerSample, footer, buttons };
-
-  const submit = async () => {
-    const problem = validateTemplateForm(form);
-    if (problem) return setFormError(problem);
-    setFormError('');
-    setBusy(true);
-    const res = await createTemplate(props.account, buildTemplatePayload(form));
-    setBusy(false);
-    if (res.success) {
-      toast.success('Template submitted');
-      props.onOpenChange(false);
-      setName(''); setBody(''); setHeaderType(''); setHeader(''); setHeaderSample(''); setFooter(''); setButtons([]); setSamples([]);
-      props.onCreated();
-    } else setFormError(errorText(res));
-  };
-
-  const updateButton = (i: number, patch: Partial<TemplateButton>) =>
-    setButtons((list) => list.map((b, idx) => (idx === i ? { ...b, ...patch } : b)));
-  const addButton = (type: TemplateButtonType) => setButtons((list) => [...list, { type, text: '' }]);
-
-  return (
-    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>Create template</DialogTitle>
-          <DialogDescription>Submitted to Meta for review once created.</DialogDescription>
-        </DialogHeader>
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <Label htmlFor="wa-tpl-name">Name</Label>
-            <Input id="wa-tpl-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="order_update" className="font-mono" />
-            <p className="text-[11px] text-steel">Lowercase letters, digits and underscores.</p>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <Label>Category</Label>
-              <Select value={category} onValueChange={(v) => setCategory(v as TemplateCategory)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>{TEMPLATE_CATEGORIES.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="wa-tpl-lang">Language</Label>
-              <Input id="wa-tpl-lang" value={language} onChange={(e) => setLanguage(e.target.value)} className="font-mono" />
-            </div>
-          </div>
-          <div className="space-y-1">
-            <Label>Header (optional)</Label>
-            <Select value={headerType || 'none'} onValueChange={(v) => setHeaderType(v === 'none' ? '' : (v as HeaderType))}>
-              <SelectTrigger aria-label="Header type"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="none">No header</SelectItem>
-                {HEADER_TYPES.map((h) => <SelectItem key={h} value={h}>{h === 'TEXT' ? 'Text' : h === 'IMAGE' ? 'Image' : 'Document'}</SelectItem>)}
-              </SelectContent>
-            </Select>
-            {headerType === 'TEXT' && (
-              <>
-                <Input id="wa-tpl-header" aria-label="Header text" value={header} onChange={(e) => setHeader(e.target.value)} placeholder="Order {{1}}" />
-                <p className="text-[11px] text-steel">{header.length}/{TEMPLATE_LIMITS.header} characters. One variable, {'{{1}}'}, is allowed.</p>
-              </>
-            )}
-            {headerHasVariable && (
-              <Input aria-label="Header example" value={headerSample} onChange={(e) => setHeaderSample(e.target.value)} placeholder="Example value for {{1}}" />
-            )}
-            {(headerType === 'IMAGE' || headerType === 'DOCUMENT') && (
-              <>
-                <Input aria-label="Header sample link" value={headerSample} onChange={(e) => setHeaderSample(e.target.value)} placeholder="https://example.com/sample.png" />
-                <p className="text-[11px] text-steel">A public link to a sample {headerType === 'IMAGE' ? 'image' : 'document'} for review.</p>
-              </>
-            )}
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="wa-tpl-body">Body</Label>
-            <Textarea id="wa-tpl-body" value={body} onChange={(e) => setBody(e.target.value)} placeholder="Hi {{1}}, your order {{2}} shipped." />
-          </div>
-          {holes.map((n, i) => (
-            <div key={n} className="space-y-1">
-              <Label htmlFor={`wa-tpl-sample-${n}`}>Sample for {`{{${n}}}`}</Label>
-              <Input
-                id={`wa-tpl-sample-${n}`}
-                value={samples[i] ?? ''}
-                onChange={(e) => setSamples((s) => { const next = [...s]; next[i] = e.target.value; return next; })}
-              />
-            </div>
-          ))}
-          <div className="space-y-1">
-            <Label htmlFor="wa-tpl-footer">Footer (optional)</Label>
-            <Input id="wa-tpl-footer" value={footer} onChange={(e) => setFooter(e.target.value)} />
-            <p className="text-[11px] text-steel">{footer.length}/{TEMPLATE_LIMITS.footer} characters.</p>
-          </div>
-          <div className="space-y-2">
-            <Label>Buttons (optional)</Label>
-            {buttons.map((b, i) => (
-              <div key={i} className="space-y-1 rounded-sm border border-line p-2">
-                <div className="flex items-center justify-between text-[11px] uppercase text-steel">
-                  <span>{b.type === 'QUICK_REPLY' ? 'Quick reply' : b.type === 'URL' ? 'Link' : 'Phone'}</span>
-                  <Button variant="ghost" size="icon" aria-label={`Remove button ${i + 1}`} onClick={() => setButtons((l) => l.filter((_, idx) => idx !== i))}>
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-                <Input aria-label={`Button ${i + 1} text`} value={b.text} maxLength={TEMPLATE_LIMITS.button} onChange={(e) => updateButton(i, { text: e.target.value })} placeholder="Button text" />
-                {b.type === 'URL' && (
-                  <>
-                    <Input aria-label={`Button ${i + 1} link`} value={b.url ?? ''} onChange={(e) => updateButton(i, { url: e.target.value })} placeholder="https://example.com/track/{{1}}" />
-                    {(b.url ?? '').includes('{{') && (
-                      <Input aria-label={`Button ${i + 1} example link`} value={b.example ?? ''} onChange={(e) => updateButton(i, { example: e.target.value })} placeholder="https://example.com/track/123" />
-                    )}
-                  </>
-                )}
-                {b.type === 'PHONE_NUMBER' && (
-                  <Input aria-label={`Button ${i + 1} phone`} value={b.phone_number ?? ''} onChange={(e) => updateButton(i, { phone_number: e.target.value })} placeholder="+15551234567" />
-                )}
-              </div>
-            ))}
-            <div className="flex flex-wrap gap-2">
-              <Button type="button" variant="outline" size="sm" disabled={quickCount >= TEMPLATE_LIMITS.quickReplies} onClick={() => addButton('QUICK_REPLY')}>
-                Add quick reply
-              </Button>
-              <Button type="button" variant="outline" size="sm" disabled={linkCount >= TEMPLATE_LIMITS.cta} onClick={() => addButton('URL')}>
-                Add link
-              </Button>
-              <Button type="button" variant="outline" size="sm" disabled={linkCount >= TEMPLATE_LIMITS.cta || buttons.some((b) => b.type === 'PHONE_NUMBER')} onClick={() => addButton('PHONE_NUMBER')}>
-                Add phone
-              </Button>
-            </div>
-            <p className="text-[11px] text-steel">Up to {TEMPLATE_LIMITS.quickReplies} quick replies, or {TEMPLATE_LIMITS.cta} link or phone buttons.</p>
-          </div>
-          {formError && <p role="alert" className="text-xs text-destructive">{formError}</p>}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => props.onOpenChange(false)}>Cancel</Button>
-          <Button onClick={submit} disabled={busy}>{busy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}Create</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function SendDialog({ template, onClose, account }: { template: WhatsAppTemplate | null; onClose: () => void; account?: string }) {
-  const [to, setTo] = useState('');
-  const [params, setParams] = useState<string[]>([]);
-  const [headerValue, setHeaderValue] = useState('');
-  const [urlSuffixes, setUrlSuffixes] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
-  const holes = extractPlaceholders(template?.template || '');
-  const headerType = template?.header_type || '';
-  const headerNeedsText = headerType === 'TEXT' && extractPlaceholders(template?.header || '').length > 0;
-  const headerNeedsMedia = headerType === 'IMAGE' || headerType === 'DOCUMENT';
-  const dynamicUrlButtons = (template?.buttons ?? [])
-    .map((b, index) => ({ b, index }))
-    .filter(({ b }) => b.button_type === 'Visit Website' && b.url_type === 'Dynamic');
-
-  const send = async () => {
-    if (!template) return;
-    setBusy(true);
-    setErr('');
-    const header_params: HeaderParam[] = headerNeedsText
-      ? [headerValue]
-      : headerNeedsMedia && headerValue.trim()
-        ? [{ type: headerType === 'IMAGE' ? 'image' : 'document', link: headerValue.trim() }]
-        : [];
-    const button_params: ButtonParam[] = dynamicUrlButtons.map(({ index }) => ({ index, sub_type: 'url', text: urlSuffixes[index] ?? '' }));
-    const res = await sendTemplateMessage({
-      to,
-      template_name: template.template_name || template.name,
-      body_params: holes.map((_, i) => params[i] ?? ''),
-      header_params,
-      button_params,
-      account: account || template.whatsapp_account,
-    });
-    setBusy(false);
-    if (res.success) {
-      toast.success('Template sent');
-      setTo(''); setParams([]); setHeaderValue(''); setUrlSuffixes({});
-      onClose();
-    } else setErr(errorText(res));
-  };
-
-  return (
-    <Dialog open={!!template} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>Send template</DialogTitle>
-          <DialogDescription className="font-mono">{template?.template_name}</DialogDescription>
-        </DialogHeader>
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <Label htmlFor="wa-send-to">Recipient</Label>
-            <Input id="wa-send-to" value={to} onChange={(e) => setTo(e.target.value)} placeholder="+15551234567" className="font-mono" />
-          </div>
-          {headerNeedsText && (
-            <div className="space-y-1">
-              <Label htmlFor="wa-send-header">Header value</Label>
-              <Input id="wa-send-header" value={headerValue} onChange={(e) => setHeaderValue(e.target.value)} />
-            </div>
-          )}
-          {headerNeedsMedia && (
-            <div className="space-y-1">
-              <Label htmlFor="wa-send-header">{headerType === 'IMAGE' ? 'Header image link' : 'Header document link'}</Label>
-              <Input id="wa-send-header" value={headerValue} onChange={(e) => setHeaderValue(e.target.value)} placeholder="https://example.com/file" />
-            </div>
-          )}
-          {holes.map((n, i) => (
-            <div key={n} className="space-y-1">
-              <Label htmlFor={`wa-send-p-${n}`}>{`{{${n}}}`}</Label>
-              <Input id={`wa-send-p-${n}`} value={params[i] ?? ''} onChange={(e) => setParams((p) => { const next = [...p]; next[i] = e.target.value; return next; })} />
-            </div>
-          ))}
-          {dynamicUrlButtons.map(({ b, index }) => (
-            <div key={index} className="space-y-1">
-              <Label htmlFor={`wa-send-url-${index}`}>{`${b.button_label || 'Link'} (end of link)`}</Label>
-              <Input id={`wa-send-url-${index}`} value={urlSuffixes[index] ?? ''} onChange={(e) => setUrlSuffixes((u) => ({ ...u, [index]: e.target.value }))} />
-            </div>
-          ))}
-          {err && <p role="alert" className="text-xs text-destructive">{err}</p>}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button onClick={send} disabled={busy || !to.trim()}>{busy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}Send</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }
