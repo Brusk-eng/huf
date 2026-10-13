@@ -3,8 +3,30 @@
 
 """WhatsApp integration tools for HUF agents.
 
-Single consolidated tool that performs Meta WhatsApp Cloud API actions via an
+Single consolidated tool that performs WhatsApp Cloud API actions via an
 `action` parameter.
+
+Actions: send_message, send_template, list_messages, get_account_info,
+list_templates, create_template.
+
+Privilege gating (A8)
+---------------------
+Two tool-config flags gate privileged behaviour. They are read from the
+call's kwargs (the agent tool configuration supplies them) and are off by
+default. A flag counts only when its value is truthy: ``True``, ``1``,
+``"1"``, ``"true"``, ``"yes"`` or ``"on"`` (case-insensitive). ``"false"``,
+``"0"``, ``""`` and ``None`` do not count.
+
+* ``allow_proactive``: permits free-form ``send_message`` to a number with no
+  open 24h customer-service window (see below).
+* ``allow_whatsapp_management``: permits ``create_template``, and also
+  permits proactive free-form sends.
+
+A free-form ``send_message`` is proactive unless ``gateway_name`` is given
+and ``bridge.window_state(gateway_name, to)`` reports an open window. With
+no gateway context, every free-form send is treated as proactive.
+``send_template`` (approved templates) is always allowed. The tool never
+uses ``ignore_permissions`` and never switches the session user.
 """
 
 import json
@@ -13,7 +35,11 @@ from typing import Optional, Any
 import frappe
 import requests
 
-META_GRAPH_URL = "https://graph.facebook.com/v18.0"
+from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+
+META_GRAPH_URL = f"https://graph.facebook.com/{bridge.GRAPH_DEFAULT_VERSION}"
+
+_TRUTHY_STRINGS = {"1", "true", "yes", "on"}
 
 
 def _error(msg: str) -> str:
@@ -22,6 +48,22 @@ def _error(msg: str) -> str:
 
 def _success(data: Any) -> str:
 	return json.dumps({"success": True, "data": data}, default=str)
+
+
+def _refused(code: str, message: str) -> str:
+	return json.dumps({"success": False, "error": code, "message": message}, default=str)
+
+
+def _flag(kwargs: dict, *names: str) -> bool:
+	"""True when any named flag in kwargs is truthy (see module docstring)."""
+	for name in names:
+		value = kwargs.get(name)
+		if isinstance(value, str):
+			if value.strip().lower() in _TRUTHY_STRINGS:
+				return True
+		elif value:
+			return True
+	return False
 
 
 def _get_whatsapp_credentials(kwargs: dict) -> tuple[str, str]:
@@ -65,19 +107,75 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		return _list_messages(kwargs)
 	elif action == "get_account_info":
 		return _get_account_info(kwargs)
+	elif action == "list_templates":
+		return _list_templates(kwargs)
+	elif action == "create_template":
+		return _create_template(kwargs)
 	else:
-		return _error(f"Unknown action '{action}'. Supported actions: send_message, send_template, list_messages, get_account_info")
+		return _error(
+			f"Unknown action '{action}'. Supported actions: send_message, send_template, "
+			"list_messages, get_account_info, list_templates, create_template"
+		)
+
+
+def _bridge_result(result: dict) -> str:
+	"""Pass a bridge result dict through as the tool's JSON response."""
+	if result.get("success"):
+		return _success({k: v for k, v in result.items() if k != "success"})
+	return json.dumps(result, default=str)
+
+
+def _resolve_bridge_account(kwargs: dict) -> Optional[dict]:
+	"""Return the resolved WhatsApp Account dict, or None when unavailable."""
+	if not bridge.is_available():
+		return None
+	acct = bridge.resolve_account((kwargs.get("whatsapp_account") or "").strip() or None)
+	if not acct or acct.get("error"):
+		return None
+	return acct
+
+
+def _is_proactive_send(kwargs: dict, recipient: str) -> bool:
+	"""A free-form send is proactive unless the gateway window is open (A8)."""
+	gateway_name = (kwargs.get("gateway_name") or "").strip()
+	if not gateway_name:
+		return True
+	try:
+		state = bridge.window_state(gateway_name, recipient)
+	except Exception:
+		# Fail closed: an unreadable window is treated as no window.
+		return True
+	return not state.get("open")
 
 
 def _send_message(kwargs: dict) -> str:
-	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
-	recipient = (kwargs.get("to") or kwargs.get("recipient") or kwargs.get("phone_number") or "").strip()
+	recipient = bridge.normalize_phone(kwargs.get("to") or kwargs.get("recipient") or kwargs.get("phone_number") or "")
 	message = (kwargs.get("message") or kwargs.get("text") or "").strip()
 
 	if not recipient:
 		return _error("Recipient phone number ('to') is required")
 	if not message:
 		return _error("Message text ('message') is required")
+
+	if _is_proactive_send(kwargs, recipient) and not _flag(kwargs, "allow_proactive", "allow_whatsapp_management"):
+		return _refused(
+			"proactive_send_not_permitted",
+			"No open 24h window for this number. Enable allow_proactive to send a free-form message.",
+		)
+
+	acct = _resolve_bridge_account(kwargs)
+	if acct:
+		try:
+			res = bridge.send_text(acct["name"], recipient, message)
+		except bridge.BridgeError as e:
+			return json.dumps(e.payload, default=str)
+		except frappe.PermissionError:
+			return _refused("permission_denied", "Not permitted to send WhatsApp messages")
+		except Exception as e:
+			return _error(f"Failed to send WhatsApp message: {str(e)}")
+		return _success({"message_id": res.get("message_id"), "recipient": recipient, "status": "sent", "name": res.get("name")})
+
+	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
 		return _error("WhatsApp credentials (phone_number_id and access_token) not found")
 
@@ -132,7 +230,7 @@ def _send_template(kwargs: dict) -> str:
 	full ``components`` array.
 	"""
 	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
-	recipient = (kwargs.get("to") or kwargs.get("recipient") or "").strip()
+	recipient = bridge.normalize_phone(kwargs.get("to") or kwargs.get("recipient") or "")
 	template_name = (kwargs.get("template_name") or "").strip()
 	language_code = (kwargs.get("language_code") or "en").strip()
 	parameters = kwargs.get("parameters") or []
@@ -219,3 +317,52 @@ def _get_account_info(kwargs: dict) -> str:
 		return _success(data)
 	except Exception as e:
 		return _error(f"Failed to fetch WhatsApp account info: {str(e)}")
+
+
+def _list_templates(kwargs: dict) -> str:
+	"""List WhatsApp Templates via the bridge (read-only)."""
+	if not bridge.is_available():
+		return _error("bridge_unavailable")
+	account_name = (kwargs.get("whatsapp_account") or "").strip() or None
+	status = (kwargs.get("status") or "").strip() or None
+	try:
+		rows = bridge.list_templates(account_name, status)
+	except frappe.PermissionError:
+		return _refused("permission_denied", "Not permitted to read WhatsApp Templates")
+	except Exception as e:
+		return _error(f"Failed to list WhatsApp templates: {str(e)}")
+	return _success(rows)
+
+
+def _create_template(kwargs: dict) -> str:
+	"""Create a WhatsApp template via the bridge (management; A8 gated).
+
+	Requires ``allow_whatsapp_management`` (or ``allow_proactive``) truthy in
+	kwargs. Accepted fields: ``template_name``, ``category``
+	(MARKETING/UTILITY/AUTHENTICATION), ``language_code``, ``body``.
+	"""
+	if not _flag(kwargs, "allow_whatsapp_management", "allow_proactive"):
+		return _refused(
+			"management_not_permitted",
+			"Template creation is disabled. Enable allow_whatsapp_management in the tool config.",
+		)
+	if not bridge.is_available():
+		return _error("bridge_unavailable")
+	acct = _resolve_bridge_account(kwargs)
+	if not acct:
+		return _error("no_account")
+
+	payload = {
+		key: kwargs[key]
+		for key in ("template_name", "category", "language_code", "body")
+		if kwargs.get(key) is not None
+	}
+	try:
+		result = bridge.create_template(acct["name"], payload)
+	except bridge.BridgeError as e:
+		return json.dumps(e.payload, default=str)
+	except frappe.PermissionError:
+		return _refused("permission_denied", "Not permitted to create WhatsApp Templates")
+	except Exception as e:
+		return _error(f"Failed to create WhatsApp template: {str(e)}")
+	return _bridge_result(result)
