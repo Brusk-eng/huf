@@ -58,7 +58,16 @@ def avail(value=True):
 class TestBridge(unittest.TestCase):
 	def test_constants_and_import_without_app(self):
 		self.assertEqual(wb.GRAPH_DEFAULT_VERSION, "v21.0")
-		self.assertNotIn("frappe_whatsapp", sys.modules)
+		# The bench may load frappe_whatsapp itself; the bridge must never import it at module level.
+		import ast, inspect
+
+		tree = ast.parse(inspect.getsource(wb))
+		top_level = [
+			(getattr(n, "module", None) or "") + "|" + ",".join(a.name for a in n.names)
+			for n in tree.body
+			if isinstance(n, (ast.Import, ast.ImportFrom))
+		]
+		self.assertFalse([i for i in top_level if "frappe_whatsapp" in i])
 
 	def test_is_available(self):
 		with patch.object(frappe.db, "exists", side_effect=[True, True, True]):
