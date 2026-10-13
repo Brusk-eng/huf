@@ -442,6 +442,34 @@ class TestBridgeMode(FakeGraphCase):
 		self.assertNotIn(("fg_spare", "en_US"), self.server.templates)
 		self.assertIn(("fg_order_update", "en_US"), self.server.templates)
 
+	def test_sync_imports_preexisting_meta_template_then_send_works(self):
+		# fg_preexisting exists on Meta only: no local row, nothing seeded in Huf
+		self.server.add_template("fg_preexisting", "en_US", "UTILITY", "APPROVED")
+		self.assertFalse(frappe.db.exists("WhatsApp Templates", {"whatsapp_account": self.account.name}))
+		synced = mgmt.sync_templates(account=self.account.name)
+		self.assertEqual(
+			(synced["success"], synced["imported"], synced["updated"], synced["unchanged"]), (True, 1, 0, 0), synced
+		)
+		self.assertEqual(self.server.requests_to("POST", "/message_templates"), [])  # import never pushes to Meta
+		row = frappe.get_doc("WhatsApp Templates", "fg_preexisting-en_US")
+		self.assertEqual(
+			(row.actual_name, row.language_code, row.status, row.category, row.header_type, row.header, row.whatsapp_account),
+			("fg_preexisting", "en_US", "APPROVED", "UTILITY", "TEXT", "Hello World", self.account.name),
+		)
+		self.assertEqual(row.footer, "WhatsApp Business Platform sample message")
+		self.assertTrue(row.id)
+
+		# second sync: nothing to do
+		again = mgmt.sync_templates(account=self.account.name)
+		self.assertEqual((again["imported"], again["updated"], again["unchanged"]), (0, 0, 1))
+		self.assertEqual(self.server.requests_to("POST", "/message_templates"), [])
+
+		sent = mgmt.send_template_message(to=SENDER, template_name="fg_preexisting", account=self.account.name)
+		self.assertTrue(sent["success"], sent)
+		self.assertEqual(self.server.sent[-1]["template"]["name"], "fg_preexisting")
+		self.assertEqual(self.server.sent[-1]["template"]["language"], {"code": "en_US"})
+		self.assertEqual(self.server.requests_to("POST", "/message_templates"), [])
+
 	def test_image_header_template_uploads_sample_and_sends_media_link(self):
 		sample = self.server.add_file("samples/header.png", "image/png", PNG)
 		created = self._make_template(

@@ -185,6 +185,21 @@ class FakeGraphServer:
 		self.files[path.lstrip("/")] = (mime_type, content)
 		return f"{self.url}/files/{path.lstrip('/')}"
 
+	def add_template(self, name: str, language: str = "en_US", category: str = "UTILITY", status: str = "APPROVED",
+		components: list | None = None) -> dict:
+		"""Seed a template that already exists on Meta (created outside Huf, e.g. hello_world)."""
+		comps = components or [
+			{"type": "HEADER", "format": "TEXT", "text": "Hello World"},
+			{"type": "BODY", "text": "Welcome and congratulations!! This message demonstrates your ability to send a WhatsApp message notification from the Cloud API."},
+			{"type": "FOOTER", "text": "WhatsApp Business Platform sample message"},
+		]
+		spec = {str(c["type"]).upper(): c for c in comps}
+		with self.lock:
+			tid = str(900000000000000 + self._next())
+			self.templates[(name, language)] = {"id": tid, "name": name, "language": language, "category": category,
+				"status": status, "spec": spec, "components": comps}
+		return self.templates[(name, language)]
+
 	def set_template_status(self, name: str, status: str, language: str | None = None) -> dict:
 		"""Move a template through review; returns the matching webhook payload."""
 		with self.lock:

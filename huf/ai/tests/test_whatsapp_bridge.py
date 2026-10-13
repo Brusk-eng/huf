@@ -379,21 +379,82 @@ class TestBridge(unittest.TestCase):
 
 		def http_get(url, **kw):
 			calls.append((url, kw))
-			return FakeResp({"data": [{"name": "promo", "status": "APPROVED", "id": "9"}, {"name": "zz", "status": "X", "id": "8"}]})
+			return FakeResp(
+				{
+					"data": [
+						{"name": "promo", "language": "en_US", "status": "APPROVED", "category": "MARKETING", "id": "9"},
+						{"name": "same", "language": "en_US", "status": "APPROVED", "category": "UTILITY", "id": "7"},
+						{"name": "zz", "language": "en_US", "status": "X", "id": "8"},
+					]
+				}
+			)
 
-		def get_value(dt, filt, field):
-			return "T1" if filt.get("actual_name") == "promo" else None
+		def local(account, name, lang):
+			return {"promo": "T1", "same": "T2"}.get(name)
+
+		def get_value(dt, name, fields, as_dict=False):
+			return {"T1": {"status": "PENDING", "category": "MARKETING", "id": "9"}, "T2": {"status": "APPROVED", "category": "UTILITY", "id": "7"}}[name]
 
 		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
 			wb, "resolve_account", return_value=ACCT
-		), patch.object(frappe.db, "get_value", side_effect=get_value), patch.object(frappe.db, "set_value") as sv:
+		), patch.object(frappe.db, "exists", return_value=False), patch.object(wb, "_local_template", side_effect=local), patch.object(
+			frappe.db, "get_value", side_effect=get_value
+		), patch.object(frappe.db, "set_value") as sv, patch.object(wb, "_import_template", return_value="zz-en_US") as imp:
 			res = wb.sync_templates("ACC", http_get=http_get)
-		self.assertEqual(res, {"success": True, "seen": 2, "updated": 1})
+		self.assertEqual(res, {"success": True, "seen": 3, "imported": 1, "updated": 1, "unchanged": 1, "skipped": 0})
 		self.assertEqual(calls[0][0], "https://graph.facebook.com/v25.0/BIZ/message_templates")
 		self.assertEqual(calls[0][1]["headers"]["Authorization"], "Bearer tok")
-		sv.assert_called_once_with("WhatsApp Templates", "T1", {"status": "APPROVED", "id": "9"})
+		sv.assert_called_once_with("WhatsApp Templates", "T1", {"status": "APPROVED"})
+		imp.assert_called_once()
+		self.assertEqual(imp.call_args.args[1]["name"], "zz")
 		with avail(False):
 			self.assertEqual(wb.sync_templates("ACC")["error"], "bridge_unavailable")
+
+	def test_import_template_maps_components_without_hooks(self):
+		class Doc:
+			doctype = "WhatsApp Templates"
+
+			def __init__(self):
+				self.rows = []
+				self.inserted = False
+
+			def append(self, field, row):
+				child = SimpleNamespace(db_insert=lambda: None, **row)
+				self.rows.append(child)
+
+			def get(self, field):
+				return self.rows
+
+			def db_insert(self):
+				self.inserted = True
+
+		doc = Doc()
+		tpl = {
+			"name": "promo", "language": "en_US", "status": "APPROVED", "category": "MARKETING", "id": "55",
+			"components": [
+				{"type": "HEADER", "format": "TEXT", "text": "Hi"},
+				{"type": "BODY", "text": "Hello {{1}}", "example": {"body_text": [["Ann"]]}},
+				{"type": "FOOTER", "text": "Bye"},
+				{"type": "BUTTONS", "buttons": [
+					{"type": "URL", "text": "Go", "url": "https://x.io/{{1}}", "example": ["https://x.io/a"]},
+					{"type": "QUICK_REPLY", "text": "Ok"},
+				]},
+			],
+		}
+		with patch.object(frappe.utils, "now", return_value="2026-01-01 00:00:00"), patch.object(frappe, "new_doc", return_value=doc), patch.object(
+			wb, "_language_link", return_value="en"
+		), patch.object(frappe, "get_doc") as gd:
+			name = wb._import_template("ACC", tpl)
+		self.assertEqual(name, "promo-en_US")
+		self.assertTrue(doc.inserted)
+		gd.assert_not_called()
+		self.assertEqual(
+			(doc.template_name, doc.actual_name, doc.id, doc.status, doc.category, doc.whatsapp_account, doc.language_code),
+			("promo", "promo", "55", "APPROVED", "MARKETING", "ACC", "en_US"),
+		)
+		self.assertEqual((doc.header_type, doc.header, doc.template, doc.sample_values, doc.footer), ("TEXT", "Hi", "Hello {{1}}", "Ann", "Bye"))
+		self.assertEqual([(r.button_type, r.sequence) for r in doc.rows], [("Visit Website", 1), ("Quick Reply", 2)])
+		self.assertEqual((doc.rows[0].url_type, doc.rows[0].example_url, doc.rows[0].parent), ("Dynamic", "https://x.io/a", "promo-en_US"))
 
 	def test_forward_status(self):
 		mod = ModuleType("frappe_whatsapp.utils.webhook")

@@ -859,8 +859,105 @@ def delete_template(name: str) -> dict[str, Any]:
 	return {"success": True, "name": name}
 
 
+_META_BUTTON_TYPES = {
+	"URL": "Visit Website",
+	"PHONE_NUMBER": "Call Phone",
+	"QUICK_REPLY": "Quick Reply",
+	"FLOW": "Flow",
+	"MPM": "Multi-Product Message",
+	"CATALOG": "Catalog",
+}
+
+
+def _local_template(account_name: str, name: str, language: str) -> str | None:
+	"""Docname of the local row for a Meta template (name + language), or None."""
+	langs = [language, language.replace("-", "_")] if language else [None]
+	for field in ("actual_name", "template_name"):
+		for lang in langs:
+			filters: dict[str, Any] = {"whatsapp_account": account_name, field: name}
+			if lang:
+				filters["language_code"] = lang
+			found = frappe.db.get_value("WhatsApp Templates", filters, "name")
+			if found:
+				return found
+		if language:  # legacy rows without a language code still match by name
+			found = frappe.db.get_value(
+				"WhatsApp Templates",
+				{"whatsapp_account": account_name, field: name, "language_code": ["in", ["", None]]},
+				"name",
+			)
+			if found:
+				return found
+	return None
+
+
+def _import_template(account_name: str, tpl: dict[str, Any]) -> str:
+	"""Insert a ``WhatsApp Templates`` row for a template that already exists on Meta.
+
+	Mirrors frappe_whatsapp's own ``fetch()``: the row is written with ``db_insert`` so the
+	``after_insert`` hook (which would POST the template to Meta) never runs.
+	"""
+	name, language = str(tpl.get("name")), str(tpl.get("language") or "")
+	doc = frappe.new_doc("WhatsApp Templates")
+	doc.template_name = name
+	doc.actual_name = name
+	doc.language_code = language
+	doc.language = _language_link(language, None) if language else None
+	doc.status = tpl.get("status")
+	doc.category = tpl.get("category")
+	doc.id = tpl.get("id")
+	doc.whatsapp_account = account_name
+	doc.name = f"{name}-{language}"
+	for comp in tpl.get("components") or []:
+		ctype = str(comp.get("type") or "").upper()
+		if ctype == "HEADER":
+			fmt = str(comp.get("format") or "").upper()
+			if fmt in ("TEXT", "IMAGE", "DOCUMENT"):
+				doc.header_type = fmt
+			if fmt == "TEXT":
+				doc.header = comp.get("text")
+		elif ctype == "FOOTER":
+			doc.footer = comp.get("text")
+		elif ctype == "BODY":
+			doc.template = comp.get("text")
+			body_text = (comp.get("example") or {}).get("body_text")
+			if body_text and body_text[0]:
+				doc.sample_values = ",".join(str(v) for v in body_text[0])
+		elif ctype == "BUTTONS":
+			for i, btn in enumerate(comp.get("buttons") or [], start=1):
+				btype = _META_BUTTON_TYPES.get(btn.get("type"))
+				if not btype:
+					continue
+				row: dict[str, Any] = {"button_type": btype, "button_label": btn.get("text"), "sequence": i}
+				if btn.get("type") == "URL":
+					row["website_url"] = btn.get("url")
+					row["url_type"] = "Dynamic" if "{{" in str(btn.get("url") or "") else "Static"
+					if btn.get("example"):
+						row["example_url"] = ",".join(btn["example"])
+				elif btn.get("type") == "PHONE_NUMBER":
+					row["phone_number"] = btn.get("phone_number")
+				doc.append("buttons", row)
+	now = frappe.utils.now()
+	user = frappe.session.user
+	doc.owner = doc.modified_by = user
+	doc.creation = doc.modified = now
+	doc.docstatus = 0
+	doc.db_insert()
+	for child in doc.get("buttons"):
+		child.parent, child.parenttype, child.parentfield = doc.name, doc.doctype, "buttons"
+		child.owner = child.modified_by = user
+		child.creation = child.modified = now
+		child.db_insert()
+	return doc.name
+
+
 def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None) -> dict[str, Any]:
-	"""Account-scoped template status sync (A15); does not call frappe_whatsapp ``fetch()``."""
+	"""Account-scoped template sync (A15); does not call frappe_whatsapp ``fetch()``.
+
+	Templates that exist on Meta but not locally are IMPORTED (inserted without the
+	frappe_whatsapp ``after_insert`` push, so nothing is POSTed to Meta); existing rows only
+	get status/category/id refreshed. Returns ``imported``/``updated``/``unchanged`` counts (``skipped``: no language, or the docname belongs to another account).
+	"""
 	if not is_available():
 		return _err("bridge_unavailable")
 	if not frappe.has_permission("WhatsApp Templates", "write"):
@@ -871,8 +968,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 	http_get = http_get or _default_get
 	url = f"{acct['url']}/{acct['version']}/{acct['business_id']}/message_templates"
 	headers = {"Authorization": f"Bearer {acct['token']}"}
-	updated = 0
-	seen = 0
+	imported = updated = unchanged = skipped = seen = 0
 	params: dict[str, Any] | None = {"limit": 100}
 	try:
 		while url:
@@ -881,22 +977,29 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 			data = resp.json()
 			for tpl in data.get("data", []):
 				seen += 1
-				name = frappe.db.get_value(
-					"WhatsApp Templates",
-					{"whatsapp_account": account_name, "actual_name": tpl.get("name")},
-					"name",
-				) or frappe.db.get_value(
-					"WhatsApp Templates",
-					{"whatsapp_account": account_name, "template_name": tpl.get("name")},
-					"name",
-				)
-				if name:
-					frappe.db.set_value(
-						"WhatsApp Templates",
-						name,
-						{"status": tpl.get("status"), "id": tpl.get("id")},
-					)
+				if not tpl.get("name"):
+					continue
+				name = _local_template(account_name, tpl["name"], str(tpl.get("language") or ""))
+				if not name:
+					language = str(tpl.get("language") or "")
+					# docname is <name>-<language> and unique site-wide: skip what cannot be named or collides
+					if not language or frappe.db.exists("WhatsApp Templates", f"{tpl['name']}-{language}"):
+						skipped += 1
+						continue
+					_import_template(account_name, tpl)
+					imported += 1
+					continue
+				current = frappe.db.get_value("WhatsApp Templates", name, ["status", "category", "id"], as_dict=True) or {}
+				changes = {
+					k: tpl.get(k)
+					for k in ("status", "category", "id")
+					if tpl.get(k) is not None and tpl.get(k) != current.get(k)
+				}
+				if changes:
+					frappe.db.set_value("WhatsApp Templates", name, changes)
 					updated += 1
+				else:
+					unchanged += 1
 			next_url = (data.get("paging") or {}).get("next")
 			if next_url:
 				nxt, base = urlparse(str(next_url)), urlparse(acct["url"])
@@ -906,7 +1009,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 			params = None
 	except Exception as exc:
 		return _err("sync_failed", message=_redact(exc))
-	return {"success": True, "seen": seen, "updated": updated}
+	return {"success": True, "seen": seen, "imported": imported, "updated": updated, "unchanged": unchanged, "skipped": skipped}
 
 
 def forward_status(change: dict[str, Any], _retry: bool = False) -> bool:

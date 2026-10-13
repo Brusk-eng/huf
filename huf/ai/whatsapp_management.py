@@ -279,7 +279,7 @@ def delete_template(name: str | None = None) -> dict[str, Any]:
 @frappe.whitelist(methods=["POST"])
 @_bridge_guard
 def sync_templates(account: str | None = None) -> dict[str, Any]:
-	"""Sync template statuses for one WhatsApp Account from Meta."""
+	"""Sync templates for one WhatsApp Account from Meta: import ones missing in Huf, refresh status/category of existing."""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	account_name = _resolve_account_name(account)

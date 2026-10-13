@@ -61,7 +61,7 @@ export function TemplatesTab({ account }: { account?: string }) {
     const res = await syncTemplates(account);
     setSyncing(false);
     if (res.success) {
-      toast.success('Templates synced');
+      toast.success(`Templates synced: ${res.imported ?? 0} imported, ${res.updated ?? 0} updated`);
       void load();
     } else if (isBridgeUnavailable(res)) setUnavailable(true);
     else toast.error(errorText(res));

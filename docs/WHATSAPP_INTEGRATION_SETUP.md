@@ -215,7 +215,7 @@ Approval and pairing notifications follow the same rule. If the window is closed
 | `list_templates` | GET | Lists WhatsApp Templates, optionally by account or status |
 | `create_template` | POST | Creates a WhatsApp Templates row. Its hook pushes it to Meta |
 | `delete_template` | POST | Deletes the row. `frappe_whatsapp` removes the template on Meta |
-| `sync_templates` | POST | Pulls template status and id from Meta for one WhatsApp Account |
+| `sync_templates` | POST | Imports templates that exist on Meta but not in Huf (without pushing anything back to Meta) and refreshes status, category and id of existing ones, for one WhatsApp Account. Returns `imported`, `updated`, `unchanged` |
 | `send_template_message` | POST | Sends an approved template. Allowed outside the 24h window |
 | `send_text_message` | POST | Sends free-form text. Refused with `window_closed` outside the window |
 | `send_media_message` | POST | Sends an image, document, audio or video by public link or public uploaded file. Refused with `window_closed` outside the window |
@@ -226,7 +226,7 @@ Template name rules: lowercase letters, digits and underscores only (`^[a-z0-9_]
 
 **Agent tool actions** (`huf/ai/tools/whatsapp.py`): `list_templates` (read-only) and `create_template` (gated, see section 6). `delete_template` returns `template_in_use` for a template that has been sent, without touching Meta.
 
-**Approval lifecycle**: the code does not enforce a state machine. A template is created in Meta by `frappe_whatsapp`. Its `status` field holds the value Meta reports, which Huf copies on `sync_templates`. The agent tool's `status` filter uses the values `PENDING`, `APPROVED` and `REJECTED`. Huf does not block sends of a template based on its status. Run a sync after Meta reviews a template, and check its status before relying on it as a fallback.
+**Approval lifecycle**: the code does not enforce a state machine. A template is created in Meta by `frappe_whatsapp`. Its `status` field holds the value Meta reports, which Huf copies on `sync_templates` (that sync also imports templates that exist only on Meta, such as `hello_world`). The agent tool's `status` filter uses the values `PENDING`, `APPROVED` and `REJECTED`. Huf does not block sends of a template based on its status. Run a sync after Meta reviews a template, and check its status before relying on it as a fallback.
 
 
 ### 4.4 Rich templates (header, footer, buttons)
