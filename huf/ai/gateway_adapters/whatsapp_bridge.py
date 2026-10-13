@@ -1,0 +1,497 @@
+# Copyright (c) 2026, Huf and contributors
+# For license information, please see license.txt
+
+"""Optional bridge between the Huf WhatsApp gateway and ``frappe_whatsapp``.
+
+This is the only Huf module that touches frappe_whatsapp doctypes. They are
+addressed by DocType name behind :func:`is_available`; frappe_whatsapp is
+never imported at module import time (only lazily, inside :func:`forward_status`).
+
+Structured errors: functions that can fail for expected reasons return or
+raise a dict-shaped error ``{"success": False, "error": "<code>", ...}``.
+``resolve_account`` returns ``{"error": "no_account"}`` when no account exists.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import re
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from typing import Any
+
+import frappe
+
+GRAPH_DEFAULT_VERSION = "v21.0"
+WINDOW_HOURS = 24
+DEFAULT_MAX_MEDIA_BYTES = 16 * 1024 * 1024
+DEFAULT_MIME_PREFIXES = ("image/", "audio/", "video/", "application/pdf", "text/plain")
+TEMPLATE_CATEGORIES = ("MARKETING", "UTILITY", "AUTHENTICATION")
+_TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+_HTTP_TIMEOUT = 30
+
+
+class BridgeError(Exception):
+	"""Structured bridge failure; ``payload`` is the error dict."""
+
+	def __init__(self, payload: dict[str, Any]):
+		super().__init__(payload.get("error") or "bridge_error")
+		self.payload = payload
+
+
+def _err(code: str, **extra: Any) -> dict[str, Any]:
+	return {"success": False, "error": code, **extra}
+
+
+def _default_get(*args: Any, **kwargs: Any) -> Any:
+	import requests
+
+	kwargs.setdefault("timeout", _HTTP_TIMEOUT)
+	return requests.get(*args, **kwargs)
+
+
+def is_available() -> bool:
+	"""Return True when frappe_whatsapp's required DocTypes are installed."""
+	try:
+		return all(
+			frappe.db.exists("DocType", dt)
+			for dt in ("WhatsApp Message", "WhatsApp Templates", "WhatsApp Account")
+		)
+	except Exception:
+		return False
+
+
+def normalize_phone(raw: Any) -> str:
+	"""Return digits only (no +, spaces, dashes, parens, leading ``00``)."""
+	digits = re.sub(r"\D", "", str(raw or ""))
+	if digits.startswith("00"):
+		digits = digits[2:]
+	return digits
+
+
+def resolve_account(name: str | None = None) -> dict[str, Any] | None:
+	"""Resolve a WhatsApp Account to a plain dict.
+
+	With ``name=None`` the default outgoing account is used, else the first
+	Active one. Returns ``None`` when the bridge is unavailable and
+	``{"error": "no_account"}`` when no matching account exists. Never raises
+	for a missing account.
+	"""
+	if not is_available():
+		return None
+	if not name:
+		name = frappe.db.get_value("WhatsApp Account", {"is_default_outgoing": 1}, "name")
+		if not name:
+			name = frappe.db.get_value("WhatsApp Account", {"status": "Active"}, "name")
+	if not name or not frappe.db.exists("WhatsApp Account", name):
+		return {"error": "no_account"}
+	doc = frappe.get_doc("WhatsApp Account", name)
+	return {
+		"name": doc.name,
+		"phone_id": doc.get("phone_id"),
+		"business_id": doc.get("business_id"),
+		"app_id": doc.get("app_id"),
+		"token": doc.get_password("token"),
+		"url": (doc.get("url") or "https://graph.facebook.com").rstrip("/"),
+		"version": doc.get("version") or GRAPH_DEFAULT_VERSION,
+		"webhook_verify_token": doc.get("webhook_verify_token"),
+		"status": doc.get("status"),
+	}
+
+
+def _account_or_error(account_name: str | None) -> dict[str, Any]:
+	if not is_available():
+		raise BridgeError(_err("bridge_unavailable"))
+	acct = resolve_account(account_name)
+	if not acct or acct.get("error"):
+		raise BridgeError(_err("no_account"))
+	return acct
+
+
+def account_matches_phone_id(account_name: str, phone_number_id: str) -> bool:
+	"""True iff the account's phone_id equals the payload phone_number_id (A11)."""
+	if not account_name or not phone_number_id or not is_available():
+		return False
+	try:
+		phone_id = frappe.db.get_value("WhatsApp Account", account_name, "phone_id")
+	except Exception:
+		return False
+	return bool(phone_id) and str(phone_id) == str(phone_number_id)
+
+
+def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> dict[str, Any]:
+	"""Compute the 24h customer-service window from signed Gateway Events only (A3).
+
+	Only inbound events with ``verified_sender=1`` for the same gateway and
+	normalised sender count. WhatsApp Message rows are never consulted.
+	"""
+	now = now or frappe.utils.now_datetime()
+	sender = normalize_phone(phone)
+	rows = frappe.get_all(
+		"Gateway Event",
+		filters={
+			"gateway": gateway_name,
+			"sender_id": sender,
+			"verified_sender": 1,
+			"received_at": [">=", now - timedelta(hours=WINDOW_HOURS)],
+		},
+		fields=["received_at", "verified_sender", "sender_id"],
+		order_by="received_at desc",
+		limit_page_length=20,
+	)
+	last = None
+	for row in rows or []:
+		if not row.get("verified_sender"):
+			continue
+		ts = row.get("received_at")
+		if ts and (last is None or ts > last):
+			last = ts
+	if last is None:
+		return {"open": False, "last_inbound_at": None, "expires_at": None}
+	expires = last + timedelta(hours=WINDOW_HOURS)
+	return {"open": now < expires and last <= now, "last_inbound_at": last, "expires_at": expires}
+
+
+def record_incoming(account_name: str, message: dict[str, Any], profile_name: str | None = None) -> str | None:
+	"""Idempotently mirror a signed inbound message into ``WhatsApp Message``.
+
+	Returns the doc name, or None when unavailable / no message id. Does not
+	trigger an outgoing send (type Incoming).
+	"""
+	if not is_available():
+		return None
+	message_id = (message or {}).get("id") or (message or {}).get("message_id")
+	if not message_id:
+		return None
+	existing = frappe.db.get_value("WhatsApp Message", {"message_id": message_id}, "name")
+	if existing:
+		return existing
+	content_type = message.get("type") or message.get("content_type") or "text"
+	body = ""
+	if content_type == "text":
+		body = (message.get("text") or {}).get("body", "") if isinstance(message.get("text"), dict) else message.get("text") or ""
+	elif isinstance(message.get(content_type), dict):
+		body = message[content_type].get("caption", "") or ""
+	if not body:
+		body = message.get("body") or message.get("message") or ""
+	allowed = {"text", "document", "image", "video", "audio", "flow", "reaction", "location", "contact", "button", "interactive", "order"}
+	doc = frappe.get_doc(
+		{
+			"doctype": "WhatsApp Message",
+			"type": "Incoming",
+			"from": normalize_phone(message.get("from")),
+			"message": body,
+			"message_id": message_id,
+			"content_type": content_type if content_type in allowed else "text",
+			"profile_name": profile_name,
+			"whatsapp_account": account_name,
+		}
+	)
+	doc.flags.ignore_mandatory = True
+	doc.insert(ignore_permissions=True)  # signed ingress mirror, internal
+	return doc.name
+
+
+def _readback(doc: Any) -> dict[str, Any]:
+	return {
+		"success": True,
+		"name": doc.name,
+		"message_id": doc.get("message_id"),
+		"status": doc.get("status"),
+	}
+
+
+def send_text(
+	account_name: str,
+	to: str,
+	text: str,
+	reply_to: str | None = None,
+	trusted: bool = False,
+) -> dict[str, Any]:
+	"""Send a free-form text via ``WhatsApp Message`` (it performs the one send, A1).
+
+	``trusted=True`` is only for the gateway-internal reply path and skips
+	permission checks; user-initiated calls must leave it False. Raises
+	:class:`BridgeError` (``.payload`` is the error dict) on failure.
+	"""
+	_account_or_error(account_name)
+	values = {
+		"doctype": "WhatsApp Message",
+		"type": "Outgoing",
+		"to": normalize_phone(to),
+		"message": text,
+		"content_type": "text",
+		"whatsapp_account": account_name,
+	}
+	if reply_to:
+		values["is_reply"] = 1
+		values["reply_to_message_id"] = reply_to
+	try:
+		doc = frappe.get_doc(values)
+		doc.insert(ignore_permissions=bool(trusted))
+	except frappe.PermissionError:
+		raise
+	except Exception as exc:
+		raise BridgeError(_err("send_failed", message=str(exc))) from exc
+	return _readback(doc)
+
+
+def send_template(
+	account_name: str,
+	to: str,
+	template_name: str,
+	body_params: list | None = None,
+	header_params: list | None = None,
+) -> dict[str, Any]:
+	"""Send an approved template via an Outgoing ``WhatsApp Message`` (use_template=1).
+
+	Permission-checked (no ignore_permissions). Raises :class:`BridgeError`.
+	"""
+	_account_or_error(account_name)
+	params = [str(p) for p in (body_params or [])]
+	values: dict[str, Any] = {
+		"doctype": "WhatsApp Message",
+		"type": "Outgoing",
+		"to": normalize_phone(to),
+		"use_template": 1,
+		"template": template_name,
+		"whatsapp_account": account_name,
+		"content_type": "text",
+		"template_parameters": ",".join(params),
+		# frappe_whatsapp builds the Meta payload from body_param (JSON dict values)
+		"body_param": json.dumps({str(i + 1): p for i, p in enumerate(params)}),
+	}
+	if header_params:
+		values["template_header_parameters"] = ",".join(str(p) for p in header_params)
+	try:
+		doc = frappe.get_doc(values)
+		doc.insert()
+	except frappe.PermissionError:
+		raise
+	except Exception as exc:
+		raise BridgeError(_err("send_failed", message=str(exc))) from exc
+	return _readback(doc)
+
+
+def list_templates(account_name: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+	"""List WhatsApp Templates (empty list when the bridge is unavailable)."""
+	if not is_available():
+		return []
+	filters: dict[str, Any] = {}
+	if account_name:
+		filters["whatsapp_account"] = account_name
+	if status:
+		filters["status"] = status
+	return frappe.get_list(
+		"WhatsApp Templates",
+		filters=filters,
+		fields=["name", "template_name", "actual_name", "category", "language_code", "status", "id", "whatsapp_account", "template"],
+		order_by="modified desc",
+		limit_page_length=500,
+	)
+
+
+def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+	"""Create a WhatsApp Templates row (its after_insert pushes to Meta). Permission-checked (A8)."""
+	if not is_available():
+		return _err("bridge_unavailable")
+	if not frappe.has_permission("WhatsApp Templates", "create"):
+		raise frappe.PermissionError("Not permitted to create WhatsApp Templates")
+	name = str(payload.get("template_name") or payload.get("name") or "")
+	category = str(payload.get("category") or "").upper()
+	language_code = str(payload.get("language_code") or "")
+	if not _TEMPLATE_NAME_RE.match(name):
+		return _err("invalid_name", message="Name must match ^[a-z0-9_]+$")
+	if category not in TEMPLATE_CATEGORIES:
+		return _err("invalid_category", message="Category must be one of " + ", ".join(TEMPLATE_CATEGORIES))
+	if not language_code:
+		return _err("invalid_language", message="language_code is required")
+	values = {k: v for k, v in payload.items() if k not in ("name",)}
+	values.update(
+		{
+			"doctype": "WhatsApp Templates",
+			"template_name": name,
+			"category": category,
+			"language_code": language_code,
+			"whatsapp_account": account_name,
+		}
+	)
+	if "template" not in values and payload.get("body"):
+		values["template"] = payload["body"]
+	try:
+		doc = frappe.get_doc(values)
+		doc.insert()
+	except frappe.PermissionError:
+		raise
+	except Exception as exc:
+		return _err("create_failed", message=str(exc))
+	return {"success": True, "name": doc.name, "status": doc.get("status"), "id": doc.get("id")}
+
+
+def delete_template(name: str) -> dict[str, Any]:
+	"""Delete a template (frappe_whatsapp on_trash removes it on Meta). Permission-checked."""
+	if not is_available():
+		return _err("bridge_unavailable")
+	if not frappe.has_permission("WhatsApp Templates", "delete"):
+		raise frappe.PermissionError("Not permitted to delete WhatsApp Templates")
+	if not frappe.db.exists("WhatsApp Templates", name):
+		return _err("not_found")
+	try:
+		frappe.delete_doc("WhatsApp Templates", name)
+	except frappe.PermissionError:
+		raise
+	except Exception as exc:
+		return _err("delete_failed", message=str(exc))
+	return {"success": True, "name": name}
+
+
+def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None) -> dict[str, Any]:
+	"""Account-scoped template status sync (A15); does not call frappe_whatsapp ``fetch()``."""
+	if not is_available():
+		return _err("bridge_unavailable")
+	if not frappe.has_permission("WhatsApp Templates", "write"):
+		raise frappe.PermissionError("Not permitted to sync WhatsApp Templates")
+	acct = resolve_account(account_name)
+	if not acct or acct.get("error"):
+		return _err("no_account")
+	http_get = http_get or _default_get
+	url = f"{acct['url']}/{acct['version']}/{acct['business_id']}/message_templates"
+	headers = {"Authorization": f"Bearer {acct['token']}"}
+	updated = 0
+	seen = 0
+	params: dict[str, Any] | None = {"limit": 100}
+	try:
+		while url:
+			resp = http_get(url, headers=headers, params=params, timeout=_HTTP_TIMEOUT)
+			resp.raise_for_status()
+			data = resp.json()
+			for tpl in data.get("data", []):
+				seen += 1
+				name = frappe.db.get_value(
+					"WhatsApp Templates",
+					{"whatsapp_account": account_name, "actual_name": tpl.get("name")},
+					"name",
+				) or frappe.db.get_value(
+					"WhatsApp Templates",
+					{"whatsapp_account": account_name, "template_name": tpl.get("name")},
+					"name",
+				)
+				if name:
+					frappe.db.set_value(
+						"WhatsApp Templates",
+						name,
+						{"status": tpl.get("status"), "id": tpl.get("id")},
+					)
+					updated += 1
+			url = (data.get("paging") or {}).get("next")
+			params = None
+	except Exception as exc:
+		return _err("sync_failed", message=str(exc))
+	return {"success": True, "seen": seen, "updated": updated}
+
+
+def forward_status(change: dict[str, Any]) -> bool:
+	"""Forward a status ``change`` to frappe_whatsapp's ``update_status`` (A4).
+
+	Lazy import; unknown message wamids are skipped; never raises. Returns
+	True only if a forward actually happened.
+	"""
+	try:
+		if not is_available():
+			return False
+		if change.get("field") == "messages":
+			statuses = (change.get("value") or {}).get("statuses") or []
+			if not statuses or not frappe.db.exists("WhatsApp Message", {"message_id": statuses[0].get("id")}):
+				return False
+		webhook = importlib.import_module("frappe_whatsapp.utils.webhook")
+		webhook.update_status(change)
+		return True
+	except Exception:
+		return False
+
+
+def download_media(
+	account_name: str,
+	media_id: str,
+	max_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
+	allowed_mime_prefixes: tuple[str, ...] = DEFAULT_MIME_PREFIXES,
+	http_get: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	"""Fetch media by id at call time. Raises ValueError on caps/mime/failure."""
+	acct = resolve_account(account_name)
+	if not acct or acct.get("error"):
+		raise ValueError("no_account")
+	http_get = http_get or _default_get
+	headers = {"Authorization": f"Bearer {acct['token']}"}
+	meta_resp = http_get(f"{acct['url']}/{acct['version']}/{media_id}", headers=headers, timeout=_HTTP_TIMEOUT)
+	meta_resp.raise_for_status()
+	meta = meta_resp.json()
+	mime = str(meta.get("mime_type") or "").split(";")[0].strip().lower()
+	if not mime or not any(mime.startswith(p) for p in allowed_mime_prefixes):
+		raise ValueError(f"mime_not_allowed: {mime or 'unknown'}")
+	declared = meta.get("file_size")
+	if declared is not None and int(declared) > max_bytes:
+		raise ValueError("media_too_large")
+	media_url = meta.get("url")
+	if not media_url:
+		raise ValueError("media_url_missing")
+	resp = http_get(media_url, headers=headers, timeout=_HTTP_TIMEOUT)
+	resp.raise_for_status()
+	content = resp.content
+	if len(content) > max_bytes:
+		raise ValueError("media_too_large")
+	filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(meta.get("filename") or media_id))[:100] or "media"
+	return {"content": content, "mime_type": mime, "filename": filename}
+
+
+def list_messages(account_name: str | None = None, phone: str | None = None, limit: int = 50) -> dict[str, Any]:
+	"""List WhatsApp Messages (newest first); bridge_unavailable error if absent (A15)."""
+	if not is_available():
+		return _err("bridge_unavailable")
+	filters: dict[str, Any] = {}
+	if account_name:
+		filters["whatsapp_account"] = account_name
+	if phone:
+		p = normalize_phone(phone)
+		or_filters = {"to": p, "from": p}
+		rows = frappe.get_list(
+			"WhatsApp Message",
+			filters=filters,
+			or_filters=or_filters,
+			fields=_MSG_FIELDS,
+			order_by="creation desc",
+			limit_page_length=limit,
+		)
+		return {"success": True, "messages": rows}
+	rows = frappe.get_list(
+		"WhatsApp Message", filters=filters, fields=_MSG_FIELDS, order_by="creation desc", limit_page_length=limit
+	)
+	return {"success": True, "messages": rows}
+
+
+_MSG_FIELDS = ["name", "type", "to", "from", "message", "message_id", "content_type", "status", "creation", "whatsapp_account", "profile_name"]
+
+
+def list_conversations(account_name: str | None = None, limit: int = 50) -> dict[str, Any]:
+	"""Group recent messages by counterparty number (latest message each)."""
+	if not is_available():
+		return _err("bridge_unavailable")
+	filters = {"whatsapp_account": account_name} if account_name else {}
+	rows = frappe.get_list(
+		"WhatsApp Message",
+		filters=filters,
+		fields=_MSG_FIELDS,
+		order_by="creation desc",
+		limit_page_length=max(limit * 20, 200),
+	)
+	convs: dict[str, dict[str, Any]] = {}
+	for row in rows:
+		other = normalize_phone(row.get("from") if row.get("type") == "Incoming" else row.get("to"))
+		if not other:
+			continue
+		conv = convs.setdefault(other, {"phone": other, "last_message": row, "count": 0, "profile_name": None})
+		conv["count"] += 1
+		if row.get("profile_name") and not conv["profile_name"]:
+			conv["profile_name"] = row["profile_name"]
+	return {"success": True, "conversations": list(convs.values())[:limit]}
