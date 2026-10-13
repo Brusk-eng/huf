@@ -125,6 +125,14 @@ class TestWhatsAppGatewayAdapter(unittest.TestCase):
 		with self.assertRaises(ValueError):
 			self.adapter.normalize_inbound(_request(payload))
 
+	def test_missing_metadata_phone_id_fails_closed(self):
+		payload = _payload([_msg("wamid.1")], statuses=[{"id": "wamid.s", "status": "sent"}])
+		payload["entry"][0]["changes"][0]["value"].pop("metadata")
+		parsed = self.adapter.parse_payload(_request(payload))
+		self.assertEqual(parsed.messages, ())
+		self.assertEqual(parsed.statuses, ())
+		self.assertGreaterEqual(parsed.ignored, 2)
+
 	def test_phone_id_mismatch_ignored(self):
 		parsed = self.adapter.parse_payload(_request(_payload([_msg("wamid.1")], phone_id="other")))
 		self.assertEqual(parsed.messages, ())

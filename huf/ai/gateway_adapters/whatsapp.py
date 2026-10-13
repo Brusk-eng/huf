@@ -155,7 +155,8 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 				items = _as_list(value.get("messages")) + _as_list(value.get("statuses"))
 				metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
 				phone_id = str(metadata.get("phone_number_id") or "")
-				if phone_id and not self._phone_id_accepted(phone_id):
+				# Fail closed: a change without metadata.phone_number_id is ignored.
+				if not phone_id or not self._phone_id_accepted(phone_id):
 					ignored += max(len(items), 1)
 					continue
 				for status in _as_list(value.get("statuses")):

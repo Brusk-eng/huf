@@ -344,6 +344,9 @@ def handle_gateway_webhook() -> dict | None:
 	if not gateway_name:
 		frappe.local.response.http_status_code = 400
 		return {"success": False, "error": "Missing gateway_name"}
+	# JSON bodies replace form_dict wholesale, so the rate limiter's
+	# form_dict key would be empty; key the buckets on the query-string name.
+	frappe.form_dict["gateway_name"] = gateway_name
 
 	try:
 		gateway = frappe.get_doc("Gateway", gateway_name)
@@ -357,6 +360,7 @@ def handle_gateway_webhook() -> dict | None:
 	adapter = get_gateway_adapter(gateway)
 	request = _inbound_request()
 	if request.method == "GET" and hasattr(adapter, "verify_url"):
+		_ingest_rate_gate()
 		try:
 			challenge = adapter.verify_url(request) or ""
 		except frappe.PermissionError:

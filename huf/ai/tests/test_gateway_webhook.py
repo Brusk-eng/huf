@@ -88,6 +88,29 @@ class TestGatewayWebhook(unittest.TestCase):
         assert gateway_webhook.handle_gateway_webhook() is None
         mock_text_response.assert_called_once_with("decrypted-echo")
 
+    @patch("huf.ai.gateway_webhook._ingest_rate_gate")
+    @patch("huf.ai.gateway_webhook.get_gateway_adapter")
+    @patch("huf.ai.gateway_webhook._inbound_request")
+    @patch("huf.ai.gateway_webhook._text_response")
+    @patch("huf.ai.gateway_webhook.frappe")
+    def test_get_verify_is_rate_gated_before_verify_url_and_keyed_by_query_name(
+        self, mock_frappe, mock_text_response, mock_request, mock_adapter, mock_gate
+    ):
+        order = []
+        mock_frappe.get_doc.return_value = SimpleNamespace(name="G1", provider="WhatsApp", is_enabled=1)
+        mock_frappe.request = SimpleNamespace(args={"gateway_name": "G1"})
+        mock_frappe.form_dict = {}
+        mock_request.return_value = SimpleNamespace(method="GET")
+        adapter = MagicMock()
+        adapter.verify_url.side_effect = lambda r: order.append("verify") or "ch"
+        mock_adapter.return_value = adapter
+        mock_gate.side_effect = lambda: order.append("gate")
+
+        gateway_webhook.handle_gateway_webhook()
+
+        assert order == ["gate", "verify"]
+        assert mock_frappe.form_dict["gateway_name"] == "G1"
+
     @patch("huf.ai.gateway_webhook.frappe")
     def test_missing_gateway_name_is_rejected(self, mock_frappe):
         """Every provider here posts application/json, and
