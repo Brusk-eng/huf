@@ -293,6 +293,17 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
           hasUnsavedChanges={hasUnsavedChanges}
           docTypes={docTypes}
           loadingDocTypes={loadingDocTypes}
+          onBoundChange={(bound) => {
+            // Stamp (or clear) the marker the serializer reads, only when it actually changes.
+            if (!selectedNodeId || !selectedNode || (config.trigger_bound === true) === bound) return;
+            updateNode(selectedNodeId, {
+              data: {
+                ...selectedNode.data,
+                configured: bound,
+                triggerConfig: { ...config, trigger_bound: bound }
+              }
+            });
+          }}
         />
       );
     }

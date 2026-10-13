@@ -74,6 +74,8 @@ export interface ScheduleTriggerConfig {
   cronExpression?: string;
   /** @deprecated display-only, ignored by the runtime */
   timezone?: string;
+  /** Set by FlowTriggerPanel when the server holds this flow's trigger; makes the node count as configured. */
+  trigger_bound?: boolean;
 }
 
 export interface DocEventTriggerConfig {
@@ -81,6 +83,8 @@ export interface DocEventTriggerConfig {
   /** Doc-event settings live in the backend (set_flow_trigger); these are display-only legacy values. */
   doctype?: string;
   event?: DocEventType;
+  /** Set by FlowTriggerPanel when the server holds this flow's trigger; makes the node count as configured. */
+  trigger_bound?: boolean;
 }
 
 export interface AppTriggerConfig {

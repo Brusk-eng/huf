@@ -7,6 +7,7 @@ import {
   describeTriggerState,
   triggerErrorInfo,
   triggerDisabledReason,
+  isTriggerBoundFor,
   DEFAULT_SCHEDULE_FORM,
   type FlowTriggerSummary,
 } from './flowTrigger';
@@ -120,5 +121,15 @@ describe('triggerDisabledReason', () => {
     expect(triggerDisabledReason(null, false)).toMatch(/Save this flow/);
     expect(triggerDisabledReason('f1', true)).toMatch(/Save your changes/);
     expect(triggerDisabledReason('f1', false)).toBeNull();
+  });
+});
+
+describe('isTriggerBoundFor', () => {
+  const s = { trigger_type: 'Schedule' } as FlowTriggerSummary;
+  it('is true only when the server trigger matches the node kind', () => {
+    expect(isTriggerBoundFor('schedule', s)).toBe(true);
+    expect(isTriggerBoundFor('doc-event', s)).toBe(false);
+    expect(isTriggerBoundFor('doc-event', { trigger_type: 'Doc Event' } as FlowTriggerSummary)).toBe(true);
+    expect(isTriggerBoundFor('schedule', null)).toBe(false);
   });
 });

@@ -269,6 +269,8 @@ function mapBackendNodeTypeToFrontend(
  * Mirrors the required string fields in graph_ir.schema.json (and the backend
  * activation rules in flow_definition/activation_rules.py).
  */
+import { TRIGGER_BOUND_KEY } from '../lib/flowTrigger';
+
 const REQUIRED_CONFIG_KEYS: Partial<Record<string, string[]>> = {
     'trigger.webhook': ['method'],
     'trigger.schedule': ['cron'],
@@ -284,6 +286,8 @@ const REQUIRED_CONFIG_KEYS: Partial<Record<string, string[]>> = {
 export function isBackendNodeConfigured(node: BackendNode): boolean {
     if (node.type === 'trigger.unset') return false;
     const config = (node.config ?? {}) as Record<string, unknown>;
+    // Schedule / doc-event triggers live on the server; FlowTriggerPanel stamps this marker once it holds one.
+    if ((node.type === 'trigger.schedule' || node.type === 'trigger.doc-event') && config[TRIGGER_BOUND_KEY] === true) return true;
     return (REQUIRED_CONFIG_KEYS[node.type] ?? []).every((key) => {
         const v = config[key];
         return v != null && !(typeof v === 'string' && v.trim() === '');

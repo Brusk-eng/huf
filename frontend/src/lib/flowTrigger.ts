@@ -28,6 +28,15 @@ export const DOC_EVENTS = [
 ] as const;
 export type FlowDocEvent = (typeof DOC_EVENTS)[number];
 
+/** Node-config key marking that the server holds this node's trigger (see FlowTriggerPanel / flowSerializer). */
+export const TRIGGER_BOUND_KEY = 'trigger_bound';
+
+/** True when the server trigger state is a trigger of this node's kind (the node then counts as configured). */
+export function isTriggerBoundFor(kind: 'schedule' | 'doc-event', s: FlowTriggerSummary | null): boolean {
+  if (!s) return false;
+  return s.trigger_type === (kind === 'schedule' ? 'Schedule' : 'Doc Event');
+}
+
 /** Shape returned by get_flow_trigger / set_flow_trigger (null when the flow has no trigger). */
 export interface FlowTriggerSummary {
   flow_id: string;

@@ -746,6 +746,19 @@ describe('flowSerializer', () => {
       const flow = deserializeFlow('f', 'F', 'Draft', graph);
       expect(flow.nodes.map((n) => n.data.configured)).toEqual([false, true, true, true]);
     });
+
+    it('counts a server-bound schedule / doc-event trigger as configured via the trigger_bound marker', () => {
+      const graph = makeBackendGraph([
+        { id: 's', type: 'trigger.schedule', config: {}, next: 'd' },
+        { id: 'e', type: 'trigger.doc-event', config: { trigger_bound: true }, next: 'd' },
+        { id: 'w', type: 'trigger.webhook', config: { trigger_bound: true }, next: 'd' },
+        { id: 'b', type: 'trigger.schedule', config: { trigger_bound: true }, next: 'd' },
+        { id: 'd', type: 'output', config: {}, next: null },
+      ]);
+      const flow = deserializeFlow('f', 'F', 'Draft', graph);
+      // unmarked schedule, marked doc-event, webhook ignores the marker (needs method), marked schedule, output
+      expect(flow.nodes.map((n) => n.data.configured)).toEqual([false, true, false, true, true]);
+    });
   });
 });
 

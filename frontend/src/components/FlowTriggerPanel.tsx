@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Clock } from 'lucide-react';
 import { toast } from 'sonner';
@@ -22,6 +22,7 @@ import {
   triggerErrorInfo,
   type DocEventForm,
   type FlowDocEvent,
+  isTriggerBoundFor,
   type FlowTriggerSummary,
   type ScheduleForm,
   type ScheduleInterval,
@@ -34,6 +35,8 @@ interface FlowTriggerPanelProps {
   hasUnsavedChanges: boolean;
   docTypes: Array<{ value: string; label: string }>;
   loadingDocTypes: boolean;
+  /** Reports whether the server holds a trigger of this kind, after a hydrate / save / clear succeeds. */
+  onBoundChange?: (bound: boolean) => void;
 }
 
 /**
@@ -41,7 +44,7 @@ interface FlowTriggerPanelProps {
  * flow's converted Procedure), not in the node config, so it hydrates from get_flow_trigger
  * and writes through set_flow_trigger.
  */
-export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, loadingDocTypes }: FlowTriggerPanelProps) {
+export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, loadingDocTypes, onBoundChange }: FlowTriggerPanelProps) {
   const navigate = useNavigate();
   const [summary, setSummary] = useState<FlowTriggerSummary | null>(null);
   const [loading, setLoading] = useState(false);
@@ -49,6 +52,10 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
   const [error, setError] = useState<TriggerErrorInfo | null>(null);
   const [scheduleForm, setScheduleForm] = useState<ScheduleForm>(DEFAULT_SCHEDULE_FORM);
   const [docForm, setDocForm] = useState<DocEventForm>(DEFAULT_DOC_EVENT_FORM);
+
+  // Latest callback without refetching when its identity changes (it closes over the selected node).
+  const boundRef = useRef(onBoundChange);
+  boundRef.current = onBoundChange;
 
   const hydrate = useCallback((s: FlowTriggerSummary | null) => {
     setSummary(s);
@@ -65,7 +72,11 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
     let cancelled = false;
     setLoading(true);
     getFlowTrigger(flowId)
-      .then((s) => !cancelled && hydrate(s))
+      .then((s) => {
+        if (cancelled) return;
+        hydrate(s);
+        boundRef.current?.(isTriggerBoundFor(kind, s));
+      })
       .catch((e) => !cancelled && setError(triggerErrorInfo(e)))
       .finally(() => !cancelled && setLoading(false));
     return () => {
@@ -91,6 +102,7 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
     try {
       const next = await setFlowTrigger(built.args);
       hydrate(next);
+      boundRef.current?.(isTriggerBoundFor(kind, next));
       toast.success(next.enabled && next.automation_status === 'Active' ? 'Trigger saved' : 'Trigger saved, activation pending');
     } catch (e) {
       setError(triggerErrorInfo(e));
@@ -106,6 +118,7 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
     try {
       await clearFlowTrigger(flowId);
       hydrate(null);
+      boundRef.current?.(false);
       toast.success('Trigger removed');
     } catch (e) {
       setError(triggerErrorInfo(e));
