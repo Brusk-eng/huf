@@ -251,6 +251,14 @@ def analyze_conversion(flow_graph: dict, *, classify_tool=default_tool_classifie
 			validation_errors=flow_validation.errors,
 		)
 
+	from huf.huf.doctype.flow_definition.activation_rules import entry_is_unset
+
+	if entry_is_unset(flow_graph):
+		return ConversionResult(
+			convertible=False,
+			reason="This flow has no trigger configured yet (its entry is an unset trigger), so there is nothing to convert.",
+		)
+
 	blocking = find_blocking_nodes(flow_graph)
 	if blocking:
 		named = ", ".join(f"'{node_id}' ({node_type})" for node_id, node_type in blocking)
