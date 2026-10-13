@@ -5,6 +5,7 @@ import { Input } from './ui/input';
 import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import { buildBranchOptionLabels } from '@/lib/flowBranchTargets';
 import { Label } from './ui/label';
 import { Combobox } from './ui/combobox';
 import { Checkbox } from './ui/checkbox';
@@ -695,6 +696,7 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                 const otherNodes = (activeFlow?.nodes || []).filter((n) => n.id !== selectedNodeId);
                 const currentValue = value || '';
                 const isMissing = currentValue && !otherNodes.some((n) => n.id === currentValue);
+                const optionLabels = buildBranchOptionLabels(otherNodes);
                 return (
                   <Select value={currentValue} onValueChange={onChange}>
                     <SelectTrigger id={id}>
@@ -708,7 +710,7 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                       )}
                       {otherNodes.map((n) => (
                         <SelectItem key={n.id} value={n.id}>
-                          {n.data.label || n.id}
+                          {optionLabels.get(n.id)}
                         </SelectItem>
                       ))}
                     </SelectContent>
