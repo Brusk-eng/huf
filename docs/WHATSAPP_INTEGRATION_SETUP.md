@@ -34,7 +34,7 @@ Huf never imports `frappe_whatsapp` at module load. The bridge checks for the Do
 
 ### Known limits
 
-- **One Gateway per Meta app and phone number.** A signed payload for a `phone_number_id` that does not match the gateway is ignored (HTTP 200) and the gateway's `last_error` says so.
+- **One enabled Gateway per phone number.** A signed payload for a `phone_number_id` that does not match the gateway is ignored (HTTP 200) and the gateway's `last_error` says so. Several numbers need several Gateways; see [Multiple WhatsApp gateways](#multiple-whatsapp-gateways).
 - **Non-text inbound** (location, contacts, reactions) is acknowledged but does not start a run and does not open the 24h window in Huf. Known limitation.
 - **72-hour click-to-WhatsApp windows are not modelled.** Huf always applies the conservative 24h rule.
 - The window is anchored on the customer's own message timestamp, so Meta redelivering an old webhook (up to about 7 days) does not reopen it.
@@ -91,10 +91,10 @@ Then create a **WhatsApp Account** in Frappe Desk. The code reads these fields:
 | `business_id` | Template list and sync |
 | `url` | Graph base URL (defaults to `https://graph.facebook.com`) |
 | `version` | Graph API version (defaults to `v25.0`) |
-| `is_default_outgoing` | Selected when no account is named |
-| `status` | Used only by the fallback that picks the first account with status `Active` |
+| `is_default_outgoing` | **Ignored by Huf's gateway, webhook and management code.** Only the non-gateway agent tool uses it (when it is called without `gateway_name`) |
+| `status` | Used only by that same non-gateway tool fallback (first account with status `Active`) |
 
-Mark one account as **default outgoing**. If no account is marked default, the first account with status `Active` is used. If neither exists, the bridge returns `no_account`.
+Huf never guesses an account for a gateway. Every gateway-side action (inbound mirroring, replies, template sync and updates, message and template listings) resolves the account through the Gateway's `whatsapp_account`; with none linked, the gateway runs in direct mode and mirroring is skipped (logged). frappe_whatsapp's own *default outgoing* and *Active* flags are therefore irrelevant to Huf, whatever they are set to.
 
 ---
 
@@ -129,7 +129,8 @@ Create a **Gateway**:
 |---|---|
 | Channel (`provider`) | `WhatsApp` |
 | Connected integration (`integration_settings`) | The Integration Settings record from 3.1 |
-| WhatsApp Account (`whatsapp_account`) | Optional. Name of a frappe_whatsapp WhatsApp Account. Setting it enables bridge mode when the app is installed |
+| Phone number ID (`phone_number_id`) | Read-only and indexed. Derived on save from the `phone_number_id` credential of the connected integration. See [Multiple WhatsApp gateways](#multiple-whatsapp-gateways) |
+| WhatsApp Account (`whatsapp_account`) | Optional. Name of a frappe_whatsapp WhatsApp Account. Setting it enables bridge mode when the app is installed. Its `phone_id` must equal this gateway's phone number ID |
 | Fallback template (`fallback_template`) | Optional. Name of an approved template with no variables. Used when a reply is due and the 24h window is closed |
 | Fallback template language (`fallback_template_language`) | Language code of that template. Defaults to `en_US` |
 | Run as user (`execution_user`) | Least-privileged Huf user. Never `Administrator` |
@@ -161,7 +162,7 @@ In the Meta app, under WhatsApp > Configuration > Webhooks:
    - `message_template_quality_update` (optional)
    - `template_category_update` (optional)
 
-   Huf forwards these best-effort. A rejected/paused/disabled template, a quality drop to LOW or RED, or a category change is written to the `last_error` of every gateway whose fallback template matches. `played` delivery statuses are accepted and ignored. The verification GET requires `hub.mode=subscribe` when `hub.mode` is sent.
+   Huf forwards these best-effort. A rejected/paused/disabled template, a quality drop to LOW or RED, or a category change is written to the `last_error` of every gateway linked to that template's WhatsApp Account (found by the WABA id in the payload) whose fallback template matches. `played` delivery statuses are accepted and ignored. The verification GET requires `hub.mode=subscribe` when `hub.mode` is sent.
 
 **Security: the callback must be Huf's endpoint, never `frappe_whatsapp`'s webhook.** Meta allows one callback URL per app. `frappe_whatsapp` ships an unsigned webhook route. If that route is configured as the callback, Huf's signature verification is bypassed. Huf cannot detect this from its side. Check the callback URL in Meta. The management API's setup status returns the correct URL and a warning string to compare against.
 
@@ -186,6 +187,35 @@ Call `huf.ai.whatsapp_management.get_setup_status` (System Manager or Huf Admin)
 A healthy gateway has an empty `failing_checks` list. Send a test message from Meta or from a WhatsApp phone to the business number. Confirm a Gateway Event and an agent run appear.
 
 ---
+
+## Multiple WhatsApp gateways
+
+Run one Huf **Gateway per WhatsApp phone number**. Each Gateway has its own Integration Settings (phone number ID, access token, verify token, app secret), its own callback URL, and optionally its own `frappe_whatsapp` WhatsApp Account. Inbound events, the 24-hour window, conversations (`channel_id` `gateway:<name>`), replies and message history are all kept per Gateway, even when the same customer writes to several of your numbers.
+
+### Rules
+
+- **Uniqueness.** Two *enabled* WhatsApp Gateways cannot share a `phone_number_id`. Saving the second one fails with a message naming the first. A *disabled* Gateway may keep a duplicate; enabling it is what is checked, so you can swap a number from one Gateway to another by disabling the old one first.
+- **Account linking.** `whatsapp_account` is optional. When `frappe_whatsapp` is installed and an account is linked, an enabled Gateway only saves if that account exists and its `phone_id` equals the Gateway's `phone_number_id`. Link each Gateway to the account of its own number. Without `frappe_whatsapp`, the link is ignored and the Gateway runs in direct mode.
+- **No default account.** Huf's gateway, webhook and management paths never fall back to `is_default_outgoing` or the first `Active` account (see section 2). A Gateway with no linked account sends directly through Graph and its inbound messages are not mirrored into `WhatsApp Message`.
+- **Everything is scoped by Gateway.** The management API takes `gateway_name` and derives the account from it. Listing messages, conversations, templates or drafts without a Gateway (or an account you may access) returns `gateway_required`. Sending needs write authority on the Gateway.
+- **Secrets are per Meta app.** The app secret that signs webhooks belongs to the Meta *app*, not the number. Two Gateways on the same Meta app need the same `app_secret` repeated in each one's Integration Settings; Gateways on different apps use different secrets.
+
+### Topologies
+
+**A. Separate Meta apps (simplest).** One Meta app per number. Each app's callback URL is that Gateway's own URL (section 3.3), each with its own verify token and app secret. Nothing else to configure.
+
+**B. Several numbers under one Meta app.** Meta allows only one callback URL per app by default, so route each number elsewhere with Meta's callback override (see [Meta's documentation](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/override/); verify the request shapes there before using them):
+
+- *Per phone number*: `POST /<BUSINESS_PHONE_NUMBER_ID>` with a `webhook_configuration` object containing `override_callback_uri` and `verify_token`.
+- *Per WhatsApp Business Account*: `POST /<WABA_ID>/subscribed_apps` with `override_callback_uri` and `verify_token`.
+
+Set `override_callback_uri` to the Huf URL of the Gateway that owns that number (`.../handle_gateway_webhook?gateway_name=<Gateway name>`) and `verify_token` to that Gateway's `webhook_verify_token`. Because the numbers share an app, all of those Gateways use the same `app_secret`.
+
+**Template and account webhooks are not overridable.** `message_template_status_update`, `message_template_quality_update`, `template_category_update` and account-level events always go to the app's *default* callback URL, whichever number or WABA they concern. Make the default callback the URL of one of your Gateways (it only needs a valid signature for the app). Huf does not treat the receiving Gateway as the template's owner: it routes the update by the WABA id in the payload (`entry[].id`, matched against `WhatsApp Account.business_id`) to the right account. An update for a WABA that no WhatsApp Account carries is ignored with a log warning. Without `frappe_whatsapp` there are no accounts, so template state is recorded unscoped and only the receiving Gateway can be flagged for a bad fallback template.
+
+### Template names
+
+`frappe_whatsapp` names a template document `<name>-<language>` and keeps `template_name` unique for the whole site, so one name and language cannot exist on two accounts at once. Creating or importing such a template for a second account fails with `template_name_taken_by_other_account` (sync lists it under `skipped_reasons`); the first account's template is never overwritten. Pick a different template name for the second account. Huf's own review and quality state (`WhatsApp Template State`) is keyed `<account>::<template>`, and drafts carry their account, so state never mixes between accounts.
 
 ## 4. The 24-hour window and templates
 
@@ -212,16 +242,22 @@ Approval and pairing notifications follow the same rule. If the window is closed
 
 | Function | Method | What it does |
 |---|---|---|
-| `get_setup_status` | GET | Setup checks (requires System Manager or Huf Admin) |
-| `list_templates` | GET | Lists WhatsApp Templates, optionally by account or status |
-| `create_template` | POST | Creates a WhatsApp Templates row. Its hook pushes it to Meta |
-| `delete_template` | POST | Deletes the row. `frappe_whatsapp` removes the template on Meta |
-| `sync_templates` | POST | Imports templates that exist on Meta but not in Huf (without pushing anything back to Meta) and refreshes status, category and id of existing ones, for one WhatsApp Account. Returns `imported`, `updated`, `unchanged` |
-| `send_template_message` | POST | Sends an approved template. Allowed outside the 24h window |
-| `send_text_message` | POST | Sends free-form text. Refused with `window_closed` outside the window |
-| `send_media_message` | POST | Sends an image, document, audio or video by public link or public uploaded file. Refused with `window_closed` outside the window |
-| `list_messages` | GET | Recent WhatsApp Messages, newest first |
-| `list_conversations` | GET | Recent messages grouped by counterparty number |
+| `get_setup_status` | GET | Setup checks (System Manager or Huf Admin) |
+| `list_templates` | GET | One account's WhatsApp Templates (`gateway_name`, or an `account` you may see) |
+| `create_template` | POST | Admin only. Creates a WhatsApp Templates row for `gateway_name`'s account. Its hook pushes it to Meta |
+| `edit_template` | POST | Admin only. Edits a template on Meta under Meta's edit rules |
+| `delete_template` | POST | Admin only. Deletes the row. `frappe_whatsapp` removes the template on Meta |
+| `sync_templates` | POST | Admin only. Imports templates that exist on Meta but not in Huf (without pushing anything back to Meta) and refreshes status, category and id of existing ones, for one gateway's account. Returns `imported`, `updated`, `unchanged` |
+| `create_template_draft` | POST | Needs the draft doctype's create permission or an admin role (the non-admin "request" path) |
+| `approve_template_draft` / `reject_template_draft` | POST | Admin only |
+| `list_template_drafts` | GET | One account's drafts |
+| `send_template_message` | POST | `gateway_name` is required; needs write authority on that Gateway. Sends an approved template from the Gateway's own account. Allowed outside the 24h window |
+| `send_text_message` | POST | `gateway_name` required, write authority. Sends free-form text. Refused with `window_closed` outside the window |
+| `send_media_message` | POST | `gateway_name` required, write authority. Sends an image, document, audio or video by public link or public uploaded file. Refused with `window_closed` outside the window |
+| `list_messages` | GET | Recent WhatsApp Messages of one gateway's account, newest first |
+| `list_conversations` | GET | That account's recent messages grouped by counterparty number |
+
+"Admin" means System Manager or Huf Admin. "Write authority on a Gateway" means write permission on that Gateway document, an admin role, or the `system.integrations.manage` capability; read access alone cannot send. Listing calls need `gateway_name` (or an `account` the caller may see: admins any, others only accounts of Gateways they can read); otherwise they return `{"success": false, "error": "gateway_required"}`. Nothing here uses `ignore_permissions`.
 
 Template name rules: lowercase letters, digits and underscores only (`^[a-z0-9_]+$`). Category: `MARKETING` or `UTILITY` (`AUTHENTICATION` is not supported because Meta requires OTP button components). `language_code` is required.
 
@@ -282,6 +318,8 @@ Huf keeps its own review state for every template (`WhatsApp Template State`, on
 ## 5. Agent tool
 
 Actions: `send_message`, `send_media`, `send_template`, `list_messages`, `get_account_info`, `list_templates`, `create_template`.
+
+With `gateway_name` the tool uses only that Gateway's account (and its own integration credentials); a Gateway with no linked account never falls back to the default account. Without `gateway_name` (non-gateway use) it uses the default outgoing account. `list_templates` always needs an account, via `gateway_name`, `whatsapp_account` or the default; it never lists across accounts.
 
 - `send_message` is a free-form text send. It is **proactive** unless `gateway_name` is passed and that gateway's window is open. Without `gateway_name`, every free-form send is treated as proactive. A proactive send needs `allow_proactive` or `allow_whatsapp_management`.
 - `send_media` (`to`, `kind` image/document/audio/video, `link`, `caption`, `filename`) is a free-form send. It follows exactly the same proactive logic and flags as `send_message`.
