@@ -25,7 +25,6 @@ from frappe.tests import IntegrationTestCase
 from huf.ai import flow_api
 from huf.ai.flow_engine import create_flow_run
 from huf.ai.flow_engine import run_flow as engine_run_flow
-
 from huf.ai.tests.factories import make_agent_tool_function
 
 
@@ -88,7 +87,10 @@ class TestFlowFailureSemantics(IntegrationTestCase):
 			"nodes": [
 				{"id": "start", "type": "trigger.webhook", "config": {"method": "POST"}, "next": "fail"},
 				failing,
-				*({"id": node_id, "type": "trigger.webhook", "config": {"method": "POST"}} for node_id in terminal_ids),
+				*(
+					{"id": node_id, "type": "trigger.webhook", "config": {"method": "POST"}}
+					for node_id in terminal_ids
+				),
 			],
 			"contract": {
 				"input_schema": {"type": "object"},
