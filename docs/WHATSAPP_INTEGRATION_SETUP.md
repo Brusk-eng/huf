@@ -118,7 +118,8 @@ Optional privilege flags (also credential rows, value `1` to enable). They are r
 | Key | Effect |
 |---|---|
 | `allow_proactive` | Allows free-form messages to numbers with no open 24h window |
-| `allow_whatsapp_management` | Allows template creation, and also allows proactive sends |
+| `allow_whatsapp_management` | Allows the agent to draft templates, and also allows proactive sends |
+| `auto_submit_templates` | With `allow_whatsapp_management`, the agent submits templates to Meta directly instead of saving a draft |
 
 ### 3.2 Gateway
 
@@ -262,6 +263,22 @@ Not available: `VIDEO` headers, `AUTHENTICATION` templates, carousel, flow, cata
 
 ---
 
+### 4.5 Template states, drafts and editing
+
+Huf keeps its own review state for every template (`WhatsApp Template State`, one row per template, named like the template row, for example `order_update-en_US`). It works on sites without `frappe_whatsapp` and stores what `frappe_whatsapp` drops: the rejection reason and recommendation, the quality score, a pending category change, and the last webhook event.
+
+**Where the state comes from**
+- Meta webhooks (`message_template_status_update`, `message_template_quality_update`, `template_category_update`) update the state as they arrive. Status events move the status (APPROVED, PENDING, REJECTED, PAUSED, DISABLED, IN_APPEAL, LIMIT_EXCEEDED, PENDING_DELETION, DELETED). FLAGGED, REINSTATED, LOCKED, ARCHIVED and UNARCHIVED only update the last event.
+- Template sync reads `id, name, status, rejected_reason, quality_score, category, previous_category, correct_category, language, parameter_format, components, message_send_ttl_seconds`. It also refreshes the header, body, footer and buttons of existing rows when Meta's differ (an edit made in WhatsApp Manager); equal content is left alone.
+- Every status change publishes the realtime event `whatsapp_template_status` with `{template, status, reason}`.
+- The quality value is kept as raw JSON (Meta's exact shape is not documented) plus a derived `GREEN`, `YELLOW`, `RED` or `UNKNOWN`. A category change is pending when Meta's `correct_category` is set and differs from the current category.
+
+**Drafts and approval.** `create_template_draft` (console) and the agent's `create_template` save a `WhatsApp Template Draft` with the same validation as a direct create. Nothing is sent to Meta. A System Manager or Huf Admin then approves or rejects it. Approval validates the payload again and submits it to Meta exactly once (status `Approved & Submitted`, with the created template recorded); a Meta refusal sets `Failed` with the error and the draft can still be approved again or rejected. Rejection never contacts Meta. Statuses: Draft, Pending Review, Approved & Submitted, Rejected, Failed. To let an agent submit without review, add the Integration Settings credential `auto_submit_templates` = `1` (together with `allow_whatsapp_management`). It is read server-side only.
+
+**Editing.** `edit_template` sends the full components to `POST /{template-id}`. Meta allows an edit only while the template is APPROVED, REJECTED or PAUSED. An APPROVED template can be edited once per 24 hours and 10 times per 30 days (REJECTED and PAUSED are unlimited), and name and language cannot change. Huf checks these locally first and refuses without calling Meta; edits of APPROVED templates are logged in the state's `edit_log` to count the quota. An edited template goes back to PENDING review. Changing an image or document header needs a fresh media upload and is not supported here; edit those in WhatsApp Manager.
+
+**WhatsApp Manager link.** Template details include `manager_url`, the WhatsApp Manager template list (`https://business.facebook.com/latest/whatsapp_manager/message_templates`), and the WhatsApp Business Account id as `business_id` for display. Meta documents no query parameters for this page, so the link cannot jump to a single template or account: sign in to the right business and find the template by name.
+
 ## 5. Agent tool
 
 Actions: `send_message`, `send_media`, `send_template`, `list_messages`, `get_account_info`, `list_templates`, `create_template`.
@@ -269,7 +286,7 @@ Actions: `send_message`, `send_media`, `send_template`, `list_messages`, `get_ac
 - `send_message` is a free-form text send. It is **proactive** unless `gateway_name` is passed and that gateway's window is open. Without `gateway_name`, every free-form send is treated as proactive. A proactive send needs `allow_proactive` or `allow_whatsapp_management`.
 - `send_media` (`to`, `kind` image/document/audio/video, `link`, `caption`, `filename`) is a free-form send. It follows exactly the same proactive logic and flags as `send_message`.
 - `send_template` is always allowed. It accepts `parameters`, `header_params` and `button_params` (see section 4.4).
-- `create_template` needs `allow_whatsapp_management` or `allow_proactive`, and accepts the header, footer and button fields of section 4.4.
+- `create_template` needs `allow_whatsapp_management` (not `allow_proactive`), accepts the header, footer and button fields of section 4.4, and saves a **draft** for human approval (section 4.5). `get_template_status` reports the review status, rejection reason, quality and draft state of a template or draft; `list_templates` rows include status and rejection reason.
 - The tool never uses `ignore_permissions` and never switches the session user.
 - `send_template`, `get_account_info` and the fallback path of `send_message` call the Graph API directly, using `phone_number_id` and `access_token` from the arguments or the Integration Settings. `send_message` logs to `WhatsApp Message` only when the bridge is not used and the app is installed.
 
@@ -282,13 +299,14 @@ Two server-side flags control privileged behaviour. They are read from the activ
 | Credential row | Enables |
 |---|---|
 | `allow_proactive` | Free-form `send_message` and `send_media` outside an open window |
-| `allow_whatsapp_management` | `create_template`, and proactive sends |
+| `allow_whatsapp_management` | `create_template` (as a draft), and proactive sends |
+| `auto_submit_templates` | `create_template` submits straight to Meta (only together with `allow_whatsapp_management`) |
 
 Rules:
 
 - A flag counts only when its value is `1`, `true` or `yes` (case-insensitive). `0`, `false`, empty or a missing row do not count.
 - Any error while reading the settings fails closed.
-- The LLM cannot enable a flag. Any `allow_proactive` or `allow_whatsapp_management` argument in a tool call is discarded.
+- The LLM cannot enable a flag. Any `allow_proactive`, `allow_whatsapp_management` or `auto_submit_templates` argument in a tool call is discarded.
 
 ---
 
