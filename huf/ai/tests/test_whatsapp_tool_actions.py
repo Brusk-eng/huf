@@ -228,7 +228,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 
 	def test_create_template_allowed_by_server_setting(self):
 		with (
-			_settings(allow_whatsapp_management="true"),
+			_settings(allow_whatsapp_management="true", auto_submit_templates="true"),
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
 			patch.object(bridge, "create_template", return_value={"success": True, "name": "TPL-3"}) as mock_create,
@@ -324,7 +324,7 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 
 	def test_create_template_with_management_setting_calls_bridge(self):
 		with (
-			_settings(allow_whatsapp_management="1"),
+			_settings(allow_whatsapp_management="1", auto_submit_templates="1"),
 			patch.object(bridge, "is_available", return_value=True),
 			patch.object(bridge, "resolve_account", return_value=_account()),
 			patch.object(

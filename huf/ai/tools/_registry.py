@@ -226,14 +226,17 @@ WHATSAPP_TOOLS = [
 			"send_media (to, kind image|document|audio|video, link, caption, filename; same 24h window rules as send_message), "
 			"send_template (to/recipient, template_name, language_code, parameters, header_params, button_params), "
 			"list_messages (to, from, limit), get_account_info, "
-			"list_templates (whatsapp_account, status), "
+			"list_templates (whatsapp_account, status; rows include review status and rejection reason), "
 			"create_template (template_name, category, language_code, body, sample_values, optional header_type/header/sample, "
-			"footer, buttons; may be refused by server policy)."
+			"footer, buttons; saves a DRAFT that a human must approve before it is submitted to Meta - returns "
+			"status pending_review and the draft name; may be refused by server policy), "
+			"get_template_status (template_name: a template name or the draft name returned by create_template; "
+			"returns status, rejection reason, quality and draft approval state)."
 		),
 		"function_path": "huf.ai.tools.whatsapp.handle_action",
 		"category": "Communication Tools",
 		"parameters": [
-			_action("send_message|send_media|send_template|list_messages|get_account_info|list_templates|create_template"),
+			_action("send_message|send_media|send_template|list_messages|get_account_info|list_templates|create_template|get_template_status"),
 			_p("to", description="Recipient phone number (E.164). Alias: recipient, phone_number."),
 			_p("recipient", description="Alias for 'to'."),
 			_p("phone_number", description="Alias for 'to'."),

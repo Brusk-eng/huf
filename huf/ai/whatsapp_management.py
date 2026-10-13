@@ -244,7 +244,19 @@ def list_templates(account: str | None = None, status: str | None = None) -> dic
 				template["buttons"] = buttons.get(template["name"], [])
 	except Exception:
 		pass  # buttons are informational for the send dialog; never fail the listing
-	return {"success": True, "templates": templates}
+	business_id = ""
+	try:
+		acct = bridge.resolve_account(account)
+		if acct and not acct.get("error"):
+			business_id = acct.get("business_id") or ""
+	except Exception:
+		pass
+	return {
+		"success": True,
+		"templates": templates,
+		"manager_url": bridge.manager_url(business_id),
+		"business_id": business_id,
+	}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -263,6 +275,82 @@ def create_template(account: str | None = None, payload: Any = None) -> dict[str
 	if isinstance(account_name, dict):
 		return account_name
 	return bridge.create_template(account_name, parsed)
+
+
+@frappe.whitelist()
+@_bridge_guard
+def get_template(name: str | None = None) -> dict[str, Any]:
+	"""Full detail of one template: components, review/quality state, edit allowance, WhatsApp Manager link."""
+	if not bridge.is_available():
+		return {"success": False, "error": "bridge_unavailable"}
+	if not name or not str(name).strip():
+		return {"success": False, "error": "invalid_name", "message": "Template name is required."}
+	return bridge.get_template(str(name).strip())
+
+
+@frappe.whitelist(methods=["POST"])
+@_bridge_guard
+def edit_template(name: str | None = None, payload: Any = None) -> dict[str, Any]:
+	"""Edit a template on Meta (full components) under Meta's edit rules; it goes back to PENDING review."""
+	if not bridge.is_available():
+		return {"success": False, "error": "bridge_unavailable"}
+	if not name or not str(name).strip():
+		return {"success": False, "error": "invalid_name", "message": "Template name is required."}
+	parsed = _parse_json_arg(payload, "payload")
+	if not isinstance(parsed, dict):
+		return {"success": False, "error": "invalid_payload", "message": "payload must be an object"}
+	return bridge.edit_template(str(name).strip(), parsed)
+
+
+@frappe.whitelist()
+@_bridge_guard
+def list_template_drafts(status: str | None = None) -> dict[str, Any]:
+	"""Template drafts awaiting (or past) human approval."""
+	return {"success": True, "drafts": bridge.list_drafts(status or None)}
+
+
+@frappe.whitelist(methods=["POST"])
+@_bridge_guard
+def create_template_draft(account: str | None = None, payload: Any = None, submit_for_review: Any = 1) -> dict[str, Any]:
+	"""Save a template as a draft (same validation as create_template); nothing is sent to Meta."""
+	parsed = _parse_json_arg(payload, "payload")
+	if not isinstance(parsed, dict):
+		return {"success": False, "error": "invalid_payload", "message": "payload must be an object"}
+	name_error = _validate_template_name(parsed.get("template_name") or parsed.get("name"))
+	if name_error:
+		return name_error
+	account_name = ""
+	if bridge.is_available():
+		resolved = bridge.resolve_account(account)
+		if resolved and not resolved.get("error"):
+			account_name = resolved["name"]
+		elif account:
+			return {"success": False, "error": "no_account"}
+	review = str(submit_for_review).strip().lower() not in ("0", "false", "no", "")
+	return bridge.create_draft(
+		parsed, requested_by=frappe.session.user, via="User", account=account_name,
+		status="Pending Review" if review else "Draft",
+	)
+
+
+@frappe.whitelist(methods=["POST"])
+@_bridge_guard
+def approve_template_draft(name: str | None = None, note: str | None = None) -> dict[str, Any]:
+	"""Admin: approve a draft and submit it to Meta (exactly once)."""
+	_require_admin()
+	if not name:
+		return {"success": False, "error": "invalid_name", "message": "Draft name is required."}
+	return bridge.approve_draft(str(name), note or "")
+
+
+@frappe.whitelist(methods=["POST"])
+@_bridge_guard
+def reject_template_draft(name: str | None = None, note: str | None = None) -> dict[str, Any]:
+	"""Admin: reject a draft; nothing is sent to Meta."""
+	_require_admin()
+	if not name:
+		return {"success": False, "error": "invalid_name", "message": "Draft name is required."}
+	return bridge.reject_draft(str(name), note or "")
 
 
 @frappe.whitelist(methods=["POST"])

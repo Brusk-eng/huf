@@ -7,7 +7,7 @@ Single consolidated tool that performs WhatsApp Cloud API actions via an
 `action` parameter.
 
 Actions: send_message, send_media, send_template, list_messages,
-get_account_info, list_templates, create_template.
+get_account_info, list_templates, create_template, get_template_status.
 
 Privilege gating (A8)
 ---------------------
@@ -24,7 +24,10 @@ settings fails closed (flag off).
   open 24h customer-service window (see below).
 * ``allow_whatsapp_management``: permits ``create_template`` (only this
   flag; ``allow_proactive`` does not), and also permits proactive free-form
-  sends.
+  sends. ``create_template`` only saves a DRAFT that a human must approve
+  in the console; nothing reaches Meta from the agent.
+* ``auto_submit_templates``: when also truthy, ``create_template`` submits to
+  Meta directly (still requires ``allow_whatsapp_management``).
 
 Credentials (``access_token``, ``phone_number_id``) are never tool
 parameters: tool arguments are persisted in Agent Tool Call, so any such
@@ -71,7 +74,7 @@ def _refused(code: str, message: str) -> str:
 	return json.dumps({"success": False, "error": code, "message": message}, default=str)
 
 
-_PRIVILEGE_FLAGS = ("allow_proactive", "allow_whatsapp_management")
+_PRIVILEGE_FLAGS = ("allow_proactive", "allow_whatsapp_management", "auto_submit_templates")
 _CREDENTIAL_KWARGS = ("access_token", "phone_number_id")
 
 
@@ -164,10 +167,12 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		return _list_templates(kwargs)
 	elif action == "create_template":
 		return _create_template(kwargs)
+	elif action == "get_template_status":
+		return _get_template_status(kwargs)
 	else:
 		return _error(
 			f"Unknown action '{action}'. Supported actions: send_message, send_media, send_template, "
-			"list_messages, get_account_info, list_templates, create_template"
+			"list_messages, get_account_info, list_templates, create_template, get_template_status"
 		)
 
 
@@ -509,11 +514,52 @@ def _list_templates(kwargs: dict) -> str:
 	return _success(rows)
 
 
+def _create_template_draft(acct: dict, payload: dict) -> str:
+	"""Save the template as a draft awaiting human approval; Meta is never contacted."""
+	try:
+		result = bridge.create_draft(
+			payload,
+			requested_by=frappe.session.user,
+			via="Agent run",
+			agent_run=getattr(frappe.flags, "huf_current_agent_run_id", None) or "",
+			account=acct["name"],
+			trusted=True,  # gated by the server-side allow_whatsapp_management flag
+		)
+	except Exception as e:
+		return _error(f"Failed to save WhatsApp template draft: {str(e)}")
+	if not result.get("success"):
+		return json.dumps(result, default=str)
+	return _success(
+		{
+			"status": "pending_review",
+			"draft": result["name"],
+			"message": (
+				"The template was saved as a draft and has NOT been sent to Meta. A human must approve it "
+				"in the WhatsApp console before it is submitted. Do not retry; use get_template_status "
+				f"with template_name '{result['name']}' to check the outcome."
+			),
+		}
+	)
+
+
+def _get_template_status(kwargs: dict) -> str:
+	"""Review status of a template or draft: Meta status, rejection reason, quality, draft state (read-only)."""
+	ref = (kwargs.get("template_name") or kwargs.get("draft") or "").strip()
+	if not ref:
+		return _error("'template_name' (a template name or a draft name) is required")
+	try:
+		result = bridge.get_draft_or_state(ref)
+	except Exception as e:
+		return _error(f"Failed to read template status: {str(e)}")
+	return _bridge_result(result)
+
+
 def _create_template(kwargs: dict) -> str:
 	"""Create a WhatsApp template via the bridge (management; A8 gated).
 
 	Requires ``allow_whatsapp_management`` enabled in
-	the server-side Integration Settings. Accepted fields: ``template_name``,
+	the server-side Integration Settings. By default this only saves a draft for human
+	approval; with the server-side ``auto_submit_templates`` credential it submits directly. Accepted fields: ``template_name``,
 	``category`` (MARKETING/UTILITY), ``language_code``, ``body`` (+ ``sample_values``),
 	optional ``header_type``/``header``/``sample``, ``footer`` and ``buttons``
 	(QUICK_REPLY, URL, PHONE_NUMBER). Validation errors are returned structured.
@@ -542,6 +588,8 @@ def _create_template(kwargs: dict) -> str:
 			payload["buttons"] = json.loads(payload["buttons"])
 		except ValueError:
 			return _error("'buttons' must be a list (or JSON list)")
+	if not _server_flag("auto_submit_templates"):
+		return _create_template_draft(acct, payload)
 	try:
 		result = bridge.create_template(acct["name"], payload)
 	except bridge.BridgeError as e:
