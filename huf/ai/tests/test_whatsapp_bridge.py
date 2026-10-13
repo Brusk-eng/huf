@@ -337,6 +337,21 @@ class TestBridge(unittest.TestCase):
 			self.assertTrue(res["success"])
 			self.assertEqual(gd.call_args.args[0]["category"], "MARKETING")
 
+	def test_create_template_meta_rejection_drops_local_orphan(self):
+		good = {"template_name": "promo_2", "category": "utility", "language_code": "en_US", "template": "Hi {{1}} there", "sample_values": "Ann"}
+
+		class Rejecting(FakeDoc):
+			def insert(self, *a, **k):
+				raise Exception("Variables can't be at the start or end of the template.")
+
+		doc = Rejecting(name="promo_2-en_US")
+		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
+			frappe, "get_doc", return_value=doc
+		), patch.object(frappe.db, "exists", return_value=True), patch.object(frappe.db, "delete") as dele:
+			res = wb.create_template("ACC", good)
+		self.assertEqual(res["error"], "create_failed")
+		dele.assert_called_once_with("WhatsApp Templates", {"name": "promo_2-en_US"})
+
 	def test_delete_template(self):
 		with avail(False):
 			self.assertEqual(wb.delete_template("T")["error"], "bridge_unavailable")

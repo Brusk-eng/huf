@@ -819,12 +819,18 @@ def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any
 	rows = wt.button_rows(spec)
 	if rows:
 		values["buttons"] = rows
+	doc = None
 	try:
 		doc = frappe.get_doc(values)
 		doc.insert()
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
+		# frappe_whatsapp pushes to Meta in after_insert, so a Meta rejection leaves a
+		# local row that never existed on Meta. Drop it (no hooks) so it cannot linger as PENDING.
+		orphan = getattr(doc, "name", None)
+		if orphan and not doc.get("id") and frappe.db.exists("WhatsApp Templates", orphan):
+			frappe.db.delete("WhatsApp Templates", {"name": orphan})
 		return _err("create_failed", message=_redact(exc))
 	return {"success": True, "name": doc.name, "status": doc.get("status"), "id": doc.get("id")}
 
