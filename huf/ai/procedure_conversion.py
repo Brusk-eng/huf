@@ -50,7 +50,7 @@ BLOCKING_NODE_TYPES: frozenset[str] = frozenset({"agent.run", "router.llm", "rou
 # at all (its entry is always exactly one non-trigger node), so these are stripped and
 # their `next` pointer becomes the Procedure's entry, rather than being treated as a
 # reason to refuse.
-TRIGGER_NODE_TYPES: frozenset[str] = frozenset({"trigger.webhook", "trigger.schedule", "trigger.doc-event"})
+TRIGGER_NODE_TYPES: frozenset[str] = frozenset({"trigger.webhook", "trigger.schedule", "trigger.doc-event", "trigger.unset"})
 
 _GRAPH_FIELDS = ("schema_version", "profile", "fingerprint", "entry", "nodes", "contract")
 

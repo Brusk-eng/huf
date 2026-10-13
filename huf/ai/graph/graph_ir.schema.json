@@ -804,6 +804,24 @@
         }
       ]
     },
+    "TriggerUnsetNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/NodeCommon"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "trigger.unset"
+            },
+            "config": {
+              "type": "object",
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
     "TriggerScheduleNode": {
       "allOf": [
         {
@@ -911,6 +929,9 @@
         },
         {
           "$ref": "#/$defs/TriggerDocEventNode"
+        },
+        {
+          "$ref": "#/$defs/TriggerUnsetNode"
         }
       ]
     },

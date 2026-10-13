@@ -1,6 +1,6 @@
 import { memo } from 'react';
 import { Handle, Position, NodeProps } from 'reactflow';
-import { AlertCircle, Zap, Webhook, Clock, Database, Mail, Trash2, Loader2, CheckCircle2, XCircle, type LucideIcon } from 'lucide-react';
+import { AlertCircle, Zap, Webhook, Clock, Database, Mail, CircleDashed, Trash2, Loader2, CheckCircle2, XCircle, type LucideIcon } from 'lucide-react';
 import { FlowNodeData } from '../../types/flow.types';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
@@ -13,6 +13,7 @@ const iconMap: Record<string, LucideIcon> = {
   Clock,
   Database,
   Mail,
+  CircleDashed,
   Zap
 };
 

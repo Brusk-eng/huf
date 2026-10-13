@@ -8,6 +8,7 @@ from frappe.utils import now_datetime
 from huf.ai import system_records
 from huf.ai.graph.validator import FLOW_NODE_TYPES, validate_flow_graph
 from huf.ai.transaction import commit_if_background
+from huf.huf.doctype.flow_definition.activation_rules import collect_activation_problems
 
 # Flow Definition fields that stay editable on a system-owned flow. Every
 # other field is locked for non-System-Managers by system_records'
@@ -37,7 +38,8 @@ ALLOWED_NODE_TYPES = FLOW_NODE_TYPES
 
 class FlowDefinition(Document):
 	def validate(self):
-		self._validate_definition_json()
+		defn = self._validate_definition_json()
+		self._validate_activation(defn)
 		self.updated_by = frappe.session.user
 		self.updated_at = now_datetime()
 		system_records.guard_flag_tamper(self)
@@ -151,3 +153,16 @@ class FlowDefinition(Document):
 		# schema_version is a schema-validated const ("1.0.0") at this point; store it
 		# verbatim rather than re-deriving or defaulting it.
 		self.schema_version = defn.get("schema_version")
+		return defn
+
+	def _validate_activation(self, defn: dict):
+		"""Active flows must be runnable: Draft/Archived saves stay permissive. Reports
+		every problem in a single message rather than failing on the first."""
+		if self.status != "Active":
+			return
+		problems = collect_activation_problems(defn)
+		if problems:
+			frappe.throw(
+				_("Flow cannot be Active: {0}").format("; ".join(problems)),
+				title=_("Flow is not ready to activate"),
+			)
