@@ -305,15 +305,44 @@ def _record_unknown_phone_ids(gateway_name: str, phone_ids) -> None:
 		_set_gateway_error(gateway_name, text, touch_event=True)
 
 
+_TEMPLATE_BAD_QUALITY = frozenset({"LOW", "RED"})
+_TEMPLATE_KIND_FIELDS = {
+	"quality": "message_template_quality_update",
+	"category": "template_category_update",
+}
+
+
+def _template_update_text(update: dict, name: str) -> str | None:
+	"""Operator-facing note for an update that needs attention, else None."""
+	kind = update.get("kind") or ("quality" if "new_quality_score" in update else "category" if "new_category" in update else "status")
+	if kind == "quality":
+		score = str(update.get("new_quality_score") or "").upper()
+		if score not in _TEMPLATE_BAD_QUALITY:
+			return None
+		previous = str(update.get("previous_quality_score") or "").upper()
+		return f"Fallback template {name} quality dropped to {score}" + (f" (was {previous})" if previous else "")
+	if kind == "category":
+		new = str(update.get("new_category") or "").upper()
+		if not new:
+			return None
+		previous = str(update.get("previous_category") or "").upper()
+		return f"Fallback template {name} category changed to {new}" + (f" (was {previous})" if previous else "")
+	state = str(update.get("event") or update.get("status") or "").upper()
+	if state not in _TEMPLATE_BAD_STATES:
+		return None
+	reason = str(update.get("reason") or "").strip()
+	return f"Fallback template {name} is {state}" + (f" ({reason})" if reason and reason != "NONE" else "")
+
+
 def _record_template_update(update: dict) -> None:
-	"""A rejected/paused/disabled template that a gateway relies on as its fallback."""
+	"""A rejected/paused/disabled, low-quality or re-categorised template that a gateway relies on as its fallback."""
 	try:
-		state = str(update.get("event") or update.get("status") or "").upper()
 		name = str(update.get("message_template_name") or update.get("name") or "").strip()
-		if state not in _TEMPLATE_BAD_STATES or not name:
+		if not name:
 			return
-		reason = str(update.get("reason") or "").strip()
-		text = f"Fallback template {name} is {state}" + (f" ({reason})" if reason and reason != "NONE" else "")
+		text = _template_update_text(update, name)
+		if not text:
+			return
 		for row in frappe.get_all(
 			"Gateway", filters={"provider": "WhatsApp", "fallback_template": name}, fields=["name"]
 		):
@@ -395,7 +424,13 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 
 	forwarded = 0
 	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
-	changes += [{"field": "message_template_status_update", "value": dict(update)} for update in parsed.template_updates]
+	changes += [
+		{
+			"field": _TEMPLATE_KIND_FIELDS.get(update.get("kind"), "message_template_status_update"),
+			"value": {k: v for k, v in update.items() if k != "kind"},
+		}
+		for update in parsed.template_updates
+	]
 	for change in changes:
 		try:
 			if bridge.forward_status(change):

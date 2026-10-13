@@ -11,6 +11,7 @@ from unittest.mock import patch
 import frappe
 
 from huf.ai.gateway_adapters import GatewayInboundRequest, GatewayReply
+from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 from huf.ai.gateway_adapters.whatsapp import (
 	GRAPH_VERSION,
 	WhatsAppGatewayAdapter,
@@ -99,6 +100,17 @@ class TestWhatsAppGatewayAdapter(unittest.TestCase):
 		bad = GatewayInboundRequest(b"", query={**q, "hub.verify_token": "nope"}, method="GET")
 		with self.assertRaises(frappe.PermissionError):
 			self.adapter.verify_url(bad)
+		# hub.mode, when present, must be "subscribe"; absent is accepted (older tooling)
+		with self.assertRaises(frappe.PermissionError):
+			self.adapter.verify_url(GatewayInboundRequest(b"", query={**q, "hub.mode": "unsubscribe"}, method="GET"))
+		legacy = {k: v for k, v in q.items() if k != "hub.mode"}
+		self.assertEqual(self.adapter.verify_url(GatewayInboundRequest(b"", query=legacy, method="GET")), "abc")
+
+	def test_graph_url_uses_shared_version_constant(self):
+		from huf.ai.gateway_adapters import whatsapp as wa
+		self.assertEqual(wa.GRAPH_VERSION, bridge.GRAPH_DEFAULT_VERSION)
+		self.assertTrue(self.adapter._graph_url.endswith("/" + bridge.GRAPH_DEFAULT_VERSION))
+		self.assertTrue(self.adapter._graph_url.startswith("https://graph.facebook.com/"))
 
 	# --- parsing
 	def test_batch_fan_out(self):

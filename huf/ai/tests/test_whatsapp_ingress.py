@@ -225,6 +225,28 @@ class TestWhatsAppIngress(unittest.TestCase):
 		self._call(self._template_payload("REJECTED", "other"), gateway_rows=[])  # no gateway uses it
 		self.mock_frappe.db.set_value.assert_not_called()
 
+	def test_template_quality_and_category_updates_surface_on_fallback_gateways(self):
+		def payload(field, value):
+			return {"entry": [{"changes": [{"field": field, "value": {"message_template_name": "reopen", **value}}]}]}
+
+		self._call(
+			payload("message_template_quality_update", {"previous_quality_score": "GREEN", "new_quality_score": "RED"}),
+			gateway_rows=[{"name": "WA"}],
+		)
+		self.assertIn("reopen quality dropped to RED (was GREEN)", self.mock_frappe.db.set_value.call_args.args[2]["last_error"])
+		self.mock_frappe.db.set_value.reset_mock()
+		self._call(
+			payload("template_category_update", {"previous_category": "UTILITY", "new_category": "MARKETING"}),
+			gateway_rows=[{"name": "WA"}],
+		)
+		self.assertIn("category changed to MARKETING (was UTILITY)", self.mock_frappe.db.set_value.call_args.args[2]["last_error"])
+		self.mock_frappe.db.set_value.reset_mock()
+		self._call(
+			payload("message_template_quality_update", {"previous_quality_score": "RED", "new_quality_score": "GREEN"}),
+			gateway_rows=[{"name": "WA"}],
+		)
+		self.mock_frappe.db.set_value.assert_not_called()
+
 	def test_malformed_signed_json_is_400(self):
 		result = self._call(body=b"not json")
 		self.assertFalse(result["success"])

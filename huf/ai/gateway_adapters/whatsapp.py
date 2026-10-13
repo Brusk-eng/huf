@@ -30,9 +30,14 @@ from huf.ai.gateway_adapters.types import (
 	OutboundDelivery,
 )
 
-GRAPH_VERSION = "v21.0"
-META_GRAPH_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
+GRAPH_VERSION = bridge.GRAPH_DEFAULT_VERSION
+META_GRAPH_URL = f"{bridge.GRAPH_HOST}/{GRAPH_VERSION}"
 DEFAULT_TEMPLATE_LANGUAGE = "en_US"
+_TEMPLATE_FIELD_KINDS = {
+	"message_template_status_update": "status",
+	"message_template_quality_update": "quality",
+	"template_category_update": "category",
+}
 _MEDIA_TYPES = ("image", "document", "audio", "video", "sticker")
 _TEXTUAL_TYPES = ("text", "interactive", "button") + _MEDIA_TYPES
 
@@ -92,8 +97,10 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		self._access_token = str(credentials["access_token"]).strip()
 		self._verify_token = str(credentials["webhook_verify_token"]).strip()
 		self._app_secret = str(credentials.get("app_secret") or "").strip()
-		# optional, honoured only under frappe.flags.in_test (see bridge.graph_base_url)
-		self._graph_url = f"{bridge.graph_base_url(str(credentials.get('graph_api_url') or ''))}/{GRAPH_VERSION}"
+		# graph_api_url is honoured only under frappe.flags.in_test (see bridge.graph_base_url);
+		# graph_api_version (e.g. "v25.0") optionally pins a Graph version for this gateway.
+		version = str(credentials.get("graph_api_version") or "").strip() or bridge.GRAPH_DEFAULT_VERSION
+		self._graph_url = f"{bridge.graph_base_url(str(credentials.get('graph_api_url') or ''))}/{version}"
 		self._http_post = http_post
 		ctx = gateway_context or {}
 		self._gateway_name = str(ctx.get("gateway_name") or "").strip()
@@ -105,6 +112,9 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 	def verify_url(self, request: GatewayInboundRequest) -> str:
 		"""Return Meta hub.challenge if the verify token matches the GET request."""
 		query = request.query or {}
+		mode = query.get("hub.mode") if "hub.mode" in query else query.get("hub_mode")
+		if mode is not None and str(mode) != "subscribe":
+			raise frappe.PermissionError("WhatsApp webhook verification mode must be subscribe")
 		token = str(query.get("hub.verify_token") or query.get("hub_verify_token") or "")
 		challenge = query.get("hub.challenge") or query.get("hub_challenge") or ""
 		if token and hmac.compare_digest(token.encode("utf-8"), self._verify_token.encode("utf-8")):
@@ -155,8 +165,8 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					ignored += 1
 					continue
 				field = change.get("field")
-				if field == "message_template_status_update":
-					template_updates.append(dict(value))
+				if field in _TEMPLATE_FIELD_KINDS:
+					template_updates.append({**value, "kind": _TEMPLATE_FIELD_KINDS[field]})
 					continue
 				items = _as_list(value.get("messages")) + _as_list(value.get("statuses"))
 				metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}

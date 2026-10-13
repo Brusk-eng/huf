@@ -25,9 +25,9 @@
                 },
                 "pricing": {
                   "billable": true,
-                  "pricing_model": "CBP",
-                  "category": "service",
-                  "type": "regular"
+                  "pricing_model": "PMP",
+                  "type": "regular",
+                  "category": "service"
                 }
               }
             ]

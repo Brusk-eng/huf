@@ -201,6 +201,7 @@ class TestParseStatusesAndNonMessages(WhatsAppContractBase):
 			("status_delivered.json", "delivered"),
 			("status_read.json", "read"),
 			("status_failed.json", "failed"),
+			("status_played.json", "played"),
 		):
 			with self.subTest(fixture=name):
 				parsed = self.parse(name)
@@ -223,6 +224,30 @@ class TestParseStatusesAndNonMessages(WhatsAppContractBase):
 		self.assertEqual(len(rejected.template_updates), 1)
 		self.assertEqual(rejected.template_updates[0]["event"], "REJECTED")
 		self.assertEqual(rejected.template_updates[0]["reason"], "INVALID_FORMAT")
+
+	def test_status_fixture_shapes(self):
+		failed = self.parse("status_failed.json").statuses[0]
+		self.assertNotIn("conversation", failed)
+		self.assertNotIn("pricing", failed)
+		sent = self.parse("status_sent.json").statuses[0]
+		self.assertEqual(sent["conversation"]["expiration_timestamp"], "1792086400")
+		for name in ("status_sent.json", "status_delivered.json", "status_read.json"):
+			pricing = self.parse(name).statuses[0]["pricing"]
+			self.assertEqual(pricing["pricing_model"], "PMP")
+			self.assertEqual({"billable", "type", "category"} - set(pricing), set())
+
+	def test_template_quality_category_and_language_variants(self):
+		quality = self.parse("template_quality_update.json")
+		self.assertEqual(quality.messages, ())
+		self.assertEqual(len(quality.template_updates), 1)
+		self.assertEqual(quality.template_updates[0]["kind"], "quality")
+		self.assertEqual(quality.template_updates[0]["new_quality_score"], "RED")
+		category = self.parse("template_category_update.json")
+		self.assertEqual(category.template_updates[0]["kind"], "category")
+		self.assertEqual(category.template_updates[0]["new_category"], "MARKETING")
+		self.assertEqual(self.parse("template_status_approved.json").template_updates[0]["kind"], "status")
+		hyphen = self.parse("template_status_approved_en-US.json").template_updates[0]
+		self.assertEqual(hyphen["message_template_language"], "en-US")
 
 	def test_errors_only_message_change_is_ignored(self):
 		parsed = self.parse("errors_only_message_change.json")
