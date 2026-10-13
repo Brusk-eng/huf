@@ -613,3 +613,35 @@ class TestFixE(_Base):
 		agent_auto = make_automation(agent=agent.name, instruction="x", status="Active")
 		self._automations.append(agent_auto.name)
 		self.assertNotIn("doc", self._doc_event_context(agent_auto))
+
+
+class TestLegacyFlowScheduleCleanup(_Base):
+	def test_patch_deletes_legacy_scheduled_job_types(self):
+		from huf.patches.v1 import delete_legacy_flow_schedule_jobs
+
+		# Scheduled Job Type names are derived from the method.
+		frappe.db.delete("Scheduled Job Type", {"method": ["in", ["huf.ai.flow_api.execute_scheduled_flow", "huf.ai.prE_unrelated.job"]]})
+		doc = frappe.get_doc(
+			{
+				"doctype": "Scheduled Job Type",
+				"method": "huf.ai.flow_api.execute_scheduled_flow",
+				"frequency": "Cron",
+				"cron_format": "*/5 * * * *",
+			}
+		)
+		doc.insert(ignore_permissions=True)
+		keep = frappe.get_doc(
+			{
+				"doctype": "Scheduled Job Type",
+				"method": "huf.ai.prE_unrelated.job",
+				"frequency": "All",
+			}
+		).insert(ignore_permissions=True)
+		try:
+			delete_legacy_flow_schedule_jobs.execute()
+			self.assertFalse(frappe.db.exists("Scheduled Job Type", doc.name))
+			self.assertTrue(frappe.db.exists("Scheduled Job Type", keep.name))
+		finally:
+			frappe.delete_doc("Scheduled Job Type", keep.name, force=1, ignore_permissions=True)
+			if frappe.db.exists("Scheduled Job Type", doc.name):
+				frappe.delete_doc("Scheduled Job Type", doc.name, force=1, ignore_permissions=True)
