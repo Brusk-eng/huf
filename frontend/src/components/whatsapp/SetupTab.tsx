@@ -17,6 +17,8 @@ function Check({ ok, label }: { ok: boolean; label: string }) {
 const CHECK_LABELS: Record<string, string> = {
   app_secret_missing: 'The app secret is not set, so incoming messages cannot be verified until you add it.',
   webhook_verify_token_missing: 'The verification token is not set, so Meta cannot confirm this webhook until you add it.',
+  account_phone_mismatch:
+    'The linked WhatsApp Account uses a different phone number than this gateway. Messages for it would be ignored. Link the matching account or fix the phone number ID.',
 };
 
 function checkLabel(code: string): string {
@@ -38,8 +40,11 @@ export function SetupTab({ status }: { status: SetupStatus }) {
         <StatusDot status={status.bridge_available ? 'healthy' : 'held'} />
         <p className="text-xs text-steel">
           {status.bridge_available
-            ? 'The WhatsApp Business app connector is installed.'
-            : 'The WhatsApp Business app connector is not installed; templates and messages are unavailable.'}
+            ? 'The optional WhatsApp Business app connector is installed, so template management and message history are available.'
+            : 'Template management and message history need the optional WhatsApp Business app connector ("bridge mode"). It is not installed, so those features are unavailable. Replies still work without it.'}
+        </p>
+        <p className="text-xs text-steel">
+          Use one gateway per Meta app and phone number. The connector's own webhook stays live and is not signature-checked, so restrict it at your reverse proxy (see the setup guide).
         </p>
       </section>
 

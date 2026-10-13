@@ -4,7 +4,7 @@ import { getFrappeErrorMessage } from '@/lib/frappe-error';
 const BASE = 'huf.ai.whatsapp_management';
 
 export const TEMPLATE_NAME_RE = /^[a-z0-9_]+$/;
-export const TEMPLATE_CATEGORIES = ['MARKETING', 'UTILITY', 'AUTHENTICATION'] as const;
+export const TEMPLATE_CATEGORIES = ['MARKETING', 'UTILITY'] as const;
 export type TemplateCategory = (typeof TEMPLATE_CATEGORIES)[number];
 
 export interface WhatsAppError {
@@ -29,6 +29,7 @@ export interface GatewayStatus {
   app_secret_present: boolean;
   app_secret_missing: boolean;
   verify_token_present: boolean;
+  account_phone_mismatch?: boolean;
   webhook_url: string;
   callback_warning: string;
   failing_checks: string[];

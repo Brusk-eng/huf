@@ -155,6 +155,33 @@ class TestWhatsAppManagement(unittest.TestCase):
 		self.assertIn("connector", gateway["callback_warning"])
 		self.assertNotIn("verify-me", json.dumps(result))
 
+	def _status_with_phones(self, account_phone, credential_phone, linked=True):
+		self.frappe.utils.get_url.return_value = "https://huf.example.com"
+		self.frappe.get_all.side_effect = lambda doctype, **kwargs: (
+			[{"name": "GW-1", "is_enabled": 1, "integration_settings": "IS-1"}] if doctype == "Gateway" else []
+		)
+		self.frappe.db.get_value.side_effect = lambda doctype, name, field=None, *a, **k: (
+			("ACC-1" if linked else None) if doctype == "Gateway" else account_phone
+		)
+		self.frappe.get_doc.return_value = MagicMock(
+			credentials=[
+				_cred("app_secret", "x"),
+				_cred("webhook_verify_token", "y"),
+				_cred("phone_number_id", credential_phone),
+			]
+		)
+		return mgmt.get_setup_status()["gateways"][0]
+
+	def test_setup_status_flags_account_phone_mismatch(self):
+		gateway = self._status_with_phones("111", "222")
+		self.assertTrue(gateway["account_phone_mismatch"])
+		self.assertIn("account_phone_mismatch", gateway["failing_checks"])
+
+	def test_setup_status_no_mismatch_when_phones_match_or_unlinked(self):
+		for gateway in (self._status_with_phones("111", "111"), self._status_with_phones("111", "222", linked=False)):
+			self.assertFalse(gateway["account_phone_mismatch"])
+			self.assertNotIn("account_phone_mismatch", gateway["failing_checks"])
+
 	def test_setup_status_requires_admin_role(self):
 		self.frappe.get_roles.return_value = ["Guest"]
 

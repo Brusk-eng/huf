@@ -407,7 +407,7 @@ def _create_template(kwargs: dict) -> str:
 
 	Requires ``allow_whatsapp_management`` enabled in
 	the server-side Integration Settings. Accepted fields: ``template_name``,
-	``category`` (MARKETING/UTILITY/AUTHENTICATION), ``language_code``, ``body``.
+	``category`` (MARKETING/UTILITY), ``language_code``, ``body``.
 	"""
 	if not _server_flag("allow_whatsapp_management"):
 		return _refused(

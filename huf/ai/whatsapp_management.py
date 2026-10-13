@@ -138,6 +138,30 @@ def _credential_presence(integration_settings: str | None) -> dict[str, bool]:
 	return presence
 
 
+def _credential_phone_number_id(integration_settings: str | None) -> str:
+	"""The gateway credential's phone_number_id (not a secret; it is in the webhook payload)."""
+	if not integration_settings:
+		return ""
+	settings = frappe.get_doc("Integration Settings", integration_settings)
+	for row in settings.credentials or []:
+		if row.key == "phone_number_id":
+			return str(row.get_password("value") or "").strip()
+	return ""
+
+
+def _account_phone_mismatch(gateway: dict[str, Any]) -> bool:
+	"""True when the linked WhatsApp Account's phone_id differs from the credential's phone_number_id."""
+	account = gateway.get("whatsapp_account")
+	if not account or not bridge.is_available():
+		return False
+	try:
+		account_phone = str(frappe.db.get_value("WhatsApp Account", account, "phone_id") or "").strip()
+		credential_phone = _credential_phone_number_id(gateway.get("integration_settings"))
+	except Exception:
+		return False
+	return bool(account_phone and credential_phone and account_phone != credential_phone)
+
+
 def _webhook_url(gateway_name: str) -> str:
 	return (
 		f"{frappe.utils.get_url()}/api/method/huf.ai.gateway_webhook.handle_gateway_webhook"
@@ -152,6 +176,9 @@ def _gateway_status(gateway: dict[str, Any]) -> dict[str, Any]:
 		failing.append("app_secret_missing")
 	if not presence["webhook_verify_token"]:
 		failing.append("webhook_verify_token_missing")
+	mismatch = _account_phone_mismatch(gateway)
+	if mismatch:
+		failing.append("account_phone_mismatch")
 	return {
 		"name": gateway["name"],
 		"enabled": bool(gateway.get("is_enabled")),
@@ -159,6 +186,7 @@ def _gateway_status(gateway: dict[str, Any]) -> dict[str, Any]:
 		"app_secret_present": presence["app_secret"],
 		"app_secret_missing": not presence["app_secret"],
 		"verify_token_present": presence["webhook_verify_token"],
+		"account_phone_mismatch": mismatch,
 		"webhook_url": _webhook_url(gateway["name"]),
 		"callback_warning": CALLBACK_WARNING,
 		"failing_checks": failing,

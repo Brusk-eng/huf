@@ -30,6 +30,15 @@ Huf's WhatsApp gateway works without `frappe_whatsapp`. It has two modes.
 
 Huf never imports `frappe_whatsapp` at module load. The bridge checks for the DocTypes `WhatsApp Message`, `WhatsApp Templates` and `WhatsApp Account`. If any is missing, the bridge reports itself unavailable.
 
+> **Template management and message history require the optional connector app (`frappe_whatsapp`, "bridge mode").** Without it, Huf still receives messages, runs the agent and replies (including the template fallback), but the template list/create/delete/sync, message and conversation listing, and the WhatsApp Message history are unavailable (`bridge_unavailable`).
+
+### Known limits
+
+- **One Gateway per Meta app and phone number.** A signed payload for a `phone_number_id` that does not match the gateway is ignored (HTTP 200) and the gateway's `last_error` says so.
+- **Non-text inbound** (location, contacts, reactions) is acknowledged but does not start a run and does not open the 24h window in Huf. Known limitation.
+- **72-hour click-to-WhatsApp windows are not modelled.** Huf always applies the conservative 24h rule.
+- The window is anchored on the customer's own message timestamp, so Meta redelivering an old webhook (up to about 7 days) does not reopen it.
+
 ### What each mode supports
 
 | Capability | Direct mode | Bridge mode |
@@ -119,6 +128,7 @@ Create a **Gateway**:
 | Connected integration (`integration_settings`) | The Integration Settings record from 3.1 |
 | WhatsApp Account (`whatsapp_account`) | Optional. Name of a frappe_whatsapp WhatsApp Account. Setting it enables bridge mode when the app is installed |
 | Fallback template (`fallback_template`) | Optional. Name of an approved template with no variables. Used when a reply is due and the 24h window is closed |
+| Fallback template language (`fallback_template_language`) | Language code of that template. Defaults to `en_US` |
 | Run as user (`execution_user`) | Least-privileged Huf user. Never `Administrator` |
 | Direct-message policy (`direct_policy`) | `Allow list` (default), `Pairing`, `Open` or `Disabled` |
 | Enabled (`is_enabled`) | Checked |
@@ -148,13 +158,23 @@ In the Meta app, under WhatsApp > Configuration > Webhooks:
 
 **Security: the callback must be Huf's endpoint, never `frappe_whatsapp`'s webhook.** Meta allows one callback URL per app. `frappe_whatsapp` ships an unsigned webhook route. If that route is configured as the callback, Huf's signature verification is bypassed. Huf cannot detect this from its side. Check the callback URL in Meta. The management API's setup status returns the correct URL and a warning string to compare against.
 
+**The connector's own webhook stays live.** Installing `frappe_whatsapp` leaves `/api/method/frappe_whatsapp.utils.webhook.webhook` reachable by anyone, with no signature check. Anyone who can reach it can write fake rows into `WhatsApp Message` and pollute the message history. Huf does not read those rows to decide the 24h window, but the history views would show them. Disable it by blocking the route at the reverse proxy, for example in nginx:
+
+```nginx
+location = /api/method/frappe_whatsapp.utils.webhook.webhook {
+    return 403;
+}
+```
+
+Place it in the site's `server` block before the generic Frappe proxy location. Meta then only reaches Huf's signed endpoint.
+
 ### 3.4 Verify the setup
 
 Call `huf.ai.whatsapp_management.get_setup_status` (System Manager or Huf Admin), or open the WhatsApp page in the Huf console (`/whatsapp`). It reports:
 
 - `bridge_available`
 - the WhatsApp Accounts found
-- for each WhatsApp gateway: its webhook URL, whether `app_secret` and `webhook_verify_token` are present, and a `failing_checks` list
+- for each WhatsApp gateway: its webhook URL, whether `app_secret` and `webhook_verify_token` are present, and a `failing_checks` list. `account_phone_mismatch` is listed when the linked WhatsApp Account's `phone_id` differs from the credential `phone_number_id`
 
 A healthy gateway has an empty `failing_checks` list. Send a test message from Meta or from a WhatsApp phone to the business number. Confirm a Gateway Event and an agent run appear.
 
@@ -172,7 +192,7 @@ Inside the window, replies are sent as free-form text.
 
 When a reply is due and the window is closed:
 
-1. If the Gateway has a `fallback_template`, the reply is sent as that template with no variables (language `en_US`).
+1. If the Gateway has a `fallback_template`, the reply is sent as that template with no variables (language from the Gateway's `fallback_template_language`, default `en_US`; in bridge mode the language of the matching WhatsApp Templates row is used when found). The Gateway Event stays `Succeeded` and its `error_message` reads "Fallback template sent; agent reply suppressed (24h window closed)".
 2. If there is no fallback template, the send raises `WhatsAppWindowClosed`. The Gateway Event is set to status `Failed`, and its `error_message` (up to 500 characters) reads like `WhatsApp delivery failed: ...`. A log entry is also written. Nothing is retried in a loop.
 
 Approval and pairing notifications follow the same rule. If the window is closed and no fallback is set, they are skipped and logged. The approval itself is not rolled back.
@@ -195,7 +215,7 @@ Approval and pairing notifications follow the same rule. If the window is closed
 | `list_messages` | GET | Recent WhatsApp Messages, newest first |
 | `list_conversations` | GET | Recent messages grouped by counterparty number |
 
-Template name rules: lowercase letters, digits and underscores only (`^[a-z0-9_]+$`). Category: `MARKETING`, `UTILITY` or `AUTHENTICATION`. `language_code` is required.
+Template name rules: lowercase letters, digits and underscores only (`^[a-z0-9_]+$`). Category: `MARKETING` or `UTILITY` (`AUTHENTICATION` is not supported because Meta requires OTP button components). `language_code` is required.
 
 **Agent tool actions** (`huf/ai/tools/whatsapp.py`): `list_templates` (read-only) and `create_template` (gated, see section 6).
 
@@ -277,7 +297,9 @@ Quoted replies do not create a new conversation. The adapter sets `thread_id` to
 | `no_account` | No WhatsApp Account is marked default, and none is `Active` | Create an account, mark one as default outgoing, or pass an account name |
 | `app_secret_missing` in `failing_checks` | The `app_secret` credential row is empty | Add the Meta App Secret to the Integration Settings |
 | Duplicate events | Meta redelivers a message. Each delivery has the same message id | Expected. The second delivery is recorded as a duplicate and does not start another run. Ingest errors are re-raised so Meta retries; redelivery is then deduplicated |
-| Messages for another phone number are ignored | The payload's `metadata.phone_number_id` does not match the gateway's `phone_number_id` | Check that the Integration Settings and the webhook subscription belong to the same WhatsApp number |
+| Messages for another phone number are ignored | The payload's `metadata.phone_number_id` does not match the gateway's `phone_number_id` | Check that the Integration Settings and the webhook subscription belong to the same WhatsApp number. The gateway's `last_error` names the ignored id. Use one Gateway per Meta app and number |
+| Gateway `last_error` shows `WhatsApp delivery failed to ...: error <code>` | Meta reported a failed delivery for an outgoing message (any mode) | Look up the error code in Meta's docs; the Error Log has the same entry |
+| Gateway `last_error` shows `Fallback template ... is REJECTED/PAUSED/DISABLED` | Meta changed the status of the template configured as fallback | Pick or fix another approved template |
 | Message status updates do not appear in `frappe_whatsapp` | `frappe_whatsapp` is not installed, or no `WhatsApp Message` row exists for that message id | Message statuses are forwarded only when the message id exists in `WhatsApp Message`. Status-only deliveries are acknowledged with 200 and do not start runs |
 
 ---

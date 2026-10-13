@@ -240,7 +240,7 @@ WHATSAPP_TOOLS = [
 			_p("template_name", description="Template name for send_template, or the new template's name for create_template."),
 			_p(
 				"category",
-				description="Template category for create_template: MARKETING, UTILITY or AUTHENTICATION.",
+				description="Template category for create_template: MARKETING or UTILITY.",
 			),
 			_p("language_code", description="Template language code, e.g. 'en' or 'en_US' (default 'en')."),
 			_p("body", description="Template body text for create_template. Use {{1}}, {{2}} for variables."),
