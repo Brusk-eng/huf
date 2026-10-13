@@ -45,7 +45,7 @@ Huf never imports `frappe_whatsapp` at module load. The bridge checks for the Do
 | Template list, create, delete and status sync | No (`bridge_unavailable`) | Yes |
 | Message and conversation listing in the management API | No (`bridge_unavailable`) | Yes |
 | Outbound media | No | No |
-| Inbound media download | Not wired (see section 7) | Not wired (see section 7) |
+| Inbound media download | Yes, best-effort in the background job (see section 7) | Yes, best-effort in the background job (see section 7) |
 
 Note: the management API and the agent tool's `list_templates` and `create_template` actions need `frappe_whatsapp`. The agent tool's `send_message` and `send_template` do not. Without `frappe_whatsapp`, they call the Graph API directly.
 
@@ -242,7 +242,7 @@ The bridge provides `download_media`, which enforces:
 - MIME allowlist: `image/`, `audio/`, `video/`, `application/pdf`, `text/plain`
 - filename sanitised to `A-Z a-z 0-9 . _ -`, at most 100 characters
 
-**However, nothing in the inbound path calls `download_media` today.** Inbound media is not downloaded and no File is created. Operators should not expect attachments to reach the agent.
+When the background job processes an event with an image, document, audio, video or sticker, it calls `download_media` (best-effort), saves a private File attached to the Gateway Event, and adds an `[Attachment saved: <url>]` note to the agent prompt. A failed or rejected download is logged and the text flow continues.
 
 **Outbound.** Media replies are not supported. The adapter declares `supports_media_reply = False` and sends text only.
 

@@ -94,10 +94,10 @@ def _get_whatsapp_credentials(kwargs: dict) -> tuple[str, str]:
 
 	# Fallback to Integration Settings or WhatsApp Account DocType
 	if frappe.db.exists("DocType", "WhatsApp Account"):
-		accounts = frappe.get_all("WhatsApp Account", fields=["name", "phone_number_id"], limit=1)
+		accounts = frappe.get_all("WhatsApp Account", fields=["name", "phone_id"], limit=1)
 		if accounts:
 			doc = frappe.get_doc("WhatsApp Account", accounts[0].name)
-			phone_number_id = phone_number_id or doc.phone_number_id or ""
+			phone_number_id = phone_number_id or doc.phone_id or ""
 			access_token = access_token or doc.get_password("token") or ""
 
 	if not phone_number_id or not access_token:
