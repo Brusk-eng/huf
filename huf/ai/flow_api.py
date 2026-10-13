@@ -597,192 +597,249 @@ def flow_webhook_clean(flow_id: str | None = None, webhook_key: str | None = Non
 	return _run_flow_webhook(resolved_flow_id, resolved_key, payload)
 
 
-@frappe.whitelist()
-def schedule_flow(flow_id: str, cron: str, schedule_name: str | None = None, timezone: str = "UTC") -> dict:
-	"""
-	Schedule a flow to run periodically via Frappe Scheduler.
-	
-	Creates a Scheduled Job Type that will trigger the flow execution
-	at the specified cron interval.
-	
-	Args:
-	    flow_id: Flow ID to schedule
-	    cron: Cron expression (e.g., "*/5 * * * *" for every 5 minutes)
-	    schedule_name: Optional name for the schedule (defaults to flow_id)
-	    timezone: Timezone for schedule execution (default: UTC)
-	
-	Returns:
-	    dict with schedule_id, status, and next_execution
-	"""
-	if not frappe.has_permission("Flow Definition", "read"):
-		frappe.throw(_("Not permitted"), frappe.PermissionError)
-	
-	if not frappe.db.exists("Flow Definition", flow_id):
-		frappe.throw(_("Flow '{0}' not found").format(flow_id), frappe.DoesNotExistError)
-	
-	# Validate cron expression format (basic validation)
-	cron_parts = cron.split()
-	if len(cron_parts) != 5:
+# ---------------------------------------------------------------------------
+# Flow triggers (schedule / doc event) -- an Automation bound to the Flow's Procedure
+# ---------------------------------------------------------------------------
+#
+# Flow triggers are not a separate scheduler: a Flow with a schedule or doc-event trigger
+# is converted to an Agent Procedure (the run path in use) and an Automation that targets
+# that Procedure carries the trigger, so it fires through the same dispatchers
+# (automation_scheduler.run_due_automations / automation_hooks.run_hooked_automations).
+# The Automation is only Active once the Procedure is Testing/Active -- conversion never
+# activates a Procedure (I8), so a fresh trigger sits in Draft until a human enables it.
+
+_FLOW_TRIGGER_TYPES = {"schedule": "Schedule", "doc_event": "Doc Event", "doc event": "Doc Event"}
+_FLOW_AUTOMATION_PREFIX = "Flow Trigger: "
+
+
+def _flow_automation_name(flow_id: str) -> str:
+	return f"{_FLOW_AUTOMATION_PREFIX}{flow_id}"
+
+
+def _flow_trigger_row(automation_name: str):
+	name = frappe.db.get_value("Automation Trigger", {"automation": automation_name}, "name")
+	return frappe.get_doc("Automation Trigger", name) if name else None
+
+
+def _ensure_flow_procedure(flow_id: str) -> str:
+	"""Return the name of an Agent Procedure version matching the Flow's current
+	definition, converting (a new immutable Draft version) only if none does."""
+	from huf.ai.procedure_conversion import analyze_conversion
+	from huf.ai.procedure_versioning import compute_fingerprint
+
+	_doc, flow_graph = _load_flow_graph(flow_id)
+	result = analyze_conversion(flow_graph)
+	if not result.convertible:
 		frappe.throw(
-			_("Invalid cron expression. Expected 5 parts (minute hour day month day_of_week), got {0}").format(len(cron_parts))
+			_("Flow '{0}' cannot take a schedule or doc-event trigger: {1}").format(flow_id, result.reason),
+			title=_("Flow Is Not Convertible"),
 		)
-	
-	schedule_name = schedule_name or f"Flow Schedule: {flow_id}"
-	job_id = f"huf.flow.schedule.{flow_id}"
-	
-	# Check if schedule already exists
-	existing = frappe.db.get_value("Scheduled Job Type", {"name": job_id}, "name")
-	
-	if existing:
-		# Update existing schedule
-		doc = frappe.get_doc("Scheduled Job Type", existing)
-		doc.cron_format = cron
-		doc.save()
-	else:
-		# Create new Scheduled Job Type
-		doc = frappe.get_doc({
-			"doctype": "Scheduled Job Type",
-			"name": job_id,
-			"method": "huf.ai.flow_api.execute_scheduled_flow",
-			"kwargs": json.dumps({"flow_id": flow_id}),
-			"cron_format": cron,
-			"frequency": "Cron",
-			"create_log": 1,
-		})
-		doc.insert()
-	
-	return {
-		"schedule_id": doc.name,
+
+	procedure_id = f"{flow_id}-procedure"
+	latest = frappe.db.get_value(
+		"Agent Procedure",
+		{"procedure_id": procedure_id},
+		["name", "fingerprint", "schema_version"],
+		order_by="version desc",
+		as_dict=True,
+	)
+	if latest:
+		graph = dict(result.procedure_graph)
+		graph["profile"] = "procedure"
+		graph["schema_version"] = latest.schema_version or graph.get("schema_version") or "1.0.0"
+		if compute_fingerprint(graph) == latest.fingerprint:
+			return latest.name
+
+	return convert_flow_to_procedure(flow_id, procedure_id=procedure_id)["name"]
+
+
+def _flow_trigger_summary(flow_id: str) -> dict | None:
+	automation_name = _flow_automation_name(flow_id)
+	if not frappe.db.exists("Automation", automation_name):
+		return None
+	automation = frappe.get_doc("Automation", automation_name)
+	trigger = _flow_trigger_row(automation_name)
+	if not trigger:
+		return None
+	procedure_status = frappe.db.get_value("Agent Procedure", automation.procedure, "status")
+	out = {
 		"flow_id": flow_id,
-		"cron": cron,
-		"status": "scheduled",
-		"message": _("Flow '{0}' scheduled successfully with cron: {1}").format(flow_id, cron),
+		"trigger_type": trigger.trigger_type,
+		"automation": automation.name,
+		"automation_trigger": trigger.name,
+		"automation_status": automation.status,
+		"procedure": automation.procedure,
+		"procedure_status": procedure_status,
+		"enabled": bool(automation.status == "Active" and not trigger.disabled),
+		"next_run": str(trigger.next_execution) if trigger.next_execution else None,
+		"last_run": str(trigger.last_execution) if trigger.last_execution else None,
 	}
+	if automation.status != "Active":
+		out["activation_required"] = _(
+			"Procedure {0} is {1}. Enable it (Testing or Active) and activate the automation for this trigger to fire."
+		).format(automation.procedure, procedure_status)
+	if trigger.trigger_type == "Schedule":
+		out.update(
+			schedule_type=trigger.schedule_type,
+			cron=trigger.cron_expression,
+			interval=trigger.scheduled_interval,
+			interval_count=trigger.interval_count,
+		)
+	else:
+		out.update(
+			reference_doctype=trigger.reference_doctype,
+			doc_event=trigger.doc_event,
+			condition=trigger.condition,
+		)
+	return out
 
 
 @frappe.whitelist()
-def unschedule_flow(flow_id: str) -> dict:
-	"""
-	Remove schedule for a flow.
-	
+def set_flow_trigger(
+	flow_id: str,
+	trigger_type: str,
+	cron: str | None = None,
+	interval: str | None = None,
+	interval_count: int = 1,
+	reference_doctype: str | None = None,
+	doc_event: str | None = None,
+	condition: str | None = None,
+	run_as_user: str | None = None,
+	disabled: int = 0,
+) -> dict:
+	"""Create or replace the single schedule / doc-event trigger of a Flow.
+
+	Converts the Flow to an Agent Procedure if needed (refusing, with the conversion's
+	reason, when the Flow contains agent.run / router.llm / human.approval), then
+	creates/updates an Automation targeting that Procedure plus its Automation Trigger.
+
 	Args:
-	    flow_id: Flow ID to unschedule
+	    flow_id: Flow Definition name.
+	    trigger_type: "schedule" or "doc_event".
+	    cron / interval: for schedule -- a 5-part cron expression, or one of
+	        Hourly/Daily/Weekly/Monthly/Yearly (with ``interval_count``).
+	    reference_doctype / doc_event / condition: for doc_event.
+	    run_as_user: identity the Procedure runs as (default: the caller).
 
 	Returns:
-	    dict with status and message
+	    the get_flow_trigger() summary, including ``next_run`` for schedules.
 	"""
 	if not frappe.has_permission("Flow Definition", "write"):
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
-	
-	job_id = f"huf.flow.schedule.{flow_id}"
-	existing = frappe.db.get_value("Scheduled Job Type", {"name": job_id}, "name")
-	
-	if not existing:
-		return {
-			"status": "not_found",
-			"message": _("No schedule found for flow '{0}'").format(flow_id),
-		}
-	
-	frappe.delete_doc("Scheduled Job Type", existing, ignore_missing=True)
-	
-	return {
-		"status": "unscheduled",
-		"message": _("Schedule removed for flow '{0}'").format(flow_id),
+	if not frappe.has_permission("Automation", "write") or not frappe.has_permission("Automation Trigger", "write"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	if not frappe.db.exists("Flow Definition", flow_id):
+		frappe.throw(_("Flow '{0}' not found").format(flow_id), frappe.DoesNotExistError)
+
+	resolved_type = _FLOW_TRIGGER_TYPES.get((trigger_type or "").strip().lower())
+	if not resolved_type:
+		frappe.throw(_("trigger_type must be 'schedule' or 'doc_event'"))
+
+	trigger_fields: dict = {"trigger_type": resolved_type}
+	if resolved_type == "Schedule":
+		if cron:
+			if len(cron.split()) != 5:
+				frappe.throw(_("Invalid cron expression. Expected 5 parts (minute hour day month day_of_week)."))
+			trigger_fields.update(schedule_type="Cron", cron_expression=cron)
+		elif interval:
+			if interval not in ("Hourly", "Daily", "Weekly", "Monthly", "Yearly"):
+				frappe.throw(_("interval must be one of Hourly, Daily, Weekly, Monthly, Yearly"))
+			trigger_fields.update(
+				schedule_type="Interval", scheduled_interval=interval, interval_count=int(interval_count or 1)
+			)
+		else:
+			frappe.throw(_("A schedule trigger needs either cron or interval."))
+		trigger_fields["next_execution"] = None
+	else:
+		if not reference_doctype or not doc_event:
+			frappe.throw(_("A doc_event trigger needs reference_doctype and doc_event."))
+		if not frappe.db.exists("DocType", reference_doctype):
+			frappe.throw(_("DocType '{0}' not found").format(reference_doctype))
+		from huf.ai.automation_hooks import SUPPORTED_DOC_EVENTS
+
+		if doc_event not in SUPPORTED_DOC_EVENTS:
+			frappe.throw(_("Unsupported doc_event '{0}'").format(doc_event))
+		trigger_fields.update(reference_doctype=reference_doctype, doc_event=doc_event, condition=condition or None)
+
+	procedure_name = _ensure_flow_procedure(flow_id)
+	procedure_status = frappe.db.get_value("Agent Procedure", procedure_name, "status")
+	from huf.huf.doctype.automation.automation import RUNNABLE_PROCEDURE_STATUSES
+
+	automation_name = _flow_automation_name(flow_id)
+	automation_fields = {
+		"target_type": "Agent Procedure",
+		"procedure": procedure_name,
+		"agent": None,
+		"run_as_user": run_as_user or frappe.session.user,
+		"status": "Active" if procedure_status in RUNNABLE_PROCEDURE_STATUSES else "Draft",
 	}
+	if frappe.db.exists("Automation", automation_name):
+		automation = frappe.get_doc("Automation", automation_name)
+		automation.update(automation_fields)
+		automation.save()
+	else:
+		automation = frappe.get_doc(
+			{"doctype": "Automation", "automation_name": automation_name, **automation_fields}
+		)
+		automation.insert()
+
+	trigger = _flow_trigger_row(automation_name)
+	if trigger:
+		# A trigger type change must not leave the old type's fields behind.
+		for fieldname in (
+			"schedule_type", "cron_expression", "scheduled_interval", "interval_count",
+			"next_execution", "reference_doctype", "doc_event", "condition",
+		):
+			trigger.set(fieldname, None)
+		trigger.update({**trigger_fields, "disabled": int(bool(disabled))})
+		trigger.save()
+	else:
+		trigger = frappe.get_doc(
+			{
+				"doctype": "Automation Trigger",
+				"trigger_name": f"{flow_id} trigger",
+				"automation": automation_name,
+				"disabled": int(bool(disabled)),
+				**trigger_fields,
+			}
+		)
+		trigger.insert()
+	frappe.cache().delete_key("huf:doc_event_automation_triggers")
+
+	return _flow_trigger_summary(flow_id)
 
 
 @frappe.whitelist()
-def get_flow_schedule(flow_id: str) -> dict | None:
-	"""
-	Get schedule details for a flow.
-	
-	Args:
-	    flow_id: Flow ID to get schedule for
-
-	Returns:
-	    dict with schedule details or None if not scheduled
-	"""
+def get_flow_trigger(flow_id: str) -> dict | None:
+	"""Return the Flow's schedule / doc-event trigger summary, or None if it has none."""
 	if not frappe.has_permission("Flow Definition", "read"):
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
-	
-	job_id = f"huf.flow.schedule.{flow_id}"
-	existing = frappe.db.get_value(
-		"Scheduled Job Type",
-		{"name": job_id},
-		["name", "cron_format", "last_execution", "next_execution", "disabled"],
-		as_dict=True,
-	)
-	
-	if not existing:
-		return None
-	
-	return {
-		"schedule_id": existing.name,
-		"flow_id": flow_id,
-		"cron": existing.cron_format,
-		"last_execution": str(existing.last_execution) if existing.last_execution else None,
-		"next_execution": str(existing.next_execution) if existing.next_execution else None,
-		"disabled": existing.disabled,
-		"status": "disabled" if existing.disabled else "active",
-	}
+	return _flow_trigger_summary(flow_id)
 
 
 @frappe.whitelist()
-def execute_scheduled_flow(flow_id: str) -> dict:
-	"""
-	Execute a scheduled flow run.
-	
-	This method is called by the Frappe Scheduler when a scheduled
-	job triggers. It creates and runs a flow run with schedule context.
-	
-	Args:
-	    flow_id: Flow ID to execute
+def clear_flow_trigger(flow_id: str) -> dict:
+	"""Remove the Flow's trigger (its Automation and Automation Trigger). The Procedure stays."""
+	if not frappe.has_permission("Flow Definition", "write"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
-	Returns:
-	    dict with flow_run_id and status
-	"""
-	from huf.ai.flow_engine import create_flow_run, run_flow as engine_run_flow
-	
-	if not frappe.db.exists("Flow Definition", flow_id):
-		frappe.log_error(title="Flow Scheduler", message=f"Scheduled flow '{flow_id}' not found")
-		return {"status": "error", "error": f"Flow '{flow_id}' not found"}
-	
-	# Check if flow is active
-	defn_doc = frappe.get_doc("Flow Definition", flow_id)
-	if defn_doc.status != "Active":
-		msg = f"Flow '{flow_id}' is not active (status: {defn_doc.status})"
-		frappe.log_error(title="Flow Scheduler", message=msg)
-		return {"status": "error", "error": msg}
-	
-	# Create flow run with schedule trigger type
-	payload = {
-		"_triggered_by": "schedule",
-		"_timestamp": str(now_datetime()),
-	}
-	
-	try:
-		flow_run = create_flow_run(
-			flow_id=flow_id,
-			payload=payload,
-			trigger_type="Schedule",
-		)
-		
-		# Run the flow
-		engine_run_flow(flow_run.name)
-		
-		flow_run.reload()
-		return {
-			"flow_run_id": flow_run.name,
-			"status": flow_run.status,
-			"flow_id": flow_id,
-		}
-	except Exception as e:
-		error_msg = str(e)
-		frappe.log_error(
-			frappe.get_traceback(),
-			f"Scheduled Flow Execution Error: {flow_id}",
-		)
-		return {"status": "error", "error": error_msg, "flow_id": flow_id}
+	automation_name = _flow_automation_name(flow_id)
+	if not frappe.db.exists("Automation", automation_name):
+		return {"status": "not_found", "flow_id": flow_id}
+
+	# Procedure runs are history: keep them, drop only their link to the trigger/automation
+	# so the delete is not blocked by Frappe's linked-document check.
+	frappe.db.set_value(
+		"Agent Procedure Run",
+		{"automation": automation_name},
+		{"automation": None, "automation_trigger": None},
+		update_modified=False,
+	)
+	for trigger_name in frappe.get_all("Automation Trigger", {"automation": automation_name}, pluck="name"):
+		frappe.delete_doc("Automation Trigger", trigger_name)
+	frappe.delete_doc("Automation", automation_name)
+	frappe.cache().delete_key("huf:doc_event_automation_triggers")
+	return {"status": "cleared", "flow_id": flow_id}
 
 
 # ---------------------------------------------------------------------------

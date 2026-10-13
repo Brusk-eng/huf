@@ -13,6 +13,8 @@
   "section_break_identity",
   "description",
   "executor_section",
+  "target_type",
+  "procedure",
   "agent",
   "model_override",
   "column_break_executor",
@@ -82,12 +84,30 @@
    "label": "Executor"
   },
   {
+   "default": "Agent",
+   "fieldname": "target_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Target Type",
+   "options": "Agent\nAgent Procedure"
+  },
+  {
+   "depends_on": "eval: doc.target_type == \"Agent Procedure\"",
+   "description": "The pinned Agent Procedure version this automation runs. Must be Testing or Active before the automation can be Active.",
+   "fieldname": "procedure",
+   "fieldtype": "Link",
+   "label": "Procedure",
+   "mandatory_depends_on": "eval: doc.target_type == \"Agent Procedure\"",
+   "options": "Agent Procedure"
+  },
+  {
    "fieldname": "agent",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Agent",
    "options": "Agent",
-   "reqd": 1
+   "mandatory_depends_on": "eval: doc.target_type != \"Agent Procedure\"",
+   "depends_on": "eval: doc.target_type != \"Agent Procedure\""
   },
   {
    "description": "Optional AI Model to use for this automation instead of the Agent's default model.",
@@ -124,7 +144,8 @@
    "fieldtype": "Long Text",
    "ignore_xss_filter": 1,
    "label": "Instruction",
-   "reqd": 1
+   "mandatory_depends_on": "eval: doc.target_type != \"Agent Procedure\"",
+   "depends_on": "eval: doc.target_type != \"Agent Procedure\""
   },
   {
    "description": "Optional template used to build the instruction/input sent to the agent at run time.",

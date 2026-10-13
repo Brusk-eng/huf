@@ -17,6 +17,7 @@ Automation runs get identical Agent Run bookkeeping, provider/model
 resolution, and queue-vs-direct execution semantics as every other caller.
 """
 
+import json
 from uuid import uuid4
 
 import frappe
@@ -108,7 +109,20 @@ def run_automation(
 			frappe.ValidationError,
 		)
 
-	if not automation.agent:
+	is_procedure = automation.get("target_type") == "Agent Procedure"
+	if is_procedure:
+		if not automation.procedure:
+			frappe.throw(
+				_("Automation '{0}' has no procedure configured.").format(automation_name),
+				frappe.ValidationError,
+			)
+		if trigger_name:
+			# Same gate as the Active-status check above: only automatic
+			# triggers are held to a runnable procedure (Testing/Active).
+			from huf.huf.doctype.automation.automation import assert_procedure_runnable
+
+			assert_procedure_runnable(automation.procedure)
+	elif not automation.agent:
 		frappe.throw(
 			_("Automation '{0}' has no agent configured.").format(automation_name),
 			frappe.ValidationError,
@@ -178,7 +192,65 @@ def _check_run_as_user_permission(automation):
 	)
 
 
+def _procedure_input_payload(trigger_context):
+	"""Trigger payload handed to a Procedure run: the public trigger_context
+	keys (type, reference_doctype/reference_name/doc, payload, fired_at...).
+	Underscore-prefixed keys are agent-prompt plumbing and are dropped."""
+	return {k: v for k, v in (trigger_context or {}).items() if not str(k).startswith("_")}
+
+
+def _execute_procedure(automation, trigger_name, trigger_context, commit=True):
+	"""Procedure branch of _execute: start an Agent Procedure Run through the
+	procedure runtime (run_agent_procedure_run) as the current (already
+	run-as-switched) user, then do the same bookkeeping as the Agent branch."""
+	from huf.ai.graph.procedure_runtime import run_agent_procedure_run
+
+	result = None
+	error_message = None
+	run_name = None
+	try:
+		run = frappe.get_doc(
+			{
+				"doctype": "Agent Procedure Run",
+				"procedure": automation.procedure,
+				"automation": automation.name,
+				"automation_trigger": trigger_name,
+				"input_payload": json.dumps(_procedure_input_payload(trigger_context), default=str),
+			}
+		)
+		run.insert(ignore_permissions=True)
+		run_name = run.name
+		outcome = run_agent_procedure_run(run.name)
+		ok = outcome.status == "success"
+		result = {
+			"success": ok,
+			"status": outcome.status,
+			"procedure_run_id": run_name,
+			"output": outcome.output,
+			"error": outcome.error,
+		}
+		if not ok:
+			error_message = str(outcome.error or _("Procedure run did not complete successfully."))
+	except Exception:
+		error_message = frappe.get_traceback()
+		frappe.log_error(
+			title=f"Automation procedure run failed: {automation.name}",
+			message=error_message,
+		)
+		result = {"success": False, "status": "error", "procedure_run_id": run_name, "error": error_message}
+
+	_update_automation_bookkeeping(automation, None, error_message)
+	if trigger_name:
+		_update_trigger_bookkeeping(trigger_name, error_message)
+	if commit:
+		frappe.db.commit()
+	return result
+
+
 def _execute(automation, trigger_name, trigger_context, now, commit=True, parent_run_id=None):
+	if automation.get("target_type") == "Agent Procedure":
+		return _execute_procedure(automation, trigger_name, trigger_context, commit)
+
 	instruction = _resolve_instruction(automation, trigger_context)
 
 	conversation_id, channel_id, external_id, skip_user_message = _resolve_conversation_routing(

@@ -4,13 +4,22 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import add_to_date, now_datetime
+from frappe.utils import now_datetime
 
 
 class AutomationTrigger(Document):
 	def validate(self):
 		self._validate_system_agent_lock()
+		self._validate_cron()
 		self._set_initial_next_execution()
+
+	def _validate_cron(self):
+		if self.trigger_type != "Schedule" or self.schedule_type != "Cron":
+			return
+		from croniter import croniter
+
+		if not self.cron_expression or not croniter.is_valid(self.cron_expression):
+			frappe.throw(_("Invalid cron expression: {0}").format(self.cron_expression or ""))
 
 	def _set_initial_next_execution(self):
 		"""Schedule-type triggers are only ever picked up by
@@ -22,16 +31,9 @@ class AutomationTrigger(Document):
 		"""
 		if self.trigger_type != "Schedule" or self.next_execution:
 			return
-		interval = self.interval_count or 1
-		si = (self.scheduled_interval or "").lower()
-		self.next_execution = add_to_date(
-			now_datetime(),
-			hours=interval if si == "hourly" else 0,
-			days=interval if si == "daily" else 0,
-			weeks=interval if si == "weekly" else 0,
-			months=interval if si == "monthly" else 0,
-			years=interval if si == "yearly" else 0,
-		)
+		from huf.ai.automation_scheduler import compute_next_execution
+
+		self.next_execution = compute_next_execution(self.as_dict(), now_datetime())
 
 	def _validate_system_agent_lock(self):
 		"""Same guard as Automation._validate_system_agent_lock(), applied
