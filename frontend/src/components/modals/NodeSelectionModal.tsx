@@ -44,6 +44,7 @@ import { getAgents, getDocTypes } from '../../services/agentApi';
 import type { AgentDoc } from '../../types/agent.types';
 import { Combobox } from '../ui/combobox';
 import { toast } from 'sonner';
+import { createWebhookTriggerDefaults } from '../../lib/flowWebhookConfig';
 
 interface NodeSelectionModalProps {
   open: boolean;
@@ -184,12 +185,8 @@ export function NodeSelectionModal({
   const handleSelectTrigger = (triggerId: string) => {
     setSelectedItem(triggerId);
     if (triggerId === 'webhook') {
-      setTriggerConfig({
-        type: 'webhook',
-        url: `${window.location.origin}/api/method/huf.ai.flow_api.flow_webhook`,
-        apiKey: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''),
-        method: 'POST'
-      });
+      // Canonical key name is `auth`: RightSidebar reads and writes it there.
+      setTriggerConfig(createWebhookTriggerDefaults(window.location.origin));
     } else if (triggerId === 'schedule') {
       setTriggerConfig({
         type: 'schedule',
@@ -304,8 +301,8 @@ export function NodeSelectionModal({
             <Label htmlFor="api-key">Security — API key (optional)</Label>
             <Input
               id="api-key"
-              value={config.apiKey || ''}
-              onChange={(e) => setTriggerConfig({ ...config, apiKey: e.target.value })}
+              value={config.auth || ''}
+              onChange={(e) => setTriggerConfig({ ...config, auth: e.target.value })}
               placeholder="Enter API key to require X-API-Key header"
             />
           </div>
