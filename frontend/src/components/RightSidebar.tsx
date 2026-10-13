@@ -1,6 +1,6 @@
 import { toast } from 'sonner';
 import { useState, useEffect } from 'react';
-import { X, Settings, Edit, Trash2, Clock } from 'lucide-react';
+import { X, Settings, Edit, Trash2 } from 'lucide-react';
 import { Input } from './ui/input';
 import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
@@ -24,48 +24,11 @@ import {
 } from './ui/alert-dialog';
 import { useFlowContext } from '../contexts/FlowContext';
 import { NodeSelectionModal } from './modals/NodeSelectionModal';
-import { ScheduleIntervalType, DocEventType, ScheduleTriggerConfig } from '../types/flow.types';
+import { FlowTriggerPanel } from './FlowTriggerPanel';
 import { getAgents, getDocTypes, getRoles } from '../services/agentApi';
 import { getToolFunctions, getToolFunction, getFlowTools, type FlowTool } from '../services/toolApi';
 import { VariablePicker } from './ui/VariablePicker';
 import { JsonSchemaForm } from './JsonSchemaForm';
-
-/**
- * Computes a human-readable summary of a schedule trigger's cadence, e.g.
- * "Runs every 5 minutes". Only handles the simple interval case (every N
- * minutes/hours/days) since that can be described with plain arithmetic; the
- * custom-cron case is intentionally left unhandled (returns null) because
- * there's no cron-parsing library in this project to describe it reliably —
- * showing a wrong or placeholder value would be worse than showing nothing.
- *
- * This deliberately does NOT claim to be an exact "next run" time: the
- * backend does not expose a real next-execution timestamp to the frontend
- * (no such field exists on ScheduleTriggerConfig or node data), so there is
- * no honest way to compute when the schedule actually last fired or its real
- * anchor point. Presenting "now + interval" as the next run time would be
- * misleading, not just approximate — it would always read "in N minutes"
- * regardless of the schedule's true state.
- */
-function computeScheduleNextRun(config: ScheduleTriggerConfig): string | null {
-  if (config.intervalType === 'custom') {
-    return null;
-  }
-
-  const unitLabels: Record<'minutes' | 'hours' | 'days', string> = {
-    minutes: 'minute',
-    hours: 'hour',
-    days: 'day',
-  };
-  const unitLabel = unitLabels[config.intervalType as 'minutes' | 'hours' | 'days'];
-  if (!unitLabel) {
-    return null;
-  }
-
-  const interval = config.interval && config.interval > 0 ? config.interval : 1;
-  const pluralizedUnit = interval === 1 ? unitLabel : `${unitLabel}s`;
-
-  return `Runs every ${interval} ${pluralizedUnit}`;
-}
 
 interface ToolParameter {
   fieldname: string;
@@ -87,7 +50,7 @@ interface RightSidebarProps {
 }
 
 export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps) {
-  const { activeFlow, selectedNodeId, selectedEdgeId, updateNode, deleteNode, updateEdges } = useFlowContext();
+  const { activeFlow, hasUnsavedChanges, selectedNodeId, selectedEdgeId, updateNode, deleteNode, updateEdges } = useFlowContext();
   const selectedNode = activeFlow?.nodes.find((n) => n.id === selectedNodeId);
   const selectedEdge = activeFlow?.edges.find((e) => e.id === selectedEdgeId);
   const [isChangingTrigger, setIsChangingTrigger] = useState(false);
@@ -322,100 +285,15 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
       );
     }
 
-    if (config.type === 'schedule') {
-      const scheduleTypeSelect = (
-        <Select
-          value={config.intervalType}
-          onValueChange={(value) => handleUpdateTriggerConfig('intervalType', value as ScheduleIntervalType)}
-        >
-          <SelectTrigger id="interval-type">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="minutes">Minutes</SelectItem>
-            <SelectItem value="hours">Hours</SelectItem>
-            <SelectItem value="days">Days</SelectItem>
-            <SelectItem value="custom">Custom (cron)</SelectItem>
-          </SelectContent>
-        </Select>
-      );
-
+    if (config.type === 'schedule' || config.type === 'doc-event') {
       return (
-        <>
-          {config.intervalType !== 'custom' ? (
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <Label htmlFor="interval">Every</Label>
-                <Input
-                  id="interval"
-                  type="number"
-                  min="1"
-                  value={config.interval || 1}
-                  onChange={(e) => handleUpdateTriggerConfig('interval', parseInt(e.target.value))}
-                />
-              </div>
-              <div>
-                <Label htmlFor="interval-type">Unit</Label>
-                {scheduleTypeSelect}
-              </div>
-            </div>
-          ) : (
-            <div>
-              <Label htmlFor="interval-type">Schedule type</Label>
-              {scheduleTypeSelect}
-            </div>
-          )}
-          {config.intervalType === 'custom' && (
-            <div>
-              <Label htmlFor="cron">Cron expression</Label>
-              <Input
-                id="cron"
-                value={config.cronExpression || ''}
-                onChange={(e) => handleUpdateTriggerConfig('cronExpression', e.target.value)}
-                placeholder="0 */6 * * *"
-              />
-            </div>
-          )}
-        </>
-      );
-    }
-
-    if (config.type === 'doc-event') {
-      return (
-        <>
-          <div>
-            <Label htmlFor="doctype">Document type</Label>
-            <Combobox
-                        id="doctype"
-              options={docTypes}
-              value={config.doctype || ''}
-              onValueChange={(v) => handleUpdateTriggerConfig('doctype', v)}
-              placeholder={loadingDocTypes ? 'Loading...' : 'Select DocType...'}
-              disabled={loadingDocTypes}
-              searchPlaceholder="Search DocType..."
-              emptyText="No DocType found."
-            />
-          </div>
-          <div>
-            <Label htmlFor="event">Event type</Label>
-            <Select
-              value={config.event}
-              onValueChange={(value) => handleUpdateTriggerConfig('event', value as DocEventType)}
-            >
-              <SelectTrigger id="event">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="save">Save</SelectItem>
-                <SelectItem value="update">Update</SelectItem>
-                <SelectItem value="delete">Delete</SelectItem>
-                <SelectItem value="before-save">Before save</SelectItem>
-                <SelectItem value="before-update">Before update</SelectItem>
-                <SelectItem value="before-delete">Before delete</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </>
+        <FlowTriggerPanel
+          kind={config.type}
+          flowId={activeFlow?.id}
+          hasUnsavedChanges={hasUnsavedChanges}
+          docTypes={docTypes}
+          loadingDocTypes={loadingDocTypes}
+        />
       );
     }
 
@@ -448,11 +326,6 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
   };
 
   const isSheet = variant === 'sheet';
-
-  const scheduleNextRun =
-    selectedNode?.data.nodeType === 'trigger' && selectedNode.data.triggerConfig?.type === 'schedule'
-      ? computeScheduleNextRun(selectedNode.data.triggerConfig as ScheduleTriggerConfig)
-      : null;
 
   return (
     <div
@@ -1426,17 +1299,6 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
           </>
         ) : null}
       </div>
-
-      {scheduleNextRun ? (
-        <div className="border-t border-border p-3 bg-card flex items-center gap-2">
-          <div className="flex items-center gap-1.5 min-w-0 rounded-md bg-paper px-2 py-1">
-            <Clock className="w-3 h-3 text-muted-foreground shrink-0" />
-            <span className="text-[12px] leading-none text-muted-foreground truncate">
-              {scheduleNextRun}
-            </span>
-          </div>
-        </div>
-      ) : null}
 
       <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
         <AlertDialogContent>

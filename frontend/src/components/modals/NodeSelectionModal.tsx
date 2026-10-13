@@ -38,11 +38,10 @@ import {
 } from 'lucide-react';
 import { triggerOptions } from '../../data/triggers';
 import { actionOptions } from '../../data/actions';
-import { TriggerConfig, ActionConfig, ScheduleIntervalType, DocEventType, AppTriggerIntegration } from '../../types/flow.types';
+import { TriggerConfig, ActionConfig, AppTriggerIntegration } from '../../types/flow.types';
 import type { ActionOption } from '../../types/modal.types';
 import { getAgents, getDocTypes } from '../../services/agentApi';
 import type { AgentDoc } from '../../types/agent.types';
-import { Combobox } from '../ui/combobox';
 import { toast } from 'sonner';
 import { createWebhookTriggerDefaults } from '../../lib/flowWebhookConfig';
 
@@ -189,15 +188,11 @@ export function NodeSelectionModal({
       setTriggerConfig(createWebhookTriggerDefaults(window.location.origin));
     } else if (triggerId === 'schedule') {
       setTriggerConfig({
-        type: 'schedule',
-        intervalType: 'hours',
-        interval: 1
+        type: 'schedule'
       });
     } else if (triggerId === 'doc-event') {
       setTriggerConfig({
-        type: 'doc-event',
-        doctype: '',
-        event: 'save'
+        type: 'doc-event'
       });
     } else if (triggerId.includes('gmail') || triggerId.includes('slack')) {
       setTriggerConfig({
@@ -337,101 +332,12 @@ export function NodeSelectionModal({
       );
     }
 
-    if (config.type === 'schedule') {
+    if (config.type === 'schedule' || config.type === 'doc-event') {
       return (
-        <div className="space-y-4 mt-4">
-          <div>
-            <Label htmlFor="interval-type">Schedule type</Label>
-            <Select
-              value={config.intervalType}
-              onValueChange={(value) =>
-                setTriggerConfig({ ...config, intervalType: value as ScheduleIntervalType })
-              }
-            >
-              <SelectTrigger id="interval-type">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="minutes">Minutes</SelectItem>
-                <SelectItem value="hours">Hours</SelectItem>
-                <SelectItem value="days">Days</SelectItem>
-                <SelectItem value="custom">Custom (cron)</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          {config.intervalType !== 'custom' && (
-            <div>
-              <Label htmlFor="interval">Interval</Label>
-              <Input
-                id="interval"
-                type="number"
-                min="1"
-                value={config.interval || 1}
-                onChange={(e) =>
-                  setTriggerConfig({ ...config, interval: parseInt(e.target.value) })
-                }
-              />
-            </div>
-          )}
-          {config.intervalType === 'custom' && (
-            <div>
-              <Label htmlFor="cron">Cron expression</Label>
-              <Input
-                id="cron"
-                value={config.cronExpression || ''}
-                onChange={(e) =>
-                  setTriggerConfig({ ...config, cronExpression: e.target.value })
-                }
-                placeholder="0 */6 * * *"
-              />
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    if (config.type === 'doc-event') {
-      const comboboxOptions = docTypes.map((dt) => ({
-        value: dt.name,
-        label: dt.name,
-      }));
-
-      return (
-        <div className="space-y-4 mt-4">
-          <div>
-            <Label htmlFor="doctype">Document type</Label>
-            <Combobox
-              options={comboboxOptions}
-              value={config.doctype || ''}
-              onValueChange={(value) => setTriggerConfig({ ...config, doctype: value })}
-              placeholder={loadingDocTypes ? 'Loading...' : 'Select DocType...'}
-              disabled={loadingDocTypes}
-              searchPlaceholder="Search DocType..."
-              emptyText="No DocType found."
-            />
-          </div>
-          <div>
-            <Label htmlFor="event">Event type</Label>
-            <Select
-              value={config.event}
-              onValueChange={(value) =>
-                setTriggerConfig({ ...config, event: value as DocEventType })
-              }
-            >
-              <SelectTrigger id="event">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="save">Save</SelectItem>
-                <SelectItem value="update">Update</SelectItem>
-                <SelectItem value="delete">Delete</SelectItem>
-                <SelectItem value="before-save">Before save</SelectItem>
-                <SelectItem value="before-update">Before update</SelectItem>
-                <SelectItem value="before-delete">Before delete</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
+        <p className="mt-4 text-sm text-muted-foreground">
+          Add the node, then set the {config.type === 'schedule' ? 'schedule' : 'document event'} in the
+          sidebar. It is saved as an Automation on the flow's Procedure once the flow is saved.
+        </p>
       );
     }
 

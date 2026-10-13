@@ -62,14 +62,23 @@ export interface WebhookTriggerConfig {
 
 export interface ScheduleTriggerConfig {
   type: 'schedule';
-  intervalType: ScheduleIntervalType;
+  /**
+   * The schedule itself lives in the backend (set_flow_trigger / get_flow_trigger), edited in
+   * FlowTriggerPanel. The fields below are legacy display-only values the runtime ignores.
+   * @deprecated
+   */
+  intervalType?: ScheduleIntervalType;
+  /** @deprecated display-only, ignored by the runtime */
   interval?: number;
+  /** @deprecated display-only, ignored by the runtime */
   cronExpression?: string;
+  /** @deprecated display-only, ignored by the runtime */
   timezone?: string;
 }
 
 export interface DocEventTriggerConfig {
   type: 'doc-event';
+  /** Doc-event settings live in the backend (set_flow_trigger); these are display-only legacy values. */
   doctype?: string;
   event?: DocEventType;
 }
