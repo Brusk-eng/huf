@@ -9,8 +9,8 @@ import {
   buildTemplatePayload,
   createTemplate,
   createTemplateDraft,
-  listConversations,
-  listMessages,
+  listMessageLog,
+  listMessageLogFilters,
   listTemplateDrafts,
   listTemplates,
   sendTemplateMessage,
@@ -155,8 +155,8 @@ describe('gateway-scoped calls', () => {
   });
 
   it('always names the gateway for lists, so the server never lists across accounts', async () => {
-    await listMessages('GW-A', '15551234567', 20);
-    await listConversations('GW-A');
+    await listMessageLog('GW-A', { phone: '15551234567' });
+    await listMessageLogFilters('GW-A');
     await listTemplates('GW-A', 'APPROVED');
     await listTemplateDrafts('GW-A');
     const args = get.mock.calls.map((c) => c[1] as Record<string, unknown>);

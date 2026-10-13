@@ -38,6 +38,8 @@ export interface GatewayStatus {
   name: string;
   enabled: boolean;
   whatsapp_account?: string | null;
+  phone_number_id?: string;
+  fallback_template?: string | null;
   app_secret_present: boolean;
   app_secret_missing: boolean;
   verify_token_present: boolean;
@@ -128,27 +130,6 @@ export interface TemplateDraft {
   submitted_template?: string;
   submit_error?: string;
   creation?: string | null;
-}
-
-export interface WhatsAppMessage {
-  name: string;
-  type?: 'Incoming' | 'Outgoing' | string;
-  to?: string;
-  from?: string;
-  message?: string;
-  message_id?: string;
-  content_type?: string;
-  status?: string;
-  creation?: string;
-  whatsapp_account?: string;
-  profile_name?: string;
-}
-
-export interface WhatsAppConversation {
-  phone: string;
-  last_message: WhatsAppMessage;
-  count: number;
-  profile_name?: string | null;
 }
 
 export const TEMPLATE_LIMITS = { body: 1024, header: 60, footer: 60, button: 25, quickReplies: 3, cta: 2 } as const;
@@ -486,12 +467,6 @@ export const sendTemplateMessage = (args: {
 export const sendTextMessage = (gatewayName: string, to: string, text: string) =>
   invoke<Record<string, unknown>>('send_text_message', { gateway_name: gatewayName, to, text }, 'post');
 
-export const listMessages = (gatewayName: string, phone?: string, limit = 50) =>
-  invoke<{ messages: WhatsAppMessage[] }>('list_messages', { gateway_name: gatewayName, phone, limit }, 'get');
-
-export const listConversations = (gatewayName: string, limit = 50) =>
-  invoke<{ conversations: WhatsAppConversation[] }>('list_conversations', { gateway_name: gatewayName, limit }, 'get');
-
 export const sendMediaMessage = (
   gatewayName: string,
   to: string,
@@ -523,3 +498,55 @@ export async function uploadPublicFile(f: File): Promise<{ fileUrl: string } | W
     return { success: false, error: 'upload_failed', message: getFrappeErrorMessage(err) };
   }
 }
+
+export type MessageDirection = 'in' | 'out';
+export type MessageSentBy = 'agent' | 'template' | 'manual' | 'customer';
+
+export interface MessageLogItem {
+  name: string;
+  message_id: string | null;
+  direction: MessageDirection;
+  phone: string;
+  profile_name: string | null;
+  content_type: string | null;
+  text: string | null;
+  status: string | null;
+  error: string | null;
+  template: string | null;
+  creation: string;
+  gateway: string;
+  agent: string | null;
+  agent_run: string | null;
+  event: string | null;
+  sent_by: MessageSentBy | null;
+}
+
+export interface MessageLogQuery {
+  direction?: MessageDirection;
+  status?: string;
+  agent?: string;
+  template?: string;
+  phone?: string;
+  q?: string;
+  date_from?: string;
+  date_to?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface MessageLogFilterOptions {
+  agents: { name: string; title: string }[];
+  templates: string[];
+  statuses: string[];
+  directions: string[];
+}
+
+export const listMessageLog = (gatewayName: string, query: MessageLogQuery = {}) =>
+  invoke<{ items: MessageLogItem[]; next_cursor: string | null; has_more: boolean }>(
+    'list_message_log',
+    { gateway_name: gatewayName, limit: 50, ...query },
+    'get',
+  );
+
+export const listMessageLogFilters = (gatewayName: string) =>
+  invoke<MessageLogFilterOptions>('list_message_log_filters', { gateway_name: gatewayName }, 'get');
