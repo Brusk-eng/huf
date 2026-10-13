@@ -14,6 +14,15 @@ function Check({ ok, label }: { ok: boolean; label: string }) {
   );
 }
 
+const CHECK_LABELS: Record<string, string> = {
+  app_secret_missing: 'The app secret is not set, so incoming messages cannot be verified until you add it.',
+  webhook_verify_token_missing: 'The verification token is not set, so Meta cannot confirm this webhook until you add it.',
+};
+
+function checkLabel(code: string): string {
+  return CHECK_LABELS[code] ?? 'A setup check is failing for this gateway.';
+}
+
 export function SetupTab({ status }: { status: SetupStatus }) {
   const copy = (url: string) => {
     navigator.clipboard
@@ -29,8 +38,8 @@ export function SetupTab({ status }: { status: SetupStatus }) {
         <StatusDot status={status.bridge_available ? 'healthy' : 'held'} />
         <p className="text-xs text-steel">
           {status.bridge_available
-            ? 'frappe_whatsapp is installed.'
-            : 'frappe_whatsapp is not installed; templates and messages are unavailable.'}
+            ? 'The WhatsApp Business app connector is installed.'
+            : 'The WhatsApp Business app connector is not installed; templates and messages are unavailable.'}
         </p>
       </section>
 
@@ -62,15 +71,15 @@ export function SetupTab({ status }: { status: SetupStatus }) {
               <span className="text-xs text-steel">{g.enabled ? 'Enabled' : 'Disabled'}</span>
             </div>
             <div className="flex flex-wrap gap-4">
-              <Check ok={!g.app_secret_missing} label="app_secret" />
-              <Check ok={g.verify_token_present} label="verify token" />
+              <Check ok={!g.app_secret_missing} label="App secret" />
+              <Check ok={g.verify_token_present} label="Verification token" />
               <span className="text-xs text-steel">Account: {g.whatsapp_account || 'none'}</span>
             </div>
-            {g.app_secret_missing && (
-              <p className="text-xs text-destructive">
-                app_secret_missing: inbound webhooks cannot be signature-verified until the app secret is set.
+            {(g.failing_checks ?? []).map((code) => (
+              <p key={code} className="text-xs text-destructive">
+                {checkLabel(code)}
               </p>
-            )}
+            ))}
             <div className="flex gap-2">
               <Input readOnly value={g.webhook_url} className="font-mono text-xs" aria-label={`Webhook URL for ${g.name}`} />
               <Button type="button" variant="outline" size="icon" onClick={() => copy(g.webhook_url)} aria-label="Copy webhook URL">

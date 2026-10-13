@@ -6,9 +6,8 @@ export function BridgeUnavailable() {
       <PlugZap className="h-6 w-6 text-steel" />
       <h3 className="text-sm font-semibold text-ink">WhatsApp bridge not available</h3>
       <p className="max-w-md text-xs text-steel">
-        Templates and message history need the optional <span className="font-mono">frappe_whatsapp</span> app
-        installed on this site. Install it, then reload. See{' '}
-        <span className="font-mono">docs/WHATSAPP_INTEGRATION_SETUP.md</span> for setup steps.
+        Templates and message history need the optional WhatsApp Business app connector installed on this site.
+        Install it, then reload. Ask your administrator if you are unsure how.
       </p>
     </div>
   );
