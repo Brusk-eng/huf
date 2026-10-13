@@ -9,8 +9,10 @@ the node's own executor returns ``{"status": "failed"}``. The three cases:
 
   (a) failing node, no outgoing edge  -> Flow Run ends ``Failed`` with ``last_error``.
   (b) failing node with ``on_error``  -> the on_failure edge is followed, run ``Success``.
-  (c) failing node with a ``next``    -> must NOT report ``Success`` as if the node
-      had succeeded (the ``always`` edge is not a success-only edge).
+  (c) failing node with a ``next``    -> run ends ``Failed`` (the ``always`` edge is
+      still followed, see (d), but does not handle the failure).
+  (d) the downstream cleanup node still executes, and the run is ``Failed``.
+  (e) failure handled by an ``on_failure`` edge -> run ``Success``.
 
 Run with:
     bench --site <site> run-tests --app huf --module huf.ai.tests.test_flow_failure_semantics
@@ -129,23 +131,29 @@ class TestFlowFailureSemantics(IntegrationTestCase):
 
 		self.assertEqual(flow_run.status, "Success", f"unexpected: {flow_run.last_error}")
 
-	@unittest.expectedFailure
 	def test_c_failed_node_with_normal_next_edge_does_not_report_success(self):
-		"""Known gap, not fixed here: ``_evaluate_edges`` deliberately takes an ``always``
-		edge from a FAILED node (pinned by test_flow_engine.TestEvaluateEdges), so the run
-		continues and ends Success with no last_error. Whether that is the intended Flow
-		contract is an open question; if it is decided it must fail, drop the decorator."""
 		"""(c) A failing node whose only outgoing edge is a normal ``next`` must not
 		end the run Success as if the node had succeeded."""
 		flow_run = self._run({"next": "after"}, ["after"])
 
-		self.assertNotEqual(
-			flow_run.status,
-			"Success",
-			"a failed node was followed through its normal next edge and the run reported Success",
-		)
+		self.assertEqual(flow_run.status, "Failed")
+		self.assertIn("fail", flow_run.last_error)
+		self.assertIn("simulated tool failure", flow_run.last_error)
+
+	def test_d_always_edge_runs_cleanup_but_run_is_failed(self):
+		"""(d) The always edge is still followed (cleanup runs) yet the run ends Failed."""
+		flow_run = self._run({"next": "after"}, ["after"])
+
+		self.assertEqual(flow_run.current_node_id, "after")
 		self.assertEqual(flow_run.status, "Failed")
 		self.assertTrue(flow_run.last_error)
+
+	def test_e_failure_handled_by_on_failure_edge_succeeds(self):
+		"""(e) A failure routed via an explicit on_failure edge is handled: run Success."""
+		flow_run = self._run({"on_error": "recover"}, ["recover"])
+
+		self.assertEqual(flow_run.current_node_id, "recover")
+		self.assertEqual(flow_run.status, "Success", f"unexpected: {flow_run.last_error}")
 
 
 if __name__ == "__main__":

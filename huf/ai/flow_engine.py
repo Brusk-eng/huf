@@ -588,13 +588,32 @@ def _build_program(nodes_map: dict, edges_list: list, settings) -> GraphProgram:
 	return GraphProgram(version, specs, version.graph.get("entry"), settings=dict(settings or {}))
 
 
-def _build_router(flow_run, settings, edges_list: list, state: ExecutionState) -> Router:
-	"""One routing path for every node type (structural knots 3 and 4)."""
+def _build_router(
+	flow_run, settings, edges_list: list, state: ExecutionState, unhandled_failures: list | None = None
+) -> Router:
+	"""One routing path for every node type (structural knots 3 and 4).
+
+	``unhandled_failures`` collects ``"<node id>: <error>"`` for every failed node whose
+	chosen successor is not one of its ``on_failure`` edges (an ``on_error`` target is
+	one), so the run can still end ``Failed`` after an ``always`` edge ran cleanup nodes.
+	"""
 	run_ctx = _run_context(settings)
 	is_agentic = (run_ctx.mode if run_ctx is not None else "normal") == "agentic"
 	orch_policy = (settings or {}).get("orchestrator_call_policy", "after_each_node")
 
 	def default_resolver(node: NodeSpec, outcome: Outcome, context: GraphContext):
+		chosen = _resolve_default(node, outcome, context)
+		if outcome.status == "failed" and unhandled_failures is not None:
+			# No edge chosen -> the executor falls back to the node's ``on_error``.
+			handled = (chosen is None and bool(node.raw.get("on_error"))) or any(
+				e.get("from") == node.id and e.get("to") == chosen and e.get("type") == "on_failure"
+				for e in edges_list
+			)
+			if not handled:
+				unhandled_failures.append(f"Node '{node.id}' failed: {outcome.error or 'unknown error'}")
+		return chosen
+
+	def _resolve_default(node: NodeSpec, outcome: Outcome, context: GraphContext):
 		node_result = outcome.extra or {"status": outcome.status}
 		if is_agentic and _should_call_orchestrator(orch_policy, state.completed_nodes):
 			candidates = _get_outgoing_edges(node.id, edges_list)
@@ -705,7 +724,8 @@ def _execute_loop(flow_run, nodes_map: dict, edges_list: list, settings: dict):
 	"""
 	program = _build_program(nodes_map, edges_list, settings)
 	state = _flow_state(flow_run)
-	router = _build_router(flow_run, settings, edges_list, state)
+	unhandled_failures: list = []
+	router = _build_router(flow_run, settings, edges_list, state, unhandled_failures)
 	handler = _make_node_handler(flow_run, settings)
 	handlers = {node_type: handler for node_type in _NODE_TYPES}
 
@@ -742,6 +762,13 @@ def _execute_loop(flow_run, nodes_map: dict, edges_list: list, settings: dict):
 	if result.status == ExecutionResult.FAILED:
 		_publish_flow_event(flow_run, "flow_error", {"error": result.error})
 		_fail_flow_run(flow_run, result.error)
+		return result
+
+	if unhandled_failures:
+		# A failure no on_failure/on_error route handled: cleanup nodes may have run
+		# via an ``always`` edge, but the run is still Failed (first failure wins).
+		_publish_flow_event(flow_run, "flow_error", {"error": unhandled_failures[0]})
+		_fail_flow_run(flow_run, unhandled_failures[0])
 		return result
 
 	_complete_flow_run(flow_run)
