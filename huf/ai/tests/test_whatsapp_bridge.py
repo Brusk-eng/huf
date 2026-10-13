@@ -401,7 +401,10 @@ class TestBridge(unittest.TestCase):
 			frappe.db, "get_value", side_effect=get_value
 		), patch.object(frappe.db, "set_value") as sv, patch.object(wb, "_import_template", return_value="zz-en_US") as imp:
 			res = wb.sync_templates("ACC", http_get=http_get)
-		self.assertEqual(res, {"success": True, "seen": 3, "imported": 1, "updated": 1, "unchanged": 1, "skipped": 0})
+		self.assertEqual(
+			res,
+			{"success": True, "seen": 3, "imported": 1, "updated": 1, "unchanged": 1, "skipped": 0, "skipped_reasons": []},
+		)
 		self.assertEqual(calls[0][0], "https://graph.facebook.com/v25.0/BIZ/message_templates")
 		self.assertEqual(calls[0][1]["headers"]["Authorization"], "Bearer tok")
 		sv.assert_called_once_with("WhatsApp Templates", "T1", {"status": "APPROVED"})
@@ -409,6 +412,62 @@ class TestBridge(unittest.TestCase):
 		self.assertEqual(imp.call_args.args[1]["name"], "zz")
 		with avail(False):
 			self.assertEqual(wb.sync_templates("ACC")["error"], "bridge_unavailable")
+
+	def test_sync_templates_isolates_overflowing_template(self):
+		long_cdn = "https://scontent.xx.fbcdn.net/v/t39/sample.jpg?" + "oh=" + "a" * 180
+		inserted = []
+
+		class Doc:
+			doctype = "WhatsApp Templates"
+
+			def __init__(self):
+				self.rows = []
+
+			def append(self, field, row):
+				self.rows.append(SimpleNamespace(db_insert=lambda: None, **row))
+
+			def get(self, field):
+				return self.rows
+
+			def db_insert(self):
+				inserted.append(self.template_name)
+
+		def button_components(url, example):
+			btn = {"type": "URL", "text": "Go", "url": url}
+			if example:
+				btn["example"] = [example]
+			return [{"type": "BUTTONS", "buttons": [btn]}]
+
+		def http_get(url, **kw):
+			return FakeResp({"data": [
+				# good: Meta sample link is too long for example_url, so it is dropped and the template imports
+				{"name": "good", "language": "en_US", "status": "APPROVED", "category": "UTILITY", "id": "1",
+				 "components": [{"type": "BODY", "text": "Hi"}] + button_components("https://x.io/static", long_cdn)},
+				# bad: dynamic base URL overflows website_url, which is needed to send, so it is skipped
+				{"name": "bad", "language": "en_US", "status": "APPROVED", "category": "UTILITY", "id": "2",
+				 "components": [{"type": "BODY", "text": "Yo"}] + button_components("https://x.io/" + "b" * 200 + "/{{1}}", None)},
+			]})
+
+		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
+			wb, "resolve_account", return_value=ACCT
+		), patch.object(frappe.db, "exists", return_value=False), patch.object(
+			wb, "_local_template", return_value=None
+		), patch.object(frappe, "new_doc", side_effect=lambda dt: Doc()), patch.object(
+			frappe.utils, "now", return_value="2026-01-01 00:00:00"
+		), patch.object(wb, "_language_link", return_value="en"), patch.object(
+			frappe.db, "savepoint"
+		) as sp, patch.object(frappe.db, "rollback") as rb:
+			res = wb.sync_templates("ACC", http_get=http_get)
+		self.assertTrue(res["success"])
+		self.assertEqual((res["seen"], res["imported"], res["skipped"]), (2, 1, 1))
+		self.assertEqual(inserted, ["good"])
+		self.assertEqual(len(res["skipped_reasons"]), 1)
+		reason = res["skipped_reasons"][0]
+		self.assertTrue(reason.startswith("bad: import failed"))
+		self.assertIn("website_url", reason)
+		self.assertNotIn("https://", reason)
+		self.assertEqual(sp.call_count, 2)  # one savepoint per import attempt
+		rb.assert_called_once()  # only the failing one is rolled back
 
 	def test_import_template_maps_components_without_hooks(self):
 		class Doc:

@@ -62,6 +62,10 @@ _HTTP_TIMEOUT = 15
 _MEDIA_HOST_SUFFIXES = ("fbcdn.net", "facebook.com", "whatsapp.net", "fbsbx.com")
 _SECRET_QS_RE = re.compile(r"(?i)((?:access_)?token=)[^&\s\"'<>]+")
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+# Frappe ``Data`` columns default to varchar(140); Meta example/CDN URLs can exceed it.
+_DATA_COLUMN_LEN = 140
+_TEMPLATE_DATA_FIELDS = ("template_name", "actual_name", "language_code", "header", "footer", "id", "status", "category")
+_BUTTON_DATA_FIELDS = ("button_label", "phone_number", "website_url")
 
 
 def _redact(text: Any) -> str:
@@ -934,9 +938,21 @@ def _import_template(account_name: str, tpl: dict[str, Any]) -> str:
 					row["url_type"] = "Dynamic" if "{{" in str(btn.get("url") or "") else "Static"
 					if btn.get("example"):
 						row["example_url"] = ",".join(btn["example"])
+						if len(row["example_url"]) > _DATA_COLUMN_LEN:
+							# Meta sample link (often a long signed CDN URL): not needed to send, so dropped
+							row.pop("example_url")
 				elif btn.get("type") == "PHONE_NUMBER":
 					row["phone_number"] = btn.get("phone_number")
 				doc.append("buttons", row)
+	# validate before any insert so an overflowing template never leaves a half-written parent row
+	checks = [("WhatsApp Templates", _TEMPLATE_DATA_FIELDS, [doc])]
+	checks.append(("WhatsApp Button", _BUTTON_DATA_FIELDS, list(doc.get("buttons") or [])))
+	for dt, fieldnames, docs in checks:
+		for row_doc in docs:
+			for fieldname in fieldnames:
+				value = getattr(row_doc, fieldname, None)
+				if value is not None and len(str(value)) > _DATA_COLUMN_LEN:
+					raise ValueError(f"{dt}.{fieldname} exceeds {_DATA_COLUMN_LEN} characters")
 	now = frappe.utils.now()
 	user = frappe.session.user
 	doc.owner = doc.modified_by = user
@@ -956,7 +972,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 
 	Templates that exist on Meta but not locally are IMPORTED (inserted without the
 	frappe_whatsapp ``after_insert`` push, so nothing is POSTed to Meta); existing rows only
-	get status/category/id refreshed. Returns ``imported``/``updated``/``unchanged`` counts (``skipped``: no language, or the docname belongs to another account).
+	get status/category/id refreshed. Returns ``imported``/``updated``/``unchanged`` counts; ``skipped`` counts templates that could not be imported (no language, docname collision, or a per-template failure) with redacted ``skipped_reasons``. Meta sample URLs longer than the column are dropped, not failed.
 	"""
 	if not is_available():
 		return _err("bridge_unavailable")
@@ -969,6 +985,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 	url = f"{acct['url']}/{acct['version']}/{acct['business_id']}/message_templates"
 	headers = {"Authorization": f"Bearer {acct['token']}"}
 	imported = updated = unchanged = skipped = seen = 0
+	skipped_reasons: list[str] = []
 	params: dict[str, Any] | None = {"limit": 100}
 	try:
 		while url:
@@ -979,27 +996,41 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 				seen += 1
 				if not tpl.get("name"):
 					continue
-				name = _local_template(account_name, tpl["name"], str(tpl.get("language") or ""))
-				if not name:
-					language = str(tpl.get("language") or "")
-					# docname is <name>-<language> and unique site-wide: skip what cannot be named or collides
-					if not language or frappe.db.exists("WhatsApp Templates", f"{tpl['name']}-{language}"):
-						skipped += 1
+				# one template's failure must not fail the whole sync: count it and continue
+				try:
+					name = _local_template(account_name, tpl["name"], str(tpl.get("language") or ""))
+					if not name:
+						language = str(tpl.get("language") or "")
+						# docname is <name>-<language> and unique site-wide: skip what cannot be named or collides
+						if not language or frappe.db.exists("WhatsApp Templates", f"{tpl['name']}-{language}"):
+							skipped += 1
+							skipped_reasons.append(_redact(f"{tpl['name']}: no language or name collision"))
+							continue
+						sp = f"wa_import_{seen}"
+						frappe.db.savepoint(sp)
+						try:
+							_import_template(account_name, tpl)
+						except Exception as exc:
+							frappe.db.rollback(save_point=sp)
+							skipped += 1
+							skipped_reasons.append(_redact(f"{tpl['name']}: import failed ({type(exc).__name__}: {exc})"))
+							continue
+						imported += 1
 						continue
-					_import_template(account_name, tpl)
-					imported += 1
-					continue
-				current = frappe.db.get_value("WhatsApp Templates", name, ["status", "category", "id"], as_dict=True) or {}
-				changes = {
-					k: tpl.get(k)
-					for k in ("status", "category", "id")
-					if tpl.get(k) is not None and tpl.get(k) != current.get(k)
-				}
-				if changes:
-					frappe.db.set_value("WhatsApp Templates", name, changes)
-					updated += 1
-				else:
-					unchanged += 1
+					current = frappe.db.get_value("WhatsApp Templates", name, ["status", "category", "id"], as_dict=True) or {}
+					changes = {
+						k: tpl.get(k)
+						for k in ("status", "category", "id")
+						if tpl.get(k) is not None and tpl.get(k) != current.get(k)
+					}
+					if changes:
+						frappe.db.set_value("WhatsApp Templates", name, changes)
+						updated += 1
+					else:
+						unchanged += 1
+				except Exception as exc:
+					skipped += 1
+					skipped_reasons.append(_redact(f"{tpl.get('name')}: {type(exc).__name__}: {exc}"))
 			next_url = (data.get("paging") or {}).get("next")
 			if next_url:
 				nxt, base = urlparse(str(next_url)), urlparse(acct["url"])
@@ -1009,7 +1040,15 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 			params = None
 	except Exception as exc:
 		return _err("sync_failed", message=_redact(exc))
-	return {"success": True, "seen": seen, "imported": imported, "updated": updated, "unchanged": unchanged, "skipped": skipped}
+	return {
+		"success": True,
+		"seen": seen,
+		"imported": imported,
+		"updated": updated,
+		"unchanged": unchanged,
+		"skipped": skipped,
+		"skipped_reasons": skipped_reasons,
+	}
 
 
 def forward_status(change: dict[str, Any], _retry: bool = False) -> bool:
