@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -11,8 +11,9 @@ import {
 import { TemplatePreview } from './TemplatePreview';
 import { rowToPreviewInput } from './templateModel';
 
-export function SendTemplateDialog({ template, onClose, gateway }: { template: WhatsAppTemplate | null; onClose: () => void; gateway?: string }) {
-  const [to, setTo] = useState('');
+export function SendTemplateDialog({ template, onClose, gateway, initialTo = '' }: { template: WhatsAppTemplate | null; onClose: () => void; gateway?: string; initialTo?: string }) {
+  const [to, setTo] = useState(initialTo);
+  useEffect(() => { if (template) setTo(initialTo); }, [template, initialTo]);
   const [params, setParams] = useState<string[]>([]);
   const [headerValue, setHeaderValue] = useState('');
   const [urlSuffixes, setUrlSuffixes] = useState<Record<number, string>>({});
@@ -47,7 +48,7 @@ export function SendTemplateDialog({ template, onClose, gateway }: { template: W
     setBusy(false);
     if (res.success) {
       toast.success('Template sent');
-      setTo(''); setParams([]); setHeaderValue(''); setUrlSuffixes({});
+      setParams([]); setHeaderValue(''); setUrlSuffixes({});
       onClose();
     } else setErr(errorText(res));
   };
