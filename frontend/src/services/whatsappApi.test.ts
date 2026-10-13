@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest';
 import {
+  buildEditPayload,
   buildTemplatePayload,
+  templateNameProblem,
   errorText,
   extractPlaceholders,
   isBridgeUnavailable,
@@ -17,20 +19,24 @@ describe('whatsappApi helpers', () => {
   });
 
   it('validates template forms', () => {
-    const ok = { name: 'order_update', language: 'en_US', body: 'Hi {{1}}', samples: ['Ann'] };
+    const ok = { name: 'order_update', language: 'en_US', body: 'Hi {{1}}, welcome', samples: ['Ann'] };
     expect(validateTemplateForm(ok)).toBeNull();
-    expect(validateTemplateForm({ ...ok, name: 'Bad Name' })).toMatch(/Name/);
+    expect(validateTemplateForm({ ...ok, name: 'Bad Name' })).toMatch(/lowercase/);
     expect(validateTemplateForm({ ...ok, body: 'Hi {{2}}' })).toMatch(/Placeholders/);
     expect(validateTemplateForm({ ...ok, samples: [''] })).toMatch(/sample/);
     expect(validateTemplateForm({ ...ok, body: ' ' })).toMatch(/Body/);
+    expect(validateTemplateForm({ ...ok, body: '{{1}} is here' })).toMatch(/start with a variable/);
+    expect(validateTemplateForm({ ...ok, body: 'Hi {{1}}' })).toMatch(/end with a variable/);
+    expect(templateNameProblem('Bad Name')).toMatch(/lowercase/);
+    expect(templateNameProblem('order_update')).toBeNull();
   });
 
   it('builds payload, dropping empty optionals', () => {
     const p = buildTemplatePayload({
-      name: 'a_b', category: 'UTILITY', language: 'en_US', body: 'Hi {{1}}', header: ' ', footer: 'Bye', samples: ['Ann', 'x'],
+      name: 'a_b', category: 'UTILITY', language: 'en_US', body: 'Hi {{1}}, welcome', header: ' ', footer: 'Bye', samples: ['Ann', 'x'],
     });
     expect(p).toEqual({
-      template_name: 'a_b', category: 'UTILITY', language_code: 'en_US', template: 'Hi {{1}}', footer: 'Bye', sample_values: 'Ann',
+      template_name: 'a_b', category: 'UTILITY', language_code: 'en_US', template: 'Hi {{1}}, welcome', footer: 'Bye', sample_values: 'Ann',
     });
   });
 
@@ -43,7 +49,7 @@ describe('whatsappApi helpers', () => {
   });
 
   describe('rich templates', () => {
-    const base = { name: 'order_update', language: 'en_US', body: 'Hi {{1}}', samples: ['Ann'] };
+    const base = { name: 'order_update', language: 'en_US', body: 'Hi {{1}}, welcome', samples: ['Ann'] };
 
     it('validates headers against Meta limits', () => {
       expect(validateTemplateForm({ ...base, headerType: 'TEXT', header: 'Order {{1}}', headerSample: 'A-1' })).toBeNull();
@@ -115,5 +121,17 @@ describe('whatsappApi helpers', () => {
     expect(validateMediaSend({ kind: 'image', link: 'https://x.example/a.png', caption: 'hi' })).toBeNull();
     expect(validateMediaSend({ kind: 'audio', link: 'https://x.example/a.mp3', caption: 'no' })).toMatch(/caption/);
     expect(validateMediaSend({ kind: 'document', fileUrl: '/files/a.pdf' })).toBeNull();
+  });
+
+  it('builds an edit payload that clears removed parts and drops name/language', () => {
+    const p = buildEditPayload({ name: 'a_b', category: 'UTILITY', language: 'en_US', body: 'Hi there', samples: [] });
+    expect(p).toEqual({ category: 'UTILITY', template: 'Hi there', header_type: '', footer: '', buttons: [], sample_values: '' });
+  });
+
+  it('keeps an existing media header when editing without a new sample', () => {
+    const f = { name: 'a_b', category: 'UTILITY' as const, language: 'en_US', body: 'Hi there', samples: [], headerType: 'IMAGE' as const, keepExistingMedia: true };
+    expect(validateTemplateForm(f)).toBeNull();
+    expect('header_type' in buildEditPayload(f)).toBe(false);
+    expect(validateTemplateForm({ ...f, keepExistingMedia: false })).toMatch(/sample file/);
   });
 });

@@ -4,6 +4,7 @@ import { getFrappeErrorMessage } from '@/lib/frappe-error';
 const BASE = 'huf.ai.whatsapp_management';
 
 export const TEMPLATE_NAME_RE = /^[a-z0-9_]+$/;
+export const TEMPLATE_NAME_MAX = 512;
 export const TEMPLATE_CATEGORIES = ['MARKETING', 'UTILITY'] as const;
 export type TemplateCategory = (typeof TEMPLATE_CATEGORIES)[number];
 
@@ -21,6 +22,9 @@ export interface WhatsAppError {
   expires_at?: string | null;
   /** Present for `validation_failed`: every problem found, per field. */
   errors?: FieldError[];
+  /** Draft approval: the status the draft ended in and why Meta refused it. */
+  status?: string;
+  submit_error?: string;
 }
 export type WhatsAppResult<T> = ({ success: true } & T) | WhatsAppError;
 
@@ -65,6 +69,65 @@ export interface WhatsAppTemplate {
   footer?: string;
   sample_values?: string;
   buttons?: { button_type: string; button_label?: string; url_type?: string; website_url?: string; phone_number?: string }[];
+  rejected_reason?: string;
+  quality_score?: string;
+  correct_category?: string;
+  category_change_pending?: boolean;
+  last_meta_update?: string | null;
+}
+
+export interface TemplateDetail {
+  name: string;
+  template_id: string;
+  template_name: string;
+  language_code: string;
+  category: string;
+  correct_category: string;
+  category_change_pending: boolean;
+  status: string;
+  whatsapp_account?: string;
+  components: {
+    header: { type: HeaderType; text: string; sample: string } | null;
+    body: { text: string; sample_values: string[] };
+    footer: { text: string } | null;
+    buttons: TemplateButton[];
+  };
+  state: {
+    rejected_reason: string;
+    rejection_recommendation: string;
+    other_info: string;
+    quality_score: string;
+    last_event: string;
+    last_event_at: string | null;
+    last_meta_update: string | null;
+  };
+  editable: boolean;
+  editable_reason?: string;
+  editable_message?: string;
+  edits_left?: number | null;
+  next_edit_at?: string | null;
+  manager_url: string;
+  business_id: string;
+}
+
+export type DraftStatus = 'Draft' | 'Pending Review' | 'Failed' | 'Approved & Submitted' | 'Rejected';
+export interface TemplateDraft {
+  name: string;
+  template_name: string;
+  language_code: string;
+  category: string;
+  whatsapp_account?: string;
+  status: DraftStatus | string;
+  payload: Partial<TemplatePayload>;
+  requested_by?: string;
+  requested_via?: 'User' | 'Agent run' | string;
+  agent_run?: string;
+  reviewed_by?: string;
+  reviewed_at?: string | null;
+  review_note?: string;
+  submitted_template?: string;
+  submit_error?: string;
+  creation?: string | null;
 }
 
 export interface WhatsAppMessage {
@@ -117,6 +180,10 @@ export interface TemplatePayload {
   buttons?: TemplateButton[];
 }
 
+export type EditTemplatePayload = Omit<TemplatePayload, 'template_name' | 'language_code' | 'header_type'> & {
+  header_type?: HeaderType | '';
+};
+
 export type HeaderParam = string | { type: 'image' | 'document' | 'video'; link: string; filename?: string };
 export interface ButtonParam {
   index: number;
@@ -164,6 +231,13 @@ export function errorText(res: WhatsAppError): string {
     invalid_recipient: 'Enter a phone number with 7 to 15 digits.',
     invalid_name: 'Template name may only contain lowercase letters, digits and underscores.',
     template_in_use: 'This template has been used in sent messages and cannot be deleted.',
+    not_found: 'This template or draft no longer exists.',
+    already_processed: 'This draft has already been handled.',
+    immutable_field: 'The name and language of a template cannot be changed.',
+    edit_limit_24h: 'Approved templates can be edited once every 24 hours.',
+    edit_limit_30d: 'The edit limit for the last 30 days has been used up.',
+    status_not_editable: 'This template cannot be edited in its current state.',
+    no_template_id: 'This template is not linked to WhatsApp yet. Sync templates first.',
   };
   if (res.errors?.length) return res.errors.map((e) => e.message).join(' ');
   return res.message || map[res.error] || res.error;
@@ -187,15 +261,37 @@ export interface TemplateForm {
   headerSample?: string;
   footer?: string;
   buttons?: TemplateButton[];
+  /** Edit mode: a media header with no new sample keeps the file already on the template. */
+  keepExistingMedia?: boolean;
+}
+
+/** WhatsApp rejects a body that starts or ends with a variable. */
+export function bodyVariableEdgeProblem(body: string): string | null {
+  const text = body.trim();
+  if (/^\{\{\s*\d+\s*\}\}/.test(text)) return 'The message cannot start with a variable. Add some text before {{1}}.';
+  if (/\{\{\s*\d+\s*\}\}$/.test(text)) return 'The message cannot end with a variable. Add some text after the last variable.';
+  return null;
+}
+
+/** Live check of the template name; empty string means nothing to say yet. */
+export function templateNameProblem(name: string): string | null {
+  if (!name) return null;
+  if (!TEMPLATE_NAME_RE.test(name)) return 'Use only lowercase letters, digits and underscores.';
+  if (name.length > TEMPLATE_NAME_MAX) return `Names are limited to ${TEMPLATE_NAME_MAX} characters.`;
+  return null;
 }
 
 export function validateTemplateForm(f: TemplateForm): string | null {
-  if (!TEMPLATE_NAME_RE.test(f.name)) return 'Name must match ^[a-z0-9_]+$';
+  if (!f.name.trim()) return 'Name is required';
+  const nameProblem = templateNameProblem(f.name);
+  if (nameProblem) return nameProblem;
   if (!f.language.trim()) return 'Language is required';
   if (!f.body.trim()) return 'Body is required';
   if (f.body.length > TEMPLATE_LIMITS.body) return `Body is limited to ${TEMPLATE_LIMITS.body} characters`;
   const holes = extractPlaceholders(f.body);
   if (holes.some((n, i) => n !== i + 1)) return 'Placeholders must be numbered {{1}}, {{2}}, ... without gaps';
+  const edge = bodyVariableEdgeProblem(f.body);
+  if (edge) return edge;
   if (holes.length > 0 && f.samples.slice(0, holes.length).some((s) => !s.trim())) {
     return 'Provide a sample value for every placeholder';
   }
@@ -211,7 +307,10 @@ export function validateTemplateForm(f: TemplateForm): string | null {
     }
     if (headerHoles.length === 1 && !(f.headerSample ?? '').trim()) return 'Provide an example for the header variable';
   } else if (f.headerType === 'IMAGE' || f.headerType === 'DOCUMENT') {
-    if (!/^https?:\/\//.test((f.headerSample ?? '').trim())) return 'Provide an http(s) link to a sample file for the header';
+    const reuseExisting = f.keepExistingMedia && !(f.headerSample ?? '').trim();
+    if (!reuseExisting && !/^https?:\/\//.test((f.headerSample ?? '').trim())) {
+      return 'Provide an http(s) link to a sample file for the header';
+    }
   }
 
   const footer = f.footer ?? '';
@@ -279,6 +378,24 @@ export function buildTemplatePayload(f: TemplateForm & { category: TemplateCateg
   return payload;
 }
 
+/**
+ * Payload for editing an existing template: name and language are left out, and
+ * cleared optional parts are sent empty so the server drops them.
+ */
+export function buildEditPayload(f: TemplateForm & { category: TemplateCategory }): EditTemplatePayload {
+  const base = buildTemplatePayload(f);
+  const rest: Partial<TemplatePayload> = { ...base };
+  delete rest.template_name;
+  delete rest.language_code;
+  const out = { ...rest, header_type: rest.header_type ?? '', footer: rest.footer ?? '', buttons: rest.buttons ?? [] } as EditTemplatePayload;
+  if (f.keepExistingMedia && (f.headerType === 'IMAGE' || f.headerType === 'DOCUMENT') && !f.headerSample?.trim()) {
+    delete out.header_type;
+    delete out.sample;
+  }
+  if (!rest.sample_values) out.sample_values = '';
+  return out;
+}
+
 /** Validate an outbound media send before calling the server. */
 export function validateMediaSend(f: { kind: MediaKind; link?: string; fileUrl?: string; caption?: string }): string | null {
   if (!f.link?.trim() && !f.fileUrl) return 'Add a file or paste a public link';
@@ -292,7 +409,40 @@ export const getSetupStatus = (gatewayName?: string) =>
   invoke<SetupStatus>('get_setup_status', gatewayName ? { gateway_name: gatewayName } : {}, 'get');
 
 export const listTemplates = (account?: string, status?: string) =>
-  invoke<{ templates: WhatsAppTemplate[] }>('list_templates', { account, status }, 'get');
+  invoke<{ templates: WhatsAppTemplate[]; manager_url?: string; business_id?: string }>(
+    'list_templates',
+    { account, status },
+    'get',
+  );
+
+export const getTemplate = (name: string) => invoke<TemplateDetail>('get_template', { name }, 'get');
+
+export const editTemplate = (name: string, payload: EditTemplatePayload) =>
+  invoke<{ name: string; status?: string; edits_left?: number | null }>(
+    'edit_template',
+    { name, payload: JSON.stringify(payload) },
+    'post',
+  );
+
+export const listTemplateDrafts = (status?: string) =>
+  invoke<{ drafts: TemplateDraft[] }>('list_template_drafts', { status }, 'get');
+
+export const createTemplateDraft = (account: string | undefined, payload: TemplatePayload) =>
+  invoke<{ name: string; status: string; draft: TemplateDraft }>(
+    'create_template_draft',
+    { account, payload: JSON.stringify(payload) },
+    'post',
+  );
+
+export const approveTemplateDraft = (name: string, note?: string) =>
+  invoke<{ name: string; status: string; submitted_template?: string; submit_error?: string }>(
+    'approve_template_draft',
+    { name, note },
+    'post',
+  );
+
+export const rejectTemplateDraft = (name: string, note?: string) =>
+  invoke<{ name: string; status: string }>('reject_template_draft', { name, note }, 'post');
 
 export const createTemplate = (account: string | undefined, payload: TemplatePayload) =>
   invoke<{ name: string; status?: string; id?: string }>(
