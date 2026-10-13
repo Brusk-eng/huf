@@ -1069,7 +1069,10 @@ def list_flow_tools() -> list:
 	# any conversion code in the app and is treated as stale/unused here.
 	for row in frappe.get_all(
 		"Agent Tool Function",
-		 fields=["name", "tool_name", "description", "params"],
+		fields=["name", "tool_name", "description", "params"],
+		# Flow/Procedure runs have no Agent Execution Profile, so a Code Execution tool is
+		# refused on every call (PermissionAwareToolRegistry._allows_code_execution); don't offer it.
+		filters={"types": ["!=", "Code Execution"]},
 	):
 		params_json_schema = {}
 		if row.params:

@@ -645,3 +645,20 @@ class TestLegacyFlowScheduleCleanup(_Base):
 			frappe.delete_doc("Scheduled Job Type", keep.name, force=1, ignore_permissions=True)
 			if frappe.db.exists("Scheduled Job Type", doc.name):
 				frappe.delete_doc("Scheduled Job Type", doc.name, force=1, ignore_permissions=True)
+
+
+class TestListFlowToolsHidesCodeExecution(_Base):
+	def test_code_execution_tools_not_offered(self):
+		from huf.ai.tests.factories import make_agent_tool_function
+
+		docs = {
+			"code": make_agent_tool_function(types="Code Execution"),
+			"plain": make_agent_tool_function(),
+		}
+		try:
+			offered = {t["name"] for t in flow_api.list_flow_tools()}
+			self.assertNotIn(docs["code"].tool_name, offered)
+			self.assertIn(docs["plain"].tool_name, offered)
+		finally:
+			for doc in docs.values():
+				frappe.delete_doc("Agent Tool Function", doc.name, force=1, ignore_permissions=True)
