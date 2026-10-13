@@ -22,14 +22,24 @@ settings fails closed (flag off).
 
 * ``allow_proactive``: permits free-form ``send_message`` to a number with no
   open 24h customer-service window (see below).
-* ``allow_whatsapp_management``: permits ``create_template``, and also
-  permits proactive free-form sends.
+* ``allow_whatsapp_management``: permits ``create_template`` (only this
+  flag; ``allow_proactive`` does not), and also permits proactive free-form
+  sends.
+
+Credentials (``access_token``, ``phone_number_id``) are never tool
+parameters: tool arguments are persisted in Agent Tool Call, so any such
+keys supplied in a call are popped and discarded.
 
 A free-form ``send_message`` is proactive unless ``gateway_name`` is given
-and ``bridge.window_state(gateway_name, to)`` reports an open window. With
-no gateway context, every free-form send is treated as proactive.
-``send_template`` (approved templates) is always allowed. The tool never
-uses ``ignore_permissions`` and never switches the session user.
+and ``bridge.window_state(gateway_name, to)`` reports an open window. When a
+gateway is named, the message is sent from that gateway's own WhatsApp
+account (resolved server-side) and a conflicting ``whatsapp_account`` is
+ignored, so the window checked is always the window of the sending account.
+With no gateway context, every free-form send is treated as proactive.
+``send_template`` (approved templates) is deliberately NOT gated by either
+flag; it is routed through the bridge when available so a WhatsApp Message
+row is written. The tool never uses ``ignore_permissions`` and never
+switches the session user.
 """
 
 import json
@@ -58,6 +68,7 @@ def _refused(code: str, message: str) -> str:
 
 
 _PRIVILEGE_FLAGS = ("allow_proactive", "allow_whatsapp_management")
+_CREDENTIAL_KWARGS = ("access_token", "phone_number_id")
 
 
 def _is_truthy(value: Any) -> bool:
@@ -84,13 +95,10 @@ def _server_flag(name: str) -> bool:
 	return False
 
 
-def _get_whatsapp_credentials(kwargs: dict) -> tuple[str, str]:
-	"""Get phone_number_id and access_token from arguments or Integration Settings."""
-	phone_number_id = (kwargs.get("phone_number_id") or "").strip()
-	access_token = (kwargs.get("access_token") or "").strip()
-
-	if phone_number_id and access_token:
-		return phone_number_id, access_token
+def _get_whatsapp_credentials(kwargs: dict | None = None) -> tuple[str, str]:
+	"""Get phone_number_id and access_token from server-side configuration only."""
+	phone_number_id = ""
+	access_token = ""
 
 	# Fallback to Integration Settings or WhatsApp Account DocType
 	if frappe.db.exists("DocType", "WhatsApp Account"):
@@ -119,6 +127,9 @@ def handle_action(action: str, **kwargs: Any) -> str:
 	# Privilege flags are server-side only: discard anything the LLM supplied.
 	for name in _PRIVILEGE_FLAGS:
 		kwargs.pop(name, None)
+	# Credentials are server-side only (tool args are persisted).
+	for name in _CREDENTIAL_KWARGS:
+		kwargs.pop(name, None)
 
 	if action == "send_message":
 		return _send_message(kwargs)
@@ -146,11 +157,32 @@ def _bridge_result(result: dict) -> str:
 	return json.dumps(result, default=str)
 
 
+def _gateway_account_name(gateway_name: str) -> Optional[str]:
+	"""Server-side whatsapp_account of a Gateway ('' when unset, None when unknown)."""
+	try:
+		if not frappe.db.exists("Gateway", gateway_name):
+			return None
+		return (frappe.db.get_value("Gateway", gateway_name, "whatsapp_account") or "").strip()
+	except Exception:
+		return None
+
+
 def _resolve_bridge_account(kwargs: dict) -> Optional[dict]:
-	"""Return the resolved WhatsApp Account dict, or None when unavailable."""
+	"""Return the resolved WhatsApp Account dict, or None when unavailable.
+
+	A named ``gateway_name`` pins the account to that gateway's own account
+	(falling back to the default account like the webhook does); a
+	``whatsapp_account`` argument is only honoured without a gateway.
+	"""
 	if not bridge.is_available():
 		return None
-	acct = bridge.resolve_account((kwargs.get("whatsapp_account") or "").strip() or None)
+	account_name = (kwargs.get("whatsapp_account") or "").strip() or None
+	gateway_name = (kwargs.get("gateway_name") or "").strip()
+	if gateway_name:
+		gw_account = _gateway_account_name(gateway_name)
+		if gw_account is not None:
+			account_name = gw_account or None
+	acct = bridge.resolve_account(account_name)
 	if not acct or acct.get("error"):
 		return None
 	return acct
@@ -159,8 +191,8 @@ def _resolve_bridge_account(kwargs: dict) -> Optional[dict]:
 def _is_proactive_send(kwargs: dict, recipient: str) -> bool:
 	"""A free-form send is proactive unless the gateway window is open (A8)."""
 	gateway_name = (kwargs.get("gateway_name") or "").strip()
-	if not gateway_name:
-		return True
+	if not gateway_name or _gateway_account_name(gateway_name) is None:
+		return True  # no (or unknown) gateway: nothing to evaluate a window against
 	try:
 		state = bridge.window_state(gateway_name, recipient)
 	except Exception:
@@ -198,9 +230,9 @@ def _send_message(kwargs: dict) -> str:
 			return _error(f"Failed to send WhatsApp message: {str(e)}")
 		return _success({"message_id": res.get("message_id"), "recipient": recipient, "status": "sent", "name": res.get("name")})
 
-	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
+	phone_number_id, access_token = _get_whatsapp_credentials()
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials (phone_number_id and access_token) not found")
+		return _error("WhatsApp credentials not found")
 
 	url = f"{META_GRAPH_URL}/{phone_number_id}/messages"
 	headers = {
@@ -252,7 +284,6 @@ def _send_template(kwargs: dict) -> str:
 	parameter rows, rather than requiring a caller to hand-construct Meta's
 	full ``components`` array.
 	"""
-	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	recipient = bridge.normalize_phone(kwargs.get("to") or kwargs.get("recipient") or "")
 	template_name = (kwargs.get("template_name") or "").strip()
 	language_code = (kwargs.get("language_code") or "en").strip()
@@ -260,10 +291,24 @@ def _send_template(kwargs: dict) -> str:
 
 	if not recipient or not template_name:
 		return _error("Recipient ('to') and 'template_name' are required")
-	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
 	if not isinstance(parameters, list):
 		return _error("'parameters' must be a list of strings")
+
+	acct = _resolve_bridge_account(kwargs)
+	if acct:
+		try:
+			res = bridge.send_template(acct["name"], recipient, template_name, [str(p) for p in parameters])
+		except bridge.BridgeError as e:
+			return json.dumps(e.payload, default=str)
+		except frappe.PermissionError:
+			return _refused("permission_denied", "Not permitted to send WhatsApp messages")
+		except Exception as e:
+			return _error(f"Failed to send WhatsApp template: {str(e)}")
+		return _success({"message_id": res.get("message_id"), "recipient": recipient, "status": "sent", "name": res.get("name")})
+
+	phone_number_id, access_token = _get_whatsapp_credentials()
+	if not phone_number_id or not access_token:
+		return _error("WhatsApp credentials not found")
 
 	url = f"{META_GRAPH_URL}/{phone_number_id}/messages"
 	headers = {
@@ -325,7 +370,7 @@ def _list_messages(kwargs: dict) -> str:
 
 
 def _get_account_info(kwargs: dict) -> str:
-	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
+	phone_number_id, access_token = _get_whatsapp_credentials()
 	if not phone_number_id or not access_token:
 		return _error("WhatsApp credentials not found")
 
@@ -360,11 +405,11 @@ def _list_templates(kwargs: dict) -> str:
 def _create_template(kwargs: dict) -> str:
 	"""Create a WhatsApp template via the bridge (management; A8 gated).
 
-	Requires ``allow_whatsapp_management`` (or ``allow_proactive``) enabled in
+	Requires ``allow_whatsapp_management`` enabled in
 	the server-side Integration Settings. Accepted fields: ``template_name``,
 	``category`` (MARKETING/UTILITY/AUTHENTICATION), ``language_code``, ``body``.
 	"""
-	if not (_server_flag("allow_whatsapp_management") or _server_flag("allow_proactive")):
+	if not _server_flag("allow_whatsapp_management"):
 		return _refused(
 			"management_not_permitted",
 			"Template creation is disabled. Enable allow_whatsapp_management in the tool config.",

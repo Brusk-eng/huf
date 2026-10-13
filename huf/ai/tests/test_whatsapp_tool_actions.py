@@ -46,6 +46,10 @@ def _settings(**flags):
 	)
 
 
+def _creds():
+	return patch.object(whatsapp, "_get_whatsapp_credentials", return_value=("PN1", "token"))
+
+
 def _account(name="WA-1"):
 	return {"name": name, "phone_id": "PN1", "token": "t", "url": "https://graph.facebook.com", "version": "v21.0"}
 
@@ -57,13 +61,15 @@ class TestWhatsAppToolGating(unittest.TestCase):
 			patch.object(bridge, "resolve_account", return_value=None),
 			patch.object(bridge, "window_state", return_value={"open": False}),
 			_settings(),
+			_creds(),
+			patch.object(whatsapp, "_gateway_account_name", return_value="WA-1"),
 		]
-		self.mock_available, self.mock_resolve, self.mock_window, _ = (p.start() for p in self._patches)
+		self.mock_available, self.mock_resolve, self.mock_window, *_ = (p.start() for p in self._patches)
 		self.post = patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.9"}]})).start()
 		self.addCleanup(patch.stopall)
 
 	def _send(self, **overrides):
-		kwargs = {"phone_number_id": "PN1", "access_token": "token", "to": "+1 (555) 123-4567", "message": "hi"}
+		kwargs = {"to": "+1 (555) 123-4567", "message": "hi"}
 		kwargs.update(overrides)
 		return json.loads(whatsapp.handle_action("send_message", **kwargs))
 
@@ -135,8 +141,6 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		result = json.loads(
 			whatsapp.handle_action(
 				"send_template",
-				phone_number_id="PN1",
-				access_token="token",
 				to="15551234567",
 				template_name="order_update",
 			)
@@ -150,6 +154,63 @@ class TestWhatsAppToolGating(unittest.TestCase):
 			)
 		self.assertEqual(result["error"], "management_not_permitted")
 		mock_create.assert_not_called()
+
+	def test_create_template_not_enabled_by_allow_proactive(self):
+		with (
+			_settings(allow_proactive="1"),
+			patch.object(bridge, "is_available", return_value=True),
+			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "create_template") as mock_create,
+		):
+			result = json.loads(whatsapp.handle_action("create_template", template_name="promo"))
+		self.assertEqual(result["error"], "management_not_permitted")
+		mock_create.assert_not_called()
+
+	def test_credentials_in_kwargs_are_discarded(self):
+		with patch.object(whatsapp, "_get_whatsapp_credentials", return_value=("SERVER", "server-tok")) as creds:
+			with patch.object(whatsapp.requests, "get", return_value=FakeResponse(body={"id": "x"})) as mock_get:
+				whatsapp.handle_action("get_account_info", phone_number_id="EVIL", access_token="evil-tok")
+		creds.assert_called_once_with()
+		self.assertIn("/SERVER", mock_get.call_args.args[0])
+		self.assertEqual(mock_get.call_args.kwargs["headers"]["Authorization"], "Bearer server-tok")
+
+	def test_registry_does_not_expose_credential_parameters(self):
+		from huf.ai.tools._registry import WHATSAPP_TOOLS
+
+		names = {p["fieldname"] for p in WHATSAPP_TOOLS[0]["parameters"]}
+		self.assertNotIn("access_token", names)
+		self.assertNotIn("phone_number_id", names)
+
+	def test_gateway_pins_sending_account_and_window_check(self):
+		self.mock_window.return_value = {"open": True}
+		with (
+			patch.object(bridge, "is_available", return_value=True),
+			patch.object(bridge, "resolve_account", return_value=_account("WA-1")) as mock_resolve,
+			patch.object(bridge, "send_text", return_value={"success": True, "name": "WM-1", "message_id": "m"}) as mock_send,
+		):
+			result = self._send(gateway_name="GW-1", whatsapp_account="OTHER")
+		self.assertTrue(result["success"])
+		mock_resolve.assert_called_with("WA-1")
+		self.assertEqual(mock_send.call_args.args[0], "WA-1")
+
+	def test_unknown_gateway_is_treated_as_proactive(self):
+		self.mock_window.return_value = {"open": True}
+		with patch.object(whatsapp, "_gateway_account_name", return_value=None):
+			result = self._send(gateway_name="NOPE")
+		self.assertEqual(result["error"], "proactive_send_not_permitted")
+		self.mock_window.assert_not_called()
+
+	def test_send_template_routes_through_bridge(self):
+		with (
+			patch.object(bridge, "is_available", return_value=True),
+			patch.object(bridge, "resolve_account", return_value=_account()),
+			patch.object(bridge, "send_template", return_value={"success": True, "name": "WM-2", "message_id": "m2"}) as mock_tpl,
+		):
+			result = json.loads(
+				whatsapp.handle_action("send_template", to="15551234567", template_name="t", parameters=["a"])
+			)
+		self.assertTrue(result["success"])
+		mock_tpl.assert_called_once_with("WA-1", "15551234567", "t", ["a"])
 
 	def test_create_template_ignores_llm_supplied_management_flag(self):
 		with (
@@ -188,6 +249,8 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 		self._settings = _settings(allow_proactive="1")
 		self._settings.start()
 		self.addCleanup(self._settings.stop)
+		_creds().start()
+		self.addCleanup(patch.stopall)
 
 	def test_send_message_uses_bridge_send_text_when_account_resolvable(self):
 		with (
@@ -220,8 +283,6 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 			result = json.loads(
 				whatsapp.handle_action(
 					"send_message",
-					phone_number_id="PN1",
-					access_token="token",
 					to="15551234567",
 					message="hi",
 				)
@@ -236,15 +297,13 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 			patch.object(bridge, "is_available", return_value=False),
 			patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.3"}]})) as mock_post,
 		):
-			whatsapp.handle_action("send_message", phone_number_id="PN1", access_token="token", to="15551234567", message="hi")
+			whatsapp.handle_action("send_message", to="15551234567", message="hi")
 		self.assertTrue(mock_post.call_args.args[0].startswith(f"https://graph.facebook.com/{bridge.GRAPH_DEFAULT_VERSION}/"))
 
 	def test_send_template_normalizes_recipient(self):
-		with patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.4"}]})) as mock_post:
+		with patch.object(bridge, "is_available", return_value=False), patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.4"}]})) as mock_post:
 			whatsapp.handle_action(
 				"send_template",
-				phone_number_id="PN1",
-				access_token="token",
 				to="+1 (555) 123-4567",
 				template_name="order_update",
 			)

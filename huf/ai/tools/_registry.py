@@ -223,7 +223,7 @@ WHATSAPP_TOOLS = [
 			"Manage WhatsApp Business messaging via the Meta Cloud API. Actions: "
 			"send_message (to/recipient/phone_number, message/text; free-form sends outside the "
 			"24h window may be refused), "
-			"send_template (to/recipient, template_name, language_code), "
+			"send_template (to/recipient, template_name, language_code, parameters), "
 			"list_messages (to, from, limit), get_account_info, "
 			"list_templates (whatsapp_account, status), "
 			"create_template (template_name, category, language_code, body; may be refused by server policy)."
@@ -251,8 +251,6 @@ WHATSAPP_TOOLS = [
 				"gateway_name",
 				description="Gateway name for send_message; when the 24h customer-service window is open, free-form sends are allowed.",
 			),
-			_p("phone_number_id", description="Override the configured WhatsApp Phone Number ID."),
-			_p("access_token", description="Override the configured Meta access token."),
 		],
 	},
 ]
