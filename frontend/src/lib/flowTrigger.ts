@@ -27,6 +27,8 @@ export interface FlowTriggerSummary {
   procedure: string;
   procedure_status: string | null;
   enabled: boolean;
+  /** The flow graph changed since the bound procedure was built; re-apply to rebind. */
+  stale?: boolean;
   next_run: string | null;
   last_run: string | null;
   activation_required?: string;

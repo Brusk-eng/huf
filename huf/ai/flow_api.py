@@ -621,11 +621,37 @@ def _flow_trigger_row(automation_name: str):
 	return frappe.get_doc("Automation Trigger", name) if name else None
 
 
+def _graph_matches_fingerprint(procedure_graph: dict, procedure) -> bool:
+	"""True when the converted Flow graph hashes to the bound procedure row's fingerprint."""
+	from huf.ai.procedure_versioning import compute_fingerprint
+
+	graph = dict(procedure_graph)
+	graph["profile"] = "procedure"
+	graph["schema_version"] = procedure.schema_version or graph.get("schema_version") or "1.0.0"
+	return compute_fingerprint(graph) == procedure.fingerprint
+
+
+def _flow_trigger_is_stale(flow_id: str, procedure_name: str) -> bool:
+	"""True when the Flow's current graph no longer matches the procedure the trigger is bound to."""
+	from huf.ai.procedure_conversion import analyze_conversion
+
+	bound = frappe.db.get_value(
+		"Agent Procedure", procedure_name, ["name", "fingerprint", "schema_version"], as_dict=True
+	)
+	if not bound:
+		return True
+	try:
+		_doc, flow_graph = _load_flow_graph(flow_id)
+		result = analyze_conversion(flow_graph)
+	except Exception:  # noqa: BLE001 -- an unreadable/unconvertible flow cannot match
+		return True
+	return not result.convertible or not _graph_matches_fingerprint(result.procedure_graph, bound)
+
+
 def _ensure_flow_procedure(flow_id: str) -> str:
 	"""Return the name of an Agent Procedure version matching the Flow's current
 	definition, converting (a new immutable Draft version) only if none does."""
 	from huf.ai.procedure_conversion import analyze_conversion
-	from huf.ai.procedure_versioning import compute_fingerprint
 
 	_doc, flow_graph = _load_flow_graph(flow_id)
 	result = analyze_conversion(flow_graph)
@@ -643,12 +669,8 @@ def _ensure_flow_procedure(flow_id: str) -> str:
 		order_by="version desc",
 		as_dict=True,
 	)
-	if latest:
-		graph = dict(result.procedure_graph)
-		graph["profile"] = "procedure"
-		graph["schema_version"] = latest.schema_version or graph.get("schema_version") or "1.0.0"
-		if compute_fingerprint(graph) == latest.fingerprint:
-			return latest.name
+	if latest and _graph_matches_fingerprint(result.procedure_graph, latest):
+		return latest.name
 
 	return convert_flow_to_procedure(flow_id, procedure_id=procedure_id)["name"]
 
@@ -671,6 +693,7 @@ def _flow_trigger_summary(flow_id: str) -> dict | None:
 		"procedure": automation.procedure,
 		"procedure_status": procedure_status,
 		"enabled": bool(automation.status == "Active" and not trigger.disabled),
+		"stale": _flow_trigger_is_stale(flow_id, automation.procedure),
 		"next_run": str(trigger.next_execution) if trigger.next_execution else None,
 		"last_run": str(trigger.last_execution) if trigger.last_execution else None,
 	}
@@ -763,7 +786,11 @@ def set_flow_trigger(
 		"procedure": procedure_name,
 		"agent": None,
 		"run_as_user": run_as_user or frappe.session.user,
-		"status": "Active" if procedure_status in RUNNABLE_PROCEDURE_STATUSES else "Draft",
+		# Only a runnable procedure on an Active flow may fire; Draft/Archived flows stay Draft.
+		"status": "Active"
+		if procedure_status in RUNNABLE_PROCEDURE_STATUSES
+		and frappe.db.get_value("Flow Definition", flow_id, "status") == "Active"
+		else "Draft",
 	}
 	if frappe.db.exists("Automation", automation_name):
 		automation = frappe.get_doc("Automation", automation_name)

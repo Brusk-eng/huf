@@ -323,7 +323,7 @@ class TestAgentTargetRegression(_Base):
 
 class TestFlowTriggerApi(_Base):
 	def test_schedule_round_trip(self):
-		flow_id = self._flow()
+		flow_id = TestFlowTriggerStaleness._active_flow(self)
 		self.assertIsNone(flow_api.get_flow_trigger(flow_id))
 
 		out = flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
@@ -497,3 +497,56 @@ class TestRunAsEscalation(_Base):
 			_check_run_as_user_permission(doc)
 		doc.run_as_set_by = "Administrator"
 		_check_run_as_user_permission(doc)
+
+
+class TestFlowTriggerStaleness(_Base):
+	def _active_flow(self, cron_node=None):
+		defn = _flow_definition(
+			[
+				{"id": "start", "type": "trigger.schedule", "config": {"cron": "*/5 * * * *"}, "next": "finish"},
+				{"id": "finish", "type": "output", "config": {"value": {"ok": True}}},
+			]
+		)
+		flow_id = self._flow(defn)
+		doc = frappe.get_doc("Flow Definition", flow_id)
+		doc.status = "Active"
+		doc.save(ignore_permissions=True)
+		return flow_id
+
+	def _live_trigger(self, flow_id):
+		out = flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
+		frappe.db.set_value("Agent Procedure", out["procedure"], "status", "Active")
+		return flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
+
+	def test_editing_flow_graph_marks_trigger_stale(self):
+		flow_id = self._active_flow()
+		out = self._live_trigger(flow_id)
+		self.assertEqual(out["automation_status"], "Active")
+		self.assertFalse(out["stale"])
+
+		doc = frappe.get_doc("Flow Definition", flow_id)
+		defn = json.loads(doc.definition_json)
+		defn["nodes"][1]["config"]["value"] = {"ok": False}
+		doc.definition_json = json.dumps(defn)
+		doc.save(ignore_permissions=True)
+		self.assertTrue(flow_api.get_flow_trigger(flow_id)["stale"])
+
+		# Re-applying binds a fresh procedure version and clears the flag.
+		again = flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
+		self.assertFalse(again["stale"])
+		self.assertNotEqual(again["procedure"], out["procedure"])
+
+	def test_deactivating_flow_pauses_trigger_automation(self):
+		flow_id = self._active_flow()
+		out = self._live_trigger(flow_id)
+		doc = frappe.get_doc("Flow Definition", flow_id)
+		doc.status = "Archived"
+		doc.save(ignore_permissions=True)
+		self.assertEqual(frappe.db.get_value("Automation", out["automation"], "status"), "Paused")
+
+	def test_set_trigger_on_draft_flow_stays_draft(self):
+		flow_id = self._flow()
+		out = flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
+		frappe.db.set_value("Agent Procedure", out["procedure"], "status", "Active")
+		again = flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
+		self.assertEqual(again["automation_status"], "Draft")

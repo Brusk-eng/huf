@@ -222,6 +222,14 @@ export function FlowTriggerPanel({ kind, flowId, hasUnsavedChanges, docTypes, lo
               </Button>
             </div>
           ) : null}
+          {summary.stale ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-muted-foreground">The flow changed since this trigger was applied; it still runs the old version.</p>
+              <Button size="sm" variant="outline" disabled={formDisabled} onClick={save}>
+                Re-apply
+              </Button>
+            </div>
+          ) : null}
           {kind === 'schedule' && summary.next_run && state.kind === 'live' ? (
             <p className="flex items-center gap-1.5 text-muted-foreground">
               <Clock className="w-3 h-3 shrink-0" />
