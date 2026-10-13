@@ -550,3 +550,66 @@ class TestFlowTriggerStaleness(_Base):
 		frappe.db.set_value("Agent Procedure", out["procedure"], "status", "Active")
 		again = flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
 		self.assertEqual(again["automation_status"], "Draft")
+
+
+class TestFixE(_Base):
+	def test_m1_next_execution_recomputed_when_schedule_changes(self):
+		doc, _ = self._procedure_automation()
+		trigger = frappe.get_doc(
+			{
+				"doctype": "Automation Trigger",
+				"trigger_name": f"{PREFIX} m1",
+				"automation": doc.name,
+				"trigger_type": "Schedule",
+				"schedule_type": "Cron",
+				"cron_expression": "0 0 1 1 *",  # yearly: far in the future
+			}
+		).insert(ignore_permissions=True)
+		far = trigger.next_execution
+		self.assertGreater(far, frappe.utils.now_datetime() + datetime.timedelta(days=1))
+
+		trigger.cron_expression = "*/5 * * * *"
+		trigger.save(ignore_permissions=True)
+		self.assertLessEqual(trigger.next_execution, frappe.utils.now_datetime() + datetime.timedelta(minutes=5))
+
+		# An unrelated edit keeps the scheduler-managed next_execution.
+		kept = trigger.next_execution
+		trigger.trigger_name = f"{PREFIX} m1b"
+		trigger.save(ignore_permissions=True)
+		self.assertEqual(trigger.next_execution, kept)
+
+	def test_m3_unset_entry_flow_is_not_convertible(self):
+		from huf.ai.procedure_conversion import analyze_conversion
+
+		defn = _flow_definition(
+			[
+				{"id": "start", "type": "trigger.unset", "config": {}, "next": "finish"},
+				{"id": "finish", "type": "output", "config": {"value": {"ok": True}}},
+			]
+		)
+		result = analyze_conversion(defn)
+		self.assertFalse(result.convertible)
+		self.assertIn("trigger", result.reason.lower())
+		flow_id = self._flow(defn)
+		with self.assertRaises(frappe.ValidationError):
+			flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
+
+	def _doc_event_context(self, automation):
+		trigger = {"automation": automation.name, "name": "t-m5", "file_attachments": []}
+		with patch("huf.ai.automation_runner.run_automation") as mock_run:
+			automation_hooks.run_automation_for_doc(
+				trigger, {"doctype": "ToDo", "name": "x1", "description": "d"}, "after_insert"
+			)
+		return mock_run.call_args.kwargs["trigger_context"]
+
+	def test_m5_doc_in_context_only_for_procedure_targets(self):
+		proc_auto, _ = self._procedure_automation()
+		self.assertIn("doc", self._doc_event_context(proc_auto))
+
+		provider = make_ai_provider()
+		model = make_ai_model(provider=provider.name)
+		agent = make_agent(provider=provider.name, model=model.name)
+		self._agents.append(agent.name)
+		agent_auto = make_automation(agent=agent.name, instruction="x", status="Active")
+		self._automations.append(agent_auto.name)
+		self.assertNotIn("doc", self._doc_event_context(agent_auto))

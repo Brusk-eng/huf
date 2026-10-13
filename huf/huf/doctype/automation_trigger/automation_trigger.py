@@ -28,8 +28,19 @@ class AutomationTrigger(Document):
 		freshly created (or re-enabled) Schedule trigger with no
 		next_execution yet would therefore never fire -- compute an initial
 		one here, the same way the scheduler advances it after each run.
+
+		Also recomputed whenever the schedule definition (type, cron, interval)
+		changes, otherwise an edited cron would keep firing on the old cadence
+		until the stale next_execution elapsed. Cron expressions are evaluated in
+		the system time zone (``now_datetime()``), not a per-trigger time zone.
 		"""
-		if self.trigger_type != "Schedule" or self.next_execution:
+		if self.trigger_type != "Schedule":
+			return
+		schedule_changed = not self.is_new() and any(
+			self.has_value_changed(f)
+			for f in ("schedule_type", "cron_expression", "scheduled_interval", "interval_count")
+		)
+		if self.next_execution and not schedule_changed:
 			return
 		from huf.ai.automation_scheduler import compute_next_execution
 
