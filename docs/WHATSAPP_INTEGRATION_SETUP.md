@@ -53,10 +53,12 @@ Huf never imports `frappe_whatsapp` at module load. The bridge checks for the Do
 | Delivery status callbacks forwarded to `frappe_whatsapp` | No | Yes (only for known message ids) |
 | Template list, create, delete and status sync | No (`bridge_unavailable`) | Yes |
 | Message and conversation listing in the management API | No (`bridge_unavailable`) | Yes |
-| Outbound media | No | No |
+| Outbound media (image, document, audio, video) inside the 24h window | Yes, by link or Meta media id | Yes, by link only |
+| Rich templates: header, footer, buttons | No (`bridge_unavailable`) | Yes (see section 4.4) |
+| Template send with header and button parameters | Yes, via Graph API | Yes (see section 4.4) |
 | Inbound media download | Yes, best-effort in the background job (see section 7) | Yes, best-effort in the background job (see section 7) |
 
-Note: the management API and the agent tool's `list_templates` and `create_template` actions need `frappe_whatsapp`. The agent tool's `send_message` and `send_template` do not. Without `frappe_whatsapp`, they call the Graph API directly.
+Note: the management API and the agent tool's `list_templates` and `create_template` actions need `frappe_whatsapp`. The agent tool's `send_message`, `send_media` and `send_template` do not. Without `frappe_whatsapp`, they call the Graph API directly.
 
 ---
 
@@ -212,24 +214,58 @@ Approval and pairing notifications follow the same rule. If the window is closed
 | `sync_templates` | POST | Pulls template status and id from Meta for one WhatsApp Account |
 | `send_template_message` | POST | Sends an approved template. Allowed outside the 24h window |
 | `send_text_message` | POST | Sends free-form text. Refused with `window_closed` outside the window |
+| `send_media_message` | POST | Sends an image, document, audio or video by public link or public uploaded file. Refused with `window_closed` outside the window |
 | `list_messages` | GET | Recent WhatsApp Messages, newest first |
 | `list_conversations` | GET | Recent messages grouped by counterparty number |
 
 Template name rules: lowercase letters, digits and underscores only (`^[a-z0-9_]+$`). Category: `MARKETING` or `UTILITY` (`AUTHENTICATION` is not supported because Meta requires OTP button components). `language_code` is required.
 
-**Agent tool actions** (`huf/ai/tools/whatsapp.py`): `list_templates` (read-only) and `create_template` (gated, see section 6).
+**Agent tool actions** (`huf/ai/tools/whatsapp.py`): `list_templates` (read-only) and `create_template` (gated, see section 6). `delete_template` returns `template_in_use` for a template that has been sent, without touching Meta.
 
 **Approval lifecycle**: the code does not enforce a state machine. A template is created in Meta by `frappe_whatsapp`. Its `status` field holds the value Meta reports, which Huf copies on `sync_templates`. The agent tool's `status` filter uses the values `PENDING`, `APPROVED` and `REJECTED`. Huf does not block sends of a template based on its status. Run a sync after Meta reviews a template, and check its status before relying on it as a fallback.
+
+
+### 4.4 Rich templates (header, footer, buttons)
+
+`create_template` (management API, console Create dialog, agent tool) accepts these optional parts besides the body. They map onto the `WhatsApp Templates` fields and `WhatsApp Button` child rows exactly as `frappe_whatsapp` defines them.
+
+| Payload key | Doctype field | Notes |
+|---|---|---|
+| `template` (or `body`) | `template` | Required, up to 1024 characters. `{{1}}`, `{{2}}`, ... in order, no gaps |
+| `sample_values` | `sample_values` | One example per body variable, comma separated (so examples cannot contain commas). Required when the body has variables |
+| `header_type` | `header_type` | `TEXT`, `IMAGE` or `DOCUMENT`. `VIDEO` headers are not available in `frappe_whatsapp` and are rejected |
+| `header` | `header` | TEXT header, up to 60 characters, at most one variable `{{1}}` |
+| `sample` | `sample` | TEXT header with a variable: one example value. IMAGE/DOCUMENT: an `http(s)` URL (public, https outside tests) or the path of an uploaded File (`/files/...`). `frappe_whatsapp` uploads it to Meta for review |
+| `footer` | `footer` | Up to 60 characters, no variables |
+| `buttons` | `buttons` rows | List of `{type, text, ...}`: `QUICK_REPLY`; `URL` with `url` (a trailing `{{1}}` makes it dynamic and needs an `example` full URL); `PHONE_NUMBER` with `phone_number`. Mapped to `Quick Reply`, `Visit Website` (`url_type` Static or Dynamic, `example_url`) and `Call Phone` |
+
+Limits enforced before anything is sent to Meta: button text 25 characters, at most 3 quick replies or 2 call-to-action buttons (URL plus phone) with at most one phone button, and quick replies and call-to-action buttons each grouped together. A bad request returns one structured error listing every problem:
+
+```json
+{"success": false, "error": "validation_failed", "message": "...",
+ "errors": [{"field": "footer", "code": "too_long", "message": "..."}]}
+```
+
+**Sending with parameters.** `send_template_message` (and the tool's `send_template`, and the adapter in direct mode) take:
+
+- `body_params`: strings for `{{1}}`... The count must match the template. Parameters cannot be empty or contain newlines, tabs or four or more spaces (Meta rejects them).
+- `header_params`: one text string for a TEXT header variable, or one `{"type": "image|document", "link": "https://..."}` for a media header (`filename` is optional for documents). An IMAGE header with no link falls back to the template's own sample link.
+- `button_params`: `[{"index": 0, "sub_type": "url", "text": "<suffix>"}]` for each dynamic URL button (`index` is the button's position, starting at 0). A bare string is the suffix of the button at that list position.
+
+Bridge mode: plain body-only sends go through an Outgoing `WhatsApp Message`, which `frappe_whatsapp` sends. `frappe_whatsapp` cannot build header variables or dynamic URL parameters without a reference document, so sends that use `header_params` or `button_params` (or whose template has a dynamic URL button) are posted to Graph with the account credentials and mirrored into `WhatsApp Message` with the returned message id. There is still exactly one send.
+
+Not available: `VIDEO` headers, `AUTHENTICATION` templates, carousel, flow, catalog and multi-product buttons, copy-code and other button types, and editing a template after it is created.
 
 ---
 
 ## 5. Agent tool
 
-Actions: `send_message`, `send_template`, `list_messages`, `get_account_info`, `list_templates`, `create_template`.
+Actions: `send_message`, `send_media`, `send_template`, `list_messages`, `get_account_info`, `list_templates`, `create_template`.
 
 - `send_message` is a free-form text send. It is **proactive** unless `gateway_name` is passed and that gateway's window is open. Without `gateway_name`, every free-form send is treated as proactive. A proactive send needs `allow_proactive` or `allow_whatsapp_management`.
-- `send_template` is always allowed.
-- `create_template` needs `allow_whatsapp_management` or `allow_proactive`.
+- `send_media` (`to`, `kind` image/document/audio/video, `link`, `caption`, `filename`) is a free-form send. It follows exactly the same proactive logic and flags as `send_message`.
+- `send_template` is always allowed. It accepts `parameters`, `header_params` and `button_params` (see section 4.4).
+- `create_template` needs `allow_whatsapp_management` or `allow_proactive`, and accepts the header, footer and button fields of section 4.4.
 - The tool never uses `ignore_permissions` and never switches the session user.
 - `send_template`, `get_account_info` and the fallback path of `send_message` call the Graph API directly, using `phone_number_id` and `access_token` from the arguments or the Integration Settings. `send_message` logs to `WhatsApp Message` only when the bridge is not used and the app is installed.
 
@@ -241,7 +277,7 @@ Two server-side flags control privileged behaviour. They are read from the activ
 
 | Credential row | Enables |
 |---|---|
-| `allow_proactive` | Free-form `send_message` outside an open window |
+| `allow_proactive` | Free-form `send_message` and `send_media` outside an open window |
 | `allow_whatsapp_management` | `create_template`, and proactive sends |
 
 Rules:
@@ -264,62 +300,15 @@ The bridge provides `download_media`, which enforces:
 
 When the background job processes an event with an image, document, audio, video or sticker, it calls `download_media` (best-effort), saves a private File attached to the Gateway Event, and adds an `[Attachment saved: <url>]` note to the agent prompt. A failed or rejected download is logged and the text flow continues.
 
-**Outbound.** Media replies are not supported. The adapter declares `supports_media_reply = False` and sends text only.
+**Outbound.** The adapter declares `supports_media_reply = True`.
 
----
+- `adapter.send_media(to, kind, link=..., media_id=..., caption=..., filename=...)`: `kind` is `image`, `document`, `audio` or `video`. Give exactly one of a public `link` or a Meta `media_id`. Captions are up to 1024 characters and are not allowed on audio. `filename` applies to documents. Direct mode posts the Graph `/messages` payload. Bridge mode inserts an Outgoing `WhatsApp Message` with `content_type` and `attach` (so only `link` is supported; `media_id` and `filename` are not).
+- Free-form media is subject to the same 24h window as text. A closed window raises `WhatsAppWindowClosed` (management API: `window_closed`). There is no template fallback for media.
+- `GatewayReply.attachments` is honoured by the WhatsApp adapter: the first attachment (URL or media id) is sent with the reply text as its caption; for audio the text follows as a separate message. Other adapters ignore the field, and the agent reply pipeline does not produce attachments yet, so today media is sent through the explicit paths: the adapter, the management endpoint `send_media_message` (console Messages tab: paperclip button, public link or file upload), and the agent tool action `send_media`.
+- Uploaded files must be public (`/files/...`) for Meta to fetch them. Private files are rejected with `invalid_file`.
 
-## 8. Phone identity
+### Fake Graph API
 
-`normalize_phone` keeps digits only. It strips `+`, spaces, dashes and parentheses, and removes a leading `00`.
+`huf/ai/tests/fake_graph_server.py` is a real local HTTP server that implements the Graph endpoints Huf and `frappe_whatsapp` call (messages, message_templates, resumable sample upload, media lookup and download) and strictly validates request bodies against Meta's documented schema, including template review state and parameter counts. `test_whatsapp_fake_graph.py` points the WhatsApp Account `url` and an Integration Settings `graph_api_url` credential at it, so real `requests` calls are made. The `graph_api_url` credential and the `frappe.flags.whatsapp_test_media_hosts` media-host allowance are only honoured while `frappe.flags.in_test` is set; production always uses `graph.facebook.com` and the fixed media host allowlist. A schema violation recorded by the fake fails the test.
 
-It is applied to:
-
-- the inbound sender, which is also the conversation id (direct messages only)
-- Gateway Access Entry `external_id` for WhatsApp, on save
-- recipients in the management API and the agent tool
-- the sender lookup in the 24h window check
-
-Management recipients must have 7 to 15 digits. Meta's `wa_id` value is treated as canonical for inbound senders.
-
-Quoted replies do not create a new conversation. The adapter sets `thread_id` to none and keeps the quoted message id in the raw payload. The reply to a message quotes its inbound message id, and the conversation key stays the sender's number.
-
----
-
-## 9. Troubleshooting
-
-| Symptom | Likely cause | What to do |
-|---|---|---|
-| Meta shows "verification failed" when saving the callback | The GET token does not match `webhook_verify_token`, or the `gateway_name` in the URL is unknown | Make the token identical in both places. A token mismatch returns HTTP 403 `Webhook verification failed`. An unknown gateway returns 404 |
-| Callback returns 403 `Gateway is disabled` (any method) | The Gateway is not enabled | Enable the Gateway |
-| Every POST delivery returns 401 `Provider verification failed` | `app_secret` is missing, the `X-Hub-Signature-256` header is absent, or the signature does not match | Run `get_setup_status`. If `app_secret_missing` is listed, add the App Secret. Confirm the callback is Huf's URL, not `frappe_whatsapp`'s |
-| Reply shows `WhatsApp 24-hour customer-service window is closed` (Gateway Event `Failed`) | The sender has not messaged in the last 24 hours and there is no `fallback_template` | Set a `fallback_template` on the Gateway, or ask the customer to message again. The management `send_text_message` also returns `window_closed` |
-| `bridge_unavailable` from management or tool calls | `frappe_whatsapp` is not installed, or one of its three DocTypes is missing | Install the app (section 2). Direct replies still work without it |
-| `no_account` | No WhatsApp Account is marked default, and none is `Active` | Create an account, mark one as default outgoing, or pass an account name |
-| `app_secret_missing` in `failing_checks` | The `app_secret` credential row is empty | Add the Meta App Secret to the Integration Settings |
-| Duplicate events | Meta redelivers a message. Each delivery has the same message id | Expected. The second delivery is recorded as a duplicate and does not start another run. Ingest errors are re-raised so Meta retries; redelivery is then deduplicated |
-| Messages for another phone number are ignored | The payload's `metadata.phone_number_id` does not match the gateway's `phone_number_id` | Check that the Integration Settings and the webhook subscription belong to the same WhatsApp number. The gateway's `last_error` names the ignored id. Use one Gateway per Meta app and number |
-| Gateway `last_error` shows `WhatsApp delivery failed to ...: error <code>` | Meta reported a failed delivery for an outgoing message (any mode) | Look up the error code in Meta's docs; the Error Log has the same entry |
-| Gateway `last_error` shows `Fallback template ... is REJECTED/PAUSED/DISABLED` | Meta changed the status of the template configured as fallback | Pick or fix another approved template |
-| Message status updates do not appear in `frappe_whatsapp` | `frappe_whatsapp` is not installed, or no `WhatsApp Message` row exists for that message id | Message statuses are forwarded only when the message id exists in `WhatsApp Message`. Status-only deliveries are acknowledged with 200 and do not start runs |
-
----
-
-## 10. Testing
-
-Test files for this integration:
-
-- `huf/ai/tests/test_whatsapp_bridge.py`
-- `huf/ai/tests/test_whatsapp_gateway_adapter.py`
-- `huf/ai/tests/test_whatsapp_contract.py`
-- `huf/ai/tests/test_whatsapp_ingress.py`
-- `huf/ai/tests/test_whatsapp_management.py`
-- `huf/ai/tests/test_whatsapp_tool_actions.py`
-- `huf/ai/tests/test_whatsapp_tool_send_template.py`
-
-Run them on a bench site:
-
-```bash
-bench --site <site> run-tests --module huf.ai.tests.test_whatsapp_bridge
-```
-
-Repeat for each module above, or run `bench --site <site> run-tests --app huf` for the full suite.
+Remaining limits of the fake and of the feature: live Meta has not been exercised; the fake does not model Meta's own review decisions, rate limits or the 24h window; template edits after creation, `VIDEO` headers and non-text inbound opening the window are not supported.
