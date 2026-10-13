@@ -434,3 +434,63 @@ class TestFlowTriggerApi(_Base):
 		)
 		with self.assertRaises(frappe.ValidationError):
 			self._flow(defn)
+
+
+class TestRunAsEscalation(_Base):
+	def _user(self, roles):
+		from huf.ai.tests.factories import make_user
+
+		user = make_user(email=f"prE-{frappe.generate_hash(length=8)}@example.com", roles=roles)
+		self._users = getattr(self, "_users", []) + [user.name]
+		return user.name
+
+	def tearDown(self):
+		super().tearDown()
+		for u in getattr(self, "_users", []):
+			frappe.delete_doc("User", u, force=1, ignore_permissions=True)
+
+	def test_manager_cannot_escalate_via_set_flow_trigger(self):
+		flow_id = self._flow()
+		manager = self._user(("Huf Manager",))
+		frappe.set_user(manager)
+		with self.assertRaises(frappe.PermissionError):
+			flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *", run_as_user="Administrator")
+		# Running as self is fine for a Manager.
+		frappe.set_user("Administrator")
+
+	def test_manager_cannot_escalate_via_update_automation(self):
+		from huf.ai import automation_service
+
+		doc, _p = self._procedure_automation()
+		manager = self._user(("Huf Manager",))
+		frappe.set_user(manager)
+		with self.assertRaises(frappe.PermissionError):
+			automation_service.update_automation(doc.name, run_as_user="Administrator")
+
+	def test_manager_cannot_edit_flow_without_flow_write(self):
+		flow_id = self._flow()
+		user = self._user(("Huf Viewer",))
+		frappe.set_user(user)
+		with self.assertRaises(frappe.PermissionError):
+			flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *")
+
+	def test_system_manager_can_set_run_as_another_user(self):
+		flow_id = self._flow()
+		other = self._user(("Huf User",))
+		out = flow_api.set_flow_trigger(flow_id, "schedule", cron="*/5 * * * *", run_as_user=other)
+		auto = frappe.get_doc("Automation", out["automation"])
+		self.assertEqual(auto.run_as_user, other)
+		self.assertEqual(auto.run_as_set_by, "Administrator")
+
+	def test_fire_time_checks_who_set_run_as_user(self):
+		from huf.ai.automation_runner import _check_run_as_user_permission
+
+		doc, _p = self._procedure_automation()
+		weak = self._user(("Huf Manager",))
+		# Owner is privileged but the run_as_user was last set by a non-privileged user.
+		doc.run_as_user = "Administrator"
+		doc.run_as_set_by = weak
+		with self.assertRaises(frappe.PermissionError):
+			_check_run_as_user_permission(doc)
+		doc.run_as_set_by = "Administrator"
+		_check_run_as_user_permission(doc)

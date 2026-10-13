@@ -20,6 +20,7 @@
   "column_break_executor",
   "project",
   "run_as_user",
+  "run_as_set_by",
   "work_section",
   "instruction",
   "input_template",
@@ -133,6 +134,15 @@
    "fieldtype": "Link",
    "label": "Run As User",
    "options": "User"
+  },
+  {
+   "description": "User who last set Run As User. Fire-time impersonation is authorised against this user, not the owner.",
+   "fieldname": "run_as_set_by",
+   "fieldtype": "Link",
+   "label": "Run As Set By",
+   "no_copy": 1,
+   "options": "User",
+   "read_only": 1
   },
   {
    "fieldname": "work_section",

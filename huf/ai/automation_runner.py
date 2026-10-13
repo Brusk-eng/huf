@@ -174,7 +174,9 @@ def _check_run_as_user_permission(automation):
 	frappe.get_roles(...)``).
 	"""
 	run_as_user = automation.run_as_user
-	owner = automation.owner
+	# Authorise against whoever last set run_as_user (Automation.validate records
+	# it); the owner is only the fallback for rows that predate the field.
+	owner = automation.get("run_as_set_by") or automation.owner
 
 	if not run_as_user or run_as_user == owner:
 		return
@@ -184,8 +186,8 @@ def _check_run_as_user_permission(automation):
 
 	frappe.throw(
 		_(
-			"Automation '{0}' is configured to run as '{1}', but its owner "
-			"'{2}' does not have the System Manager role required to run "
+			"Automation '{0}' is configured to run as '{1}', but '{2}', who set "
+			"that identity, does not have the System Manager role required to run "
 			"automations as another user."
 		).format(automation.name, run_as_user, owner),
 		frappe.PermissionError,

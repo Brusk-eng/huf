@@ -27,6 +27,36 @@ class Automation(Document):
 	def validate(self):
 		self._validate_target()
 		self._validate_system_agent_lock()
+		self._validate_run_as_user()
+
+	def _validate_run_as_user(self):
+		"""Only a System Manager may set ``run_as_user`` to anyone but themselves.
+
+		Records who set it (``run_as_set_by``) so the fire-time check in
+		automation_runner authorises the run identity against the user who chose
+		it, not merely the (possibly more privileged) owner. Without this a Huf
+		Manager could edit a System Manager's automation and point it at
+		Administrator.
+		"""
+		if (
+			frappe.flags.in_seeding
+			or frappe.flags.in_install
+			or frappe.flags.in_migrate
+			or frappe.flags.in_patch
+		):
+			return
+		if not self.run_as_user:
+			self.run_as_set_by = None
+			return
+		if not self.is_new() and not self.has_value_changed("run_as_user"):
+			return
+		user = frappe.session.user
+		if self.run_as_user != user and "System Manager" not in frappe.get_roles(user):
+			frappe.throw(
+				_("Only System Managers can set an automation to run as another user."),
+				frappe.PermissionError,
+			)
+		self.run_as_set_by = user
 
 	def _validate_target(self):
 		"""Exactly one executor: an Agent, or a pinned Agent Procedure version.

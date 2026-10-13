@@ -730,6 +730,8 @@ def set_flow_trigger(
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
 	if not frappe.db.exists("Flow Definition", flow_id):
 		frappe.throw(_("Flow '{0}' not found").format(flow_id), frappe.DoesNotExistError)
+	if not frappe.has_permission("Flow Definition", "write", flow_id):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
 	resolved_type = _FLOW_TRIGGER_TYPES.get((trigger_type or "").strip().lower())
 	if not resolved_type:
