@@ -77,7 +77,7 @@ class TestFlowActivationGate(UnitTestCase):
 			try:
 				frappe.delete_doc("Flow Definition", name, force=1, ignore_permissions=True)
 			except Exception:  # noqa: BLE001 -- best-effort cleanup
-				pass
+				frappe.log_error(f"flow activation test cleanup failed: {name}")
 
 	def _make(self, flow_id, definition, status):
 		if getattr(frappe.flags, "currently_saving", None) is None:
