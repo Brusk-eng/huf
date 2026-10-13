@@ -19,7 +19,7 @@ Huf's WhatsApp gateway works without `frappe_whatsapp`. It has two modes.
 **Direct mode** (Huf core only)
 
 - Huf receives Meta webhooks, verifies them, and runs the agent.
-- Replies are posted to the Meta Graph API (`v21.0`) using the credentials in the connected Integration Settings.
+- Replies are posted to the Meta Graph API (`v25.0`) using the credentials in the connected Integration Settings.
 - No `frappe_whatsapp` DocTypes are required.
 
 **Bridge mode** (`frappe_whatsapp` installed and the Gateway's `whatsapp_account` field set)
@@ -90,7 +90,7 @@ Then create a **WhatsApp Account** in Frappe Desk. The code reads these fields:
 | `token` | Access token (stored as a Password field) |
 | `business_id` | Template list and sync |
 | `url` | Graph base URL (defaults to `https://graph.facebook.com`) |
-| `version` | Graph API version (defaults to `v21.0`) |
+| `version` | Graph API version (defaults to `v25.0`) |
 | `is_default_outgoing` | Selected when no account is named |
 | `status` | Used only by the fallback that picks the first account with status `Active` |
 
@@ -157,6 +157,10 @@ In the Meta app, under WhatsApp > Configuration > Webhooks:
 4. Subscribe to these fields:
    - `messages`
    - `message_template_status_update`
+   - `message_template_quality_update` (optional)
+   - `template_category_update` (optional)
+
+   Huf forwards these best-effort. A rejected/paused/disabled template, a quality drop to LOW or RED, or a category change is written to the `last_error` of every gateway whose fallback template matches. `played` delivery statuses are accepted and ignored. The verification GET requires `hub.mode=subscribe` when `hub.mode` is sent.
 
 **Security: the callback must be Huf's endpoint, never `frappe_whatsapp`'s webhook.** Meta allows one callback URL per app. `frappe_whatsapp` ships an unsigned webhook route. If that route is configured as the callback, Huf's signature verification is bypassed. Huf cannot detect this from its side. Check the callback URL in Meta. The management API's setup status returns the correct URL and a warning string to compare against.
 
@@ -294,8 +298,8 @@ Rules:
 
 The bridge provides `download_media`, which enforces:
 
-- size limit: 16 MB (declared size and actual size)
-- MIME allowlist: `image/`, `audio/`, `video/`, `application/pdf`, `text/plain`
+- per-kind size limits matching Meta's inbound limits, checked against both the declared and the streamed size: document 100 MB, image 5 MB, audio 16 MB, video 16 MB, sticker 500 KB
+- MIME allowlist: `image/`, `audio/`, `video/`, `application/pdf`, `text/plain`, plus Office documents (`application/msword`, `application/vnd.openxmlformats-officedocument.*`, `application/vnd.ms-excel`, `application/vnd.ms-powerpoint`). SVG, HTML and executables are always rejected
 - filename sanitised to `A-Z a-z 0-9 . _ -`, at most 100 characters
 
 When the background job processes an event with an image, document, audio, video or sticker, it calls `download_media` (best-effort), saves a private File attached to the Gateway Event, and adds an `[Attachment saved: <url>]` note to the agent prompt. A failed or rejected download is logged and the text flow continues.
