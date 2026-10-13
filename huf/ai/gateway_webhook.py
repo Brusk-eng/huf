@@ -334,8 +334,17 @@ def _template_update_text(update: dict, name: str) -> str | None:
 	return f"Fallback template {name} is {state}" + (f" ({reason})" if reason and reason != "NONE" else "")
 
 
-def _record_template_update(update: dict) -> None:
-	"""A rejected/paused/disabled, low-quality or re-categorised template that a gateway relies on as its fallback."""
+def _record_template_update(update: dict, account: str | None = None) -> None:
+	"""Store the template's review/quality state, then flag a fallback template that needs attention.
+
+	A rejected/paused/disabled, low-quality or re-categorised template that a gateway relies on as its fallback.
+	"""
+	try:
+		from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+
+		bridge.record_template_webhook(update, account or None)  # best effort, never raises
+	except Exception:
+		pass
 	try:
 		name = str(update.get("message_template_name") or update.get("name") or "").strip()
 		if not name:
@@ -420,7 +429,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		if str(status.get("status") or "").lower() == "failed":
 			_record_failed_status(gateway.name, status)
 	for update in parsed.template_updates:
-		_record_template_update(update)
+		_record_template_update(update, (getattr(gateway, "whatsapp_account", "") or "").strip() or None)
 
 	forwarded = 0
 	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]

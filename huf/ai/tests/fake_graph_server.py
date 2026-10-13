@@ -186,7 +186,7 @@ class FakeGraphServer:
 		return f"{self.url}/files/{path.lstrip('/')}"
 
 	def add_template(self, name: str, language: str = "en_US", category: str = "UTILITY", status: str = "APPROVED",
-		components: list | None = None) -> dict:
+		components: list | None = None, **extra) -> dict:
 		"""Seed a template that already exists on Meta (created outside Huf, e.g. hello_world)."""
 		comps = components or [
 			{"type": "HEADER", "format": "TEXT", "text": "Hello World"},
@@ -197,8 +197,15 @@ class FakeGraphServer:
 		with self.lock:
 			tid = str(900000000000000 + self._next())
 			self.templates[(name, language)] = {"id": tid, "name": name, "language": language, "category": category,
-				"status": status, "spec": spec, "components": comps}
+				"status": status, "spec": spec, "components": comps, "edit_times": [], **extra}
 		return self.templates[(name, language)]
+
+	def template_by_id(self, template_id: str) -> dict:
+		with self.lock:
+			for t in self.templates.values():
+				if t["id"] == str(template_id):
+					return t
+		raise KeyError(template_id)
 
 	def set_template_status(self, name: str, status: str, language: str | None = None) -> dict:
 		"""Move a template through review; returns the matching webhook payload."""
@@ -293,6 +300,8 @@ class FakeGraphServer:
 				return self._get_templates(rec)
 			if method == "DELETE":
 				return self._delete_template(rec)
+		if node.isdigit() and not rest and method == "POST" and any(t["id"] == node for t in self.templates.values()):
+			return self._edit_template(rec, node)
 		if node == self.app_id and rest == ["uploads"] and method == "POST":
 			return self._post_upload_session(rec)
 		if node.startswith("upload:") and not rest and method == "POST":
@@ -515,7 +524,7 @@ class FakeGraphServer:
 			_need(key not in self.templates, "Content in this language already exists", code=100, subcode=2388024,
 				title="Message template already exists")
 			tid = str(900000000000000 + self._next())
-			self.templates[key] = {"id": tid, "name": name, "language": lang, "category": cat, "status": "PENDING", "spec": spec, "components": comps}
+			self.templates[key] = {"id": tid, "name": name, "language": lang, "category": cat, "status": "PENDING", "spec": spec, "components": comps, "edit_times": []}
 		return 200, {"id": tid, "status": "PENDING", "category": cat}, "application/json"
 
 	@staticmethod
@@ -604,6 +613,49 @@ class FakeGraphServer:
 		switches = sum(1 for a, b in zip(kinds, kinds[1:]) if (a == "QUICK_REPLY") != (b == "QUICK_REPLY"))
 		_need(switches <= 1, "Quick-reply and call-to-action buttons must each be grouped together")
 
+	EDITABLE_STATUSES = ("APPROVED", "REJECTED", "PAUSED")
+
+	def _edit_template(self, rec: dict, template_id: str):
+		"""POST /{template-id}: Meta's documented edit rules (status, 1/24h and 10/30d quota for APPROVED)."""
+		body = self._json(rec)
+		_need(set(body) <= {"category", "components", "message_send_ttl_seconds"}, "Unexpected top-level field in template edit "
+			"(name and language cannot be edited)")
+		comps = body.get("components")
+		_need(comps is None or (isinstance(comps, list) and comps), "components must be a non-empty list")
+		if body.get("category") is not None:
+			_need(body["category"] in ("MARKETING", "UTILITY", "AUTHENTICATION"), "category must be AUTHENTICATION, MARKETING or UTILITY")
+		_need(comps is not None or body.get("category") or body.get("message_send_ttl_seconds") is not None, "Nothing to edit")
+		spec: dict[str, dict] = {}
+		for i, c in enumerate(comps or []):
+			_need(isinstance(c, dict), f"components[{i}] must be an object")
+			ctype = str(c.get("type", "")).upper()
+			_need(ctype in ("HEADER", "BODY", "FOOTER", "BUTTONS"), f"components[{i}].type must be HEADER, BODY, FOOTER or BUTTONS")
+			_need(ctype not in spec, f"Duplicate {ctype} component")
+			spec[ctype] = c
+			getattr(self, f"_tpl_{ctype.lower()}")(f"components[{i}]", c)
+		_need(comps is None or "BODY" in spec, "A BODY component is required")
+		with self.lock:
+			t = self.template_by_id(template_id)
+			_need(t["status"] in self.EDITABLE_STATUSES, f"Message template with status {t['status']} cannot be edited",
+				code=100, subcode=2388025, title="Template Not Editable")
+			now = time.time()
+			if t["status"] == "APPROVED":
+				times = t["edit_times"]
+				_need(not [x for x in times if now - x < 86400], "Approved templates can be edited only once in 24 hours",
+					code=100, subcode=2388026, title="Edit Limit Reached")
+				_need(len([x for x in times if now - x < 30 * 86400]) < 10, "Approved templates can be edited at most 10 times in 30 days",
+					code=100, subcode=2388027, title="Edit Limit Reached")
+				times.append(now)
+			if comps is not None:
+				t["components"], t["spec"] = comps, spec
+			if body.get("category"):
+				t["category"] = body["category"]
+			if body.get("message_send_ttl_seconds") is not None:
+				t["message_send_ttl_seconds"] = body["message_send_ttl_seconds"]
+			t["status"] = "PENDING"  # edited templates go back through review
+			t["rejected_reason"] = "NONE"
+		return 200, {"success": True}, "application/json"
+
 	def _get_templates(self, rec: dict):
 		q = rec["query"]
 		if "limit" in q:
@@ -613,10 +665,16 @@ class FakeGraphServer:
 			for (name, lang), t in self.templates.items():
 				if q.get("name") and q["name"] != name:
 					continue
-				data.append({
+				if q.get("status") and q["status"] != t["status"]:
+					continue
+				row = {
 					"id": t["id"], "name": name, "language": lang, "status": t["status"],
 					"category": t["category"], "components": json.loads(json.dumps(t["components"])),
-				})
+				}
+				for opt in ("rejected_reason", "quality_score", "previous_category", "correct_category", "message_send_ttl_seconds"):
+					if t.get(opt) is not None:
+						row[opt] = t[opt]
+				data.append(row)
 		return 200, {"data": data, "paging": {"cursors": {"before": "a", "after": "b"}}}, "application/json"
 
 	def _delete_template(self, rec: dict):
@@ -765,14 +823,46 @@ def message_status_webhook(phone_id: str, wamid: str, status: str, recipient: st
 	}
 
 
-def template_status_webhook(waba_id: str, template_id: str, name: str, language: str, event: str) -> dict:
+def template_status_webhook(waba_id: str, template_id: str, name: str, language: str, event: str,
+	reason: str = "NONE", rejection_info: dict | None = None, other_info: dict | None = None) -> dict:
+	value = {
+		"event": event,
+		"message_template_id": int(template_id),
+		"message_template_name": name,
+		"message_template_language": language,
+		"reason": reason,
+	}
+	if rejection_info:
+		value["rejection_info"] = rejection_info
+	if other_info:
+		value["other_info"] = other_info
 	return {
 		"object": "whatsapp_business_account",
-		"entry": [{"id": waba_id, "changes": [{"field": "message_template_status_update", "value": {
-			"event": event,
+		"entry": [{"id": waba_id, "changes": [{"field": "message_template_status_update", "value": value}]}],
+	}
+
+
+def template_quality_webhook(waba_id: str, template_id: str, name: str, language: str, previous: str, new: str) -> dict:
+	return {
+		"object": "whatsapp_business_account",
+		"entry": [{"id": waba_id, "changes": [{"field": "message_template_quality_update", "value": {
+			"previous_quality_score": previous,
+			"new_quality_score": new,
 			"message_template_id": int(template_id),
 			"message_template_name": name,
 			"message_template_language": language,
-			"reason": "NONE",
+		}}]}],
+	}
+
+
+def template_category_webhook(waba_id: str, template_id: str, name: str, language: str, previous: str, new: str) -> dict:
+	return {
+		"object": "whatsapp_business_account",
+		"entry": [{"id": waba_id, "changes": [{"field": "template_category_update", "value": {
+			"message_template_id": int(template_id),
+			"message_template_name": name,
+			"message_template_language": language,
+			"previous_category": previous,
+			"new_category": new,
 		}}]}],
 	}

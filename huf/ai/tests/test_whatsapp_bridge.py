@@ -311,7 +311,7 @@ class TestBridge(unittest.TestCase):
 	def test_list_templates(self):
 		with avail(False):
 			self.assertEqual(wb.list_templates(), [])
-		with avail(), patch.object(frappe, "get_list", return_value=[{"name": "t"}]) as gl:
+		with avail(), patch.object(wb, "_attach_state"), patch.object(frappe, "get_list", return_value=[{"name": "t"}]) as gl:
 			self.assertEqual(wb.list_templates("ACC", "APPROVED"), [{"name": "t"}])
 			self.assertEqual(gl.call_args.kwargs["filters"], {"whatsapp_account": "ACC", "status": "APPROVED"})
 
@@ -332,7 +332,7 @@ class TestBridge(unittest.TestCase):
 				self.assertTrue(wb.create_template("ACC", {**good, "template_name": "a" * 512})["success"])
 			self.assertEqual(wb.create_template("ACC", {**good, "language_code": ""})["error"], "invalid_language")
 			doc = FakeDoc(status="PENDING", id="1")
-			with patch.object(frappe, "get_doc", return_value=doc) as gd:
+			with patch.object(frappe, "get_doc", return_value=doc) as gd, patch.object(wb, "record_template_state"):
 				res = wb.create_template("ACC", good)
 			self.assertTrue(res["success"])
 			self.assertEqual(gd.call_args.args[0]["category"], "MARKETING")

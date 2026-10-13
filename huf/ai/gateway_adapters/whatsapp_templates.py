@@ -288,6 +288,65 @@ def button_rows(spec: dict[str, Any]) -> list[dict[str, Any]]:
 	return rows
 
 
+def build_meta_components(spec: dict[str, Any], media_header: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+	"""FULL Graph ``components`` array for a validated spec (create or edit).
+
+	``media_header`` is a ready-made IMAGE/DOCUMENT header component (with its upload
+	handle) to reuse; media headers cannot be rebuilt without a fresh upload.
+	"""
+	body: dict[str, Any] = {"type": "BODY", "text": spec["body"]}
+	if spec.get("sample_values"):
+		body["example"] = {"body_text": [list(spec["sample_values"])]}
+	components: list[dict[str, Any]] = []
+	htype = spec.get("header_type")
+	if htype == "TEXT":
+		header: dict[str, Any] = {"type": "HEADER", "format": "TEXT", "text": spec["header_text"]}
+		if spec.get("header_sample"):
+			header["example"] = {"header_text": [spec["header_sample"]]}
+		components.append(header)
+	elif htype in MEDIA_HEADER_TYPES and media_header:
+		components.append(media_header)
+	components.append(body)
+	if spec.get("footer"):
+		components.append({"type": "FOOTER", "text": spec["footer"]})
+	if spec.get("buttons"):
+		buttons: list[dict[str, Any]] = []
+		for b in spec["buttons"]:
+			out: dict[str, Any] = {"type": b["type"], "text": b["text"]}
+			if b["type"] == "URL":
+				out["url"] = b["url"]
+				if b.get("dynamic") and b.get("example"):
+					out["example"] = [b["example"]]
+			elif b["type"] == "PHONE_NUMBER":
+				out["phone_number"] = b["phone_number"]
+			buttons.append(out)
+		components.append({"type": "BUTTONS", "buttons": buttons})
+	return components
+
+
+def components_to_view(components: Any) -> dict[str, Any]:
+	"""Meta components -> ``{header, body, footer, buttons}`` for display (defensive)."""
+	view: dict[str, Any] = {"header": None, "body": None, "footer": None, "buttons": []}
+	for comp in components if isinstance(components, list) else []:
+		if not isinstance(comp, dict):
+			continue
+		ctype = str(comp.get("type") or "").upper()
+		if ctype == "HEADER":
+			view["header"] = {"type": str(comp.get("format") or "TEXT").upper(), "text": comp.get("text") or ""}
+		elif ctype == "BODY":
+			ex = (comp.get("example") or {}).get("body_text")
+			view["body"] = {"text": comp.get("text") or "", "sample_values": list(ex[0]) if ex and isinstance(ex[0], list) else []}
+		elif ctype == "FOOTER":
+			view["footer"] = {"text": comp.get("text") or ""}
+		elif ctype == "BUTTONS":
+			for btn in comp.get("buttons") or []:
+				if isinstance(btn, dict):
+					view["buttons"].append(
+						{k: btn.get(k) for k in ("type", "text", "url", "phone_number", "example") if btn.get(k) is not None}
+					)
+	return view
+
+
 # --------------------------------------------------------------------- sends
 def validate_param_text(field: str, value: Any, errors: list[dict[str, str]], limit: int = MAX_PARAM_LEN) -> str:
 	text = str(value if value is not None else "")

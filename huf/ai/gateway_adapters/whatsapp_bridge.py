@@ -691,7 +691,7 @@ def list_templates(account_name: str | None = None, status: str | None = None) -
 		filters["whatsapp_account"] = account_name
 	if status:
 		filters["status"] = status
-	return frappe.get_list(
+	rows = frappe.get_list(
 		"WhatsApp Templates",
 		filters=filters,
 		fields=[
@@ -701,6 +701,30 @@ def list_templates(account_name: str | None = None, status: str | None = None) -
 		order_by="modified desc",
 		limit_page_length=500,
 	)
+	_attach_state(rows)
+	return rows
+
+
+def _attach_state(rows: list[dict[str, Any]]) -> None:
+	"""Add review/quality state columns to listed template rows (best effort)."""
+	try:
+		states = {
+			r["template"]: r
+			for r in frappe.get_all(
+				STATE_DOCTYPE,
+				filters={"template": ["in", [r["name"] for r in rows] or [""]]},
+				fields=["template", "rejected_reason", "quality_score", "correct_category", "last_meta_update"],
+			)
+		}
+	except Exception:
+		states = {}
+	for row in rows:
+		st = states.get(row["name"]) or {}
+		row["rejected_reason"] = st.get("rejected_reason") or ""
+		row["quality_score"] = st.get("quality_score") or "UNKNOWN"
+		row["correct_category"] = st.get("correct_category") or ""
+		row["category_change_pending"] = bool(row["correct_category"] and row["correct_category"] != row.get("category"))
+		row["last_meta_update"] = str(st["last_meta_update"]) if st.get("last_meta_update") else None
 
 
 def _check_sample_reference(sample: str) -> dict[str, str] | None:
@@ -764,6 +788,36 @@ def template_buttons(names: list[str]) -> dict[str, list[dict[str, Any]]]:
 	return out
 
 
+def validate_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
+	"""Validate a template create payload without touching Meta or frappe_whatsapp.
+
+	Returns ``{"error": <error dict>}`` on failure, else
+	``{"name", "category", "language_code", "language", "spec"}``.
+	"""
+	name = str(payload.get("template_name") or payload.get("name") or "")
+	category = str(payload.get("category") or "").upper()
+	language_code = str(payload.get("language_code") or "")
+	if not _TEMPLATE_NAME_RE.match(name):
+		return {"error": _err("invalid_name", message="Name must match ^[a-z0-9_]+$")}
+	if category not in TEMPLATE_CATEGORIES:
+		return {"error": _err("invalid_category", message="Category must be one of " + ", ".join(TEMPLATE_CATEGORIES))}
+	if not language_code:
+		return {"error": _err("invalid_language", message="language_code is required")}
+	if len(name) > 512:
+		return {"error": wt.validation_error([wt._e("template_name", "too_long", "Template name is longer than 512 characters.")])}
+	spec, errors = wt.validate_template_spec(payload)
+	if spec["header_type"] in wt.MEDIA_HEADER_TYPES and spec["header_sample"] and not errors:
+		problem = _check_sample_reference(spec["header_sample"])
+		if problem:
+			errors.append(problem)
+	language = _language_link(language_code, payload.get("language"))
+	if not language:
+		errors.append(wt._e("language_code", "unknown_language", f"Language {language_code} is not installed on this site."))
+	if errors:
+		return {"error": wt.validation_error(errors)}
+	return {"name": name, "category": category, "language_code": language_code, "language": language, "spec": spec}
+
+
 def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any]:
 	"""Create a WhatsApp Templates row (its after_insert pushes to Meta). Permission-checked (A8).
 
@@ -778,27 +832,11 @@ def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any
 		return _err("bridge_unavailable")
 	if not frappe.has_permission("WhatsApp Templates", "create"):
 		raise frappe.PermissionError("Not permitted to create WhatsApp Templates")
-	name = str(payload.get("template_name") or payload.get("name") or "")
-	category = str(payload.get("category") or "").upper()
-	language_code = str(payload.get("language_code") or "")
-	if not _TEMPLATE_NAME_RE.match(name):
-		return _err("invalid_name", message="Name must match ^[a-z0-9_]+$")
-	if category not in TEMPLATE_CATEGORIES:
-		return _err("invalid_category", message="Category must be one of " + ", ".join(TEMPLATE_CATEGORIES))
-	if not language_code:
-		return _err("invalid_language", message="language_code is required")
-	if len(name) > 512:
-		return wt.validation_error([wt._e("template_name", "too_long", "Template name is longer than 512 characters.")])
-	spec, errors = wt.validate_template_spec(payload)
-	if spec["header_type"] in wt.MEDIA_HEADER_TYPES and spec["header_sample"] and not errors:
-		problem = _check_sample_reference(spec["header_sample"])
-		if problem:
-			errors.append(problem)
-	language = _language_link(language_code, payload.get("language"))
-	if not language:
-		errors.append(wt._e("language_code", "unknown_language", f"Language {language_code} is not installed on this site."))
-	if errors:
-		return wt.validation_error(errors)
+	checked = validate_create_payload(payload)
+	if checked.get("error"):
+		return checked["error"]
+	name, category, language_code = checked["name"], checked["category"], checked["language_code"]
+	language, spec = checked["language"], checked["spec"]
 	values: dict[str, Any] = {k: payload[k] for k in _TEMPLATE_PASSTHROUGH if payload.get(k)}
 	values.update(
 		{
@@ -836,6 +874,10 @@ def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any
 		if orphan and not doc.get("id") and frappe.db.exists("WhatsApp Templates", orphan):
 			frappe.db.delete("WhatsApp Templates", {"name": orphan})
 		return _err("create_failed", message=_redact(exc))
+	record_template_state(
+		docname=doc.name, template_id=doc.get("id"), account=account_name, status=doc.get("status") or "PENDING",
+		category=category, source="create",
+	)
 	return {"success": True, "name": doc.name, "status": doc.get("status"), "id": doc.get("id")}
 
 
@@ -873,6 +915,12 @@ _META_BUTTON_TYPES = {
 }
 
 
+SYNC_FIELDS = (
+	"id,name,status,rejected_reason,quality_score,category,previous_category,correct_category,"
+	"language,parameter_format,components,message_send_ttl_seconds"
+)
+
+
 def _local_template(account_name: str, name: str, language: str) -> str | None:
 	"""Docname of the local row for a Meta template (name + language), or None."""
 	langs = [language, language.replace("-", "_")] if language else [None]
@@ -895,6 +943,100 @@ def _local_template(account_name: str, name: str, language: str) -> str | None:
 	return None
 
 
+def _parse_meta_components(components: Any) -> dict[str, Any]:
+	"""Meta ``components`` -> WhatsApp Templates fields (``header_type``, ``header``, ``footer``,
+	``template``, ``sample_values``) plus ``buttons`` child-row dicts. Absent parts stay empty."""
+	out: dict[str, Any] = {"header_type": "", "header": "", "footer": "", "template": "", "sample_values": "", "buttons": []}
+	for comp in components if isinstance(components, list) else []:
+		if not isinstance(comp, dict):
+			continue
+		ctype = str(comp.get("type") or "").upper()
+		if ctype == "HEADER":
+			fmt = str(comp.get("format") or "").upper()
+			if fmt in ("TEXT", "IMAGE", "DOCUMENT"):
+				out["header_type"] = fmt
+			if fmt == "TEXT":
+				out["header"] = comp.get("text") or ""
+		elif ctype == "FOOTER":
+			out["footer"] = comp.get("text") or ""
+		elif ctype == "BODY":
+			out["template"] = comp.get("text") or ""
+			body_text = (comp.get("example") or {}).get("body_text")
+			if body_text and body_text[0]:
+				out["sample_values"] = ",".join(str(v) for v in body_text[0])
+		elif ctype == "BUTTONS":
+			for i, btn in enumerate(comp.get("buttons") or [], start=1):
+				btype = _META_BUTTON_TYPES.get(btn.get("type"))
+				if not btype:
+					continue
+				row: dict[str, Any] = {"button_type": btype, "button_label": btn.get("text"), "sequence": i}
+				if btn.get("type") == "URL":
+					row["website_url"] = btn.get("url")
+					row["url_type"] = "Dynamic" if "{{" in str(btn.get("url") or "") else "Static"
+					if btn.get("example"):
+						row["example_url"] = ",".join(btn["example"])
+						if len(row["example_url"]) > _DATA_COLUMN_LEN:
+							# Meta sample link (often a long signed CDN URL): not needed to send, so dropped
+							row.pop("example_url")
+				elif btn.get("type") == "PHONE_NUMBER":
+					row["phone_number"] = btn.get("phone_number")
+				out["buttons"].append(row)
+	return out
+
+
+def _write_buttons(parent: str, rows: list[dict[str, Any]]) -> None:
+	"""Replace the ``WhatsApp Button`` children of a template with ``rows`` (no controller hooks)."""
+	frappe.db.delete("WhatsApp Button", {"parent": parent, "parenttype": "WhatsApp Templates"})
+	now, user = frappe.utils.now(), frappe.session.user
+	for i, row in enumerate(rows, start=1):
+		child = frappe.new_doc("WhatsApp Button")
+		child.update(row)
+		child.sequence = row.get("sequence") or i
+		child.parent, child.parenttype, child.parentfield = parent, "WhatsApp Templates", "buttons"
+		child.idx = i
+		child.owner = child.modified_by = user
+		child.creation = child.modified = now
+		child.docstatus = 0
+		child.db_insert()
+
+
+def _button_sig(rows: list[dict[str, Any]]) -> list[tuple]:
+	return [
+		(r.get("button_type") or "", r.get("button_label") or "", r.get("website_url") or "", r.get("phone_number") or "")
+		for r in rows
+	]
+
+
+def _refresh_local_components(name: str, tpl: dict[str, Any]) -> bool:
+	"""Bring a local row's header/body/footer/buttons in line with Meta's components; True when changed."""
+	comps = tpl.get("components")
+	if not isinstance(comps, list) or not comps:
+		return False  # no component info from Meta: leave the row alone
+	parsed = _parse_meta_components(comps)
+	current = frappe.db.get_value(
+		"WhatsApp Templates", name, ["template", "header_type", "header", "footer", "sample_values"], as_dict=True
+	) or {}
+	changes = {}
+	for key in ("template", "header_type", "header", "footer"):
+		if (current.get(key) or "") != (parsed[key] or ""):
+			changes[key] = parsed[key] or ""
+	# Meta only returns body examples when it has them; never wipe local samples with nothing
+	if parsed["sample_values"] and (current.get("sample_values") or "") != parsed["sample_values"]:
+		changes["sample_values"] = parsed["sample_values"]
+	local_buttons = frappe.get_all(
+		"WhatsApp Button",
+		filters={"parent": name, "parenttype": "WhatsApp Templates"},
+		fields=["button_type", "button_label", "website_url", "phone_number"],
+		order_by="idx asc",
+	)
+	buttons_changed = _button_sig(local_buttons) != _button_sig(parsed["buttons"])
+	if changes:
+		frappe.db.set_value("WhatsApp Templates", name, changes)
+	if buttons_changed:
+		_write_buttons(name, parsed["buttons"])
+	return bool(changes or buttons_changed)
+
+
 def _import_template(account_name: str, tpl: dict[str, Any]) -> str:
 	"""Insert a ``WhatsApp Templates`` row for a template that already exists on Meta.
 
@@ -912,38 +1054,12 @@ def _import_template(account_name: str, tpl: dict[str, Any]) -> str:
 	doc.id = tpl.get("id")
 	doc.whatsapp_account = account_name
 	doc.name = f"{name}-{language}"
-	for comp in tpl.get("components") or []:
-		ctype = str(comp.get("type") or "").upper()
-		if ctype == "HEADER":
-			fmt = str(comp.get("format") or "").upper()
-			if fmt in ("TEXT", "IMAGE", "DOCUMENT"):
-				doc.header_type = fmt
-			if fmt == "TEXT":
-				doc.header = comp.get("text")
-		elif ctype == "FOOTER":
-			doc.footer = comp.get("text")
-		elif ctype == "BODY":
-			doc.template = comp.get("text")
-			body_text = (comp.get("example") or {}).get("body_text")
-			if body_text and body_text[0]:
-				doc.sample_values = ",".join(str(v) for v in body_text[0])
-		elif ctype == "BUTTONS":
-			for i, btn in enumerate(comp.get("buttons") or [], start=1):
-				btype = _META_BUTTON_TYPES.get(btn.get("type"))
-				if not btype:
-					continue
-				row: dict[str, Any] = {"button_type": btype, "button_label": btn.get("text"), "sequence": i}
-				if btn.get("type") == "URL":
-					row["website_url"] = btn.get("url")
-					row["url_type"] = "Dynamic" if "{{" in str(btn.get("url") or "") else "Static"
-					if btn.get("example"):
-						row["example_url"] = ",".join(btn["example"])
-						if len(row["example_url"]) > _DATA_COLUMN_LEN:
-							# Meta sample link (often a long signed CDN URL): not needed to send, so dropped
-							row.pop("example_url")
-				elif btn.get("type") == "PHONE_NUMBER":
-					row["phone_number"] = btn.get("phone_number")
-				doc.append("buttons", row)
+	parsed = _parse_meta_components(tpl.get("components"))
+	for key in ("header_type", "header", "footer", "template", "sample_values"):
+		if parsed[key]:
+			setattr(doc, key, parsed[key])
+	for row in parsed["buttons"]:
+		doc.append("buttons", row)
 	# validate before any insert so an overflowing template never leaves a half-written parent row
 	checks = [("WhatsApp Templates", _TEMPLATE_DATA_FIELDS, [doc])]
 	checks.append(("WhatsApp Button", _BUTTON_DATA_FIELDS, list(doc.get("buttons") or [])))
@@ -986,7 +1102,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 	headers = {"Authorization": f"Bearer {acct['token']}"}
 	imported = updated = unchanged = skipped = seen = 0
 	skipped_reasons: list[str] = []
-	params: dict[str, Any] | None = {"limit": 100}
+	params: dict[str, Any] | None = {"limit": 100, "fields": SYNC_FIELDS}
 	try:
 		while url:
 			resp = http_get(url, headers=headers, params=params, timeout=_HTTP_TIMEOUT)
@@ -1016,6 +1132,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 							skipped_reasons.append(_redact(f"{tpl['name']}: import failed ({type(exc).__name__}: {exc})"))
 							continue
 						imported += 1
+						_record_state_from_meta(account_name, tpl, f"{tpl['name']}-{language}")
 						continue
 					current = frappe.db.get_value("WhatsApp Templates", name, ["status", "category", "id"], as_dict=True) or {}
 					changes = {
@@ -1025,6 +1142,9 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 					}
 					if changes:
 						frappe.db.set_value("WhatsApp Templates", name, changes)
+					refreshed = _refresh_local_components(name, tpl)
+					_record_state_from_meta(account_name, tpl, name)
+					if changes or refreshed:
 						updated += 1
 					else:
 						unchanged += 1
@@ -1049,6 +1169,726 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 		"skipped": skipped,
 		"skipped_reasons": skipped_reasons,
 	}
+
+
+# ------------------------------------------------------------ template state
+# Huf-owned review/quality state. Independent of frappe_whatsapp (works on sites without it):
+# frappe_whatsapp stores no rejection reason or quality, and drops the webhook ``reason``.
+
+STATE_DOCTYPE = "WhatsApp Template State"
+DRAFT_DOCTYPE = "WhatsApp Template Draft"
+MANAGER_URL = "https://business.facebook.com/latest/whatsapp_manager/message_templates"
+EDIT_LIMIT_30D = 10
+ADMIN_ROLES = ("System Manager", "Huf Admin")
+TEMPLATE_STATUSES = (
+	"APPROVED", "PENDING", "REJECTED", "PAUSED", "DISABLED", "IN_APPEAL", "LIMIT_EXCEEDED",
+	"PENDING_DELETION", "DELETED",
+)
+# Webhook events that are not statuses (FLAGGED, REINSTATED, LOCKED, ARCHIVED, UNARCHIVED) only set ``last_event``.
+_QUALITY_WORDS = {"GREEN": "GREEN", "HIGH": "GREEN", "YELLOW": "YELLOW", "MEDIUM": "YELLOW", "RED": "RED", "LOW": "RED"}
+_DRAFT_OPEN = ("Draft", "Pending Review", "Failed")
+
+
+def manager_url(business_id: str | None = None) -> str:
+	"""WhatsApp Manager template list. Meta documents no query parameters, so none are added."""
+	return MANAGER_URL
+
+
+def derive_quality(raw: Any) -> str:
+	"""GREEN/YELLOW/RED/UNKNOWN from Meta's quality value (string or object of unverified shape)."""
+
+	def walk(value: Any, depth: int = 0) -> str | None:
+		if isinstance(value, str):
+			return _QUALITY_WORDS.get(value.strip().upper())
+		if isinstance(value, dict) and depth < 3:
+			for key in ("score", "quality_score", "new_quality_score", "quality", "value", "rating"):
+				if key in value:
+					found = walk(value[key], depth + 1)
+					if found:
+						return found
+		return None
+
+	return walk(raw) or "UNKNOWN"
+
+
+def _utcnow() -> datetime:
+	return datetime.now(timezone.utc)
+
+
+def _parse_ts(value: Any) -> datetime | None:
+	try:
+		dt = datetime.fromisoformat(str(value))
+	except (TypeError, ValueError):
+		return None
+	return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _loads(value: Any, default: Any = None) -> Any:
+	if isinstance(value, (dict, list)):
+		return value
+	try:
+		return json.loads(value) if value else default
+	except (TypeError, ValueError):
+		return default
+
+
+def _state_row(docname: str) -> dict[str, Any] | None:
+	try:
+		if not frappe.db.exists(STATE_DOCTYPE, docname):
+			return None
+		return frappe.db.get_value(STATE_DOCTYPE, docname, "*", as_dict=True)
+	except Exception:
+		return None
+
+
+def _publish_status(template: str, status: str, reason: str = "") -> None:
+	try:
+		frappe.publish_realtime("whatsapp_template_status", {"template": template, "status": status, "reason": reason})
+	except Exception:
+		pass
+
+
+def _clean_reason(reason: Any) -> str:
+	text = str(reason or "").strip()
+	return "" if text.upper() == "NONE" else text
+
+
+def _resolve_state_name(template_id: Any, name: Any, language: Any) -> str | None:
+	tid = str(template_id or "").strip()
+	if tid:
+		found = frappe.db.get_value(STATE_DOCTYPE, {"template_id": tid}, "name")
+		if found:
+			return found
+		if frappe.db.exists("DocType", "WhatsApp Templates"):
+			found = frappe.db.get_value("WhatsApp Templates", {"id": tid}, "name")
+			if found:
+				return found
+	name, language = str(name or "").strip(), str(language or "").strip()
+	if name and language:
+		return f"{name}-{language}"
+	if name and frappe.db.exists("DocType", "WhatsApp Templates"):
+		found = frappe.db.get_value("WhatsApp Templates", {"actual_name": name}, "name")
+		if found:
+			return found
+	return None
+
+
+def record_template_state(
+	*,
+	template_id: Any = None,
+	name: Any = None,
+	language: Any = None,
+	docname: str | None = None,
+	account: str | None = None,
+	status: str | None = None,
+	event: str | None = None,
+	category: str | None = None,
+	previous_category: str | None = None,
+	correct_category: str | None = None,
+	reason: Any = None,
+	recommendation: str | None = None,
+	other_info: Any = None,
+	quality: Any = None,
+	components: Any = None,
+	source: str = "webhook",
+) -> str | None:
+	"""Upsert the ``WhatsApp Template State`` of a template; best effort, never raises.
+
+	``None`` leaves a field untouched, ``""`` clears it. ``event`` is a webhook event: it sets
+	``last_event`` and, when it is a template status, ``status``. Publishes the
+	``whatsapp_template_status`` realtime event when the status changed. Returns the docname.
+	"""
+	try:
+		if not frappe.db.exists("DocType", STATE_DOCTYPE):
+			return None
+		docname = docname or _resolve_state_name(template_id, name, language)
+		if not docname:
+			return None
+		event_u = str(event or "").strip().upper()
+		new_status = str(status or "").strip().upper() or (event_u if event_u in TEMPLATE_STATUSES else "")
+		now = frappe.utils.now_datetime()
+		existing = frappe.db.exists(STATE_DOCTYPE, docname)
+		doc = frappe.get_doc(STATE_DOCTYPE, docname) if existing else frappe.new_doc(STATE_DOCTYPE)
+		if not existing:
+			doc.template = docname
+		old_status = (doc.get("status") or "") if existing else ""
+		if template_id not in (None, ""):
+			doc.template_id = str(template_id)
+		if account:
+			doc.whatsapp_account = account
+		if new_status:
+			doc.status = new_status
+		if category not in (None, "") and category != doc.get("category"):
+			if previous_category in (None, "") and doc.get("category"):
+				previous_category = doc.get("category")
+			doc.category = category
+		if previous_category is not None:
+			doc.previous_category = previous_category
+		if correct_category is not None:
+			doc.correct_category = correct_category
+		cleaned = _clean_reason(reason)
+		if cleaned:
+			doc.rejected_reason = cleaned[:255]
+		elif new_status in ("APPROVED", "PENDING") and (reason is not None or event_u):
+			doc.rejected_reason = ""
+			doc.rejection_recommendation = ""
+		if recommendation:
+			doc.rejection_recommendation = str(recommendation)
+		if other_info:
+			if isinstance(other_info, dict):
+				bits = [str(other_info.get(k)) for k in ("title", "description") if other_info.get(k)]
+				other_info = ": ".join(bits)
+			doc.other_info = str(other_info)
+		elif new_status == "APPROVED":
+			doc.other_info = ""
+		if quality is not None:
+			doc.quality_raw = json.dumps(quality, default=str)
+			doc.quality_score = derive_quality(quality)
+		elif not doc.get("quality_score"):
+			doc.quality_score = "UNKNOWN"
+		if isinstance(components, list):
+			doc.components = json.dumps(components)
+		if event_u:
+			doc.last_event = event_u
+			doc.last_event_at = now
+		doc.last_meta_update = now
+		doc.flags.ignore_permissions = True
+		if existing:
+			doc.save()
+		else:
+			doc.insert()
+		if new_status and (new_status != old_status):
+			_publish_status(docname, new_status, doc.get("rejected_reason") or "")
+		return docname
+	except Exception:
+		try:
+			frappe.logger("huf").warning("WhatsApp template state update failed", exc_info=True)
+		except Exception:
+			pass
+		return None
+
+
+def record_template_webhook(update: dict[str, Any], account: str | None = None) -> str | None:
+	"""State update from a parsed ``message_template_*`` webhook change (see gateway_webhook)."""
+	try:
+		kind = update.get("kind") or (
+			"quality" if "new_quality_score" in update else "category" if "new_category" in update else "status"
+		)
+		common = {
+			"template_id": update.get("message_template_id"),
+			"name": update.get("message_template_name") or update.get("name"),
+			"language": update.get("message_template_language") or update.get("language"),
+			"account": account,
+		}
+		if kind == "quality":
+			return record_template_state(**common, quality=update.get("new_quality_score"), event="QUALITY_UPDATE")
+		if kind == "category":
+			return record_template_state(
+				**common,
+				category=str(update.get("new_category") or "").upper() or None,
+				previous_category=str(update.get("previous_category") or "").upper() or None,
+				correct_category="",
+				event="CATEGORY_UPDATE",
+			)
+		info = update.get("rejection_info") if isinstance(update.get("rejection_info"), dict) else {}
+		return record_template_state(
+			**common,
+			event=str(update.get("event") or update.get("status") or "") or None,
+			reason=update.get("reason") or info.get("reason"),
+			recommendation=info.get("recommendation"),
+			other_info=update.get("other_info") if isinstance(update.get("other_info"), dict) else None,
+		)
+	except Exception:
+		return None
+
+
+def _record_state_from_meta(account_name: str, tpl: dict[str, Any], docname: str) -> None:
+	"""State update from one template of Meta's ``/message_templates`` listing (sync)."""
+	record_template_state(
+		docname=docname,
+		template_id=tpl.get("id"),
+		account=account_name,
+		status=tpl.get("status"),
+		category=tpl.get("category"),
+		previous_category=tpl.get("previous_category") or None,
+		correct_category=tpl.get("correct_category") or "",
+		reason=tpl.get("rejected_reason"),
+		quality=tpl.get("quality_score"),
+		components=tpl.get("components"),
+		source="sync",
+	)
+
+
+def edit_quota(status: str, edit_log: Any, now: datetime | None = None) -> dict[str, Any]:
+	"""Meta edit rules for a template in ``status`` given its ``edit_log`` (ISO timestamps).
+
+	APPROVED: at most 1 edit per 24h and 10 per 30 days; REJECTED/PAUSED: unlimited;
+	anything else is not editable. ``edits_left`` is the remaining 30-day allowance for an
+	APPROVED template (None = unlimited, 0 = none), ``next_edit_at`` the earliest time a
+	blocked APPROVED template may be edited again.
+	"""
+	now = now or _utcnow()
+	status = str(status or "").upper()
+	times = sorted(t for t in (_parse_ts(x) for x in (_loads(edit_log, []) or [])) if t)
+	last_30d = [t for t in times if now - t < timedelta(days=30)]
+	out: dict[str, Any] = {
+		"editable": False, "editable_reason": "", "editable_message": "", "edits_left": 0,
+		"edits_30d": len(last_30d), "next_edit_at": None,
+	}
+	if status in ("REJECTED", "PAUSED"):
+		out.update(editable=True, edits_left=None)
+	elif status == "APPROVED":
+		out["edits_left"] = max(0, EDIT_LIMIT_30D - len(last_30d))
+		if len(last_30d) >= EDIT_LIMIT_30D:
+			nxt = last_30d[0] + timedelta(days=30)
+			out.update(editable_reason="edit_limit_30d", next_edit_at=nxt.isoformat(),
+				editable_message=f"Approved templates can be edited {EDIT_LIMIT_30D} times in 30 days; the limit is used up.")
+		elif last_30d and now - last_30d[-1] < timedelta(hours=24):
+			nxt = last_30d[-1] + timedelta(hours=24)
+			out.update(editable_reason="edit_limit_24h", next_edit_at=nxt.isoformat(),
+				editable_message="Approved templates can be edited once every 24 hours.")
+		else:
+			out["editable"] = True
+	else:
+		out.update(editable_reason="status_not_editable",
+			editable_message=f"A template with status {status or 'UNKNOWN'} cannot be edited (only APPROVED, REJECTED or PAUSED).")
+	return out
+
+
+def _button_dicts(docname: str) -> list[dict[str, Any]]:
+	rows = frappe.get_all(
+		"WhatsApp Button",
+		filters={"parent": docname, "parenttype": "WhatsApp Templates"},
+		fields=["button_type", "button_label", "url_type", "website_url", "phone_number", "example_url"],
+		order_by="idx asc",
+	)
+	reverse = {v: k for k, v in wt.DOCTYPE_BUTTON_TYPE.items()}
+	out = []
+	for r in rows:
+		btype = reverse.get(r.get("button_type"))
+		if not btype:
+			continue
+		b: dict[str, Any] = {"type": btype, "text": r.get("button_label") or ""}
+		if btype == "URL":
+			b["url"] = r.get("website_url") or ""
+			if r.get("example_url"):
+				b["example"] = r["example_url"]
+		elif btype == "PHONE_NUMBER":
+			b["phone_number"] = r.get("phone_number") or ""
+		out.append(b)
+	return out
+
+
+_ROW_FIELDS = [
+	"name", "id", "actual_name", "template_name", "language_code", "category", "status", "whatsapp_account",
+	"template", "header_type", "header", "sample", "footer", "sample_values",
+]
+
+
+def _current_payload(row: dict[str, Any]) -> dict[str, Any]:
+	"""Local row as a create-style payload (the base an edit is merged onto)."""
+	payload: dict[str, Any] = {
+		"template_name": row.get("actual_name") or row.get("template_name"),
+		"category": row.get("category"),
+		"language_code": row.get("language_code"),
+		"body": row.get("template") or "",
+		"sample_values": row.get("sample_values") or "",
+		"footer": row.get("footer") or "",
+		"buttons": _button_dicts(row["name"]),
+	}
+	if row.get("header_type"):
+		payload["header_type"] = row["header_type"]
+		if row["header_type"] == "TEXT":
+			payload["header"] = row.get("header") or ""
+		if row.get("sample"):
+			payload["sample"] = row["sample"]
+	return payload
+
+
+def get_template(name: str) -> dict[str, Any]:
+	"""Full detail of one template: components, review/quality state, edit allowance, manager link."""
+	if not is_available():
+		return _err("bridge_unavailable")
+	if not frappe.has_permission("WhatsApp Templates", "read"):
+		raise frappe.PermissionError("Not permitted to read WhatsApp Templates")
+	if not name or not frappe.db.exists("WhatsApp Templates", name):
+		return _err("not_found")
+	row = frappe.db.get_value("WhatsApp Templates", name, _ROW_FIELDS, as_dict=True)
+	state = _state_row(name) or {}
+	status = (state.get("status") or row.get("status") or "").upper()
+	quota = edit_quota(status, state.get("edit_log"))
+	view = {
+		"header": (
+			{"type": row["header_type"], "text": row.get("header") or "", "sample": row.get("sample") or ""}
+			if row.get("header_type") else None
+		),
+		"body": {"text": row.get("template") or "", "sample_values": [s for s in (row.get("sample_values") or "").split(",") if s]},
+		"footer": {"text": row["footer"]} if row.get("footer") else None,
+		"buttons": _button_dicts(name),
+	}
+	business_id = ""
+	if row.get("whatsapp_account"):
+		business_id = frappe.db.get_value("WhatsApp Account", row["whatsapp_account"], "business_id") or ""
+	category = row.get("category")
+	correct = state.get("correct_category") or ""
+	return {
+		"success": True,
+		"name": name,
+		"template_id": row.get("id") or state.get("template_id") or "",
+		"template_name": row.get("actual_name") or row.get("template_name"),
+		"language_code": row.get("language_code"),
+		"category": category,
+		"previous_category": state.get("previous_category") or "",
+		"correct_category": correct,
+		"category_change_pending": bool(correct and correct != category),
+		"status": status,
+		"whatsapp_account": row.get("whatsapp_account"),
+		"components": view,
+		"meta_components": _loads(state.get("components"), []),
+		"state": {
+			"rejected_reason": state.get("rejected_reason") or "",
+			"rejection_recommendation": state.get("rejection_recommendation") or "",
+			"other_info": state.get("other_info") or "",
+			"quality_score": state.get("quality_score") or "UNKNOWN",
+			"quality_raw": _loads(state.get("quality_raw")),
+			"last_event": state.get("last_event") or "",
+			"last_event_at": str(state["last_event_at"]) if state.get("last_event_at") else None,
+			"last_meta_update": str(state["last_meta_update"]) if state.get("last_meta_update") else None,
+		},
+		**quota,
+		"manager_url": manager_url(business_id),
+		"business_id": business_id,
+	}
+
+
+def edit_template(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+	"""Edit a template on Meta (``POST /{template-id}`` with the FULL components) and locally.
+
+	Meta rules enforced here before any call: status must be APPROVED/REJECTED/PAUSED, an
+	APPROVED template allows 1 edit/24h and 10/30 days, name and language are immutable.
+	``payload`` keys (body, sample_values, header*, sample, footer, buttons, category,
+	message_send_ttl_seconds) are merged onto the current definition. After the edit the
+	template is PENDING re-review. Permission-checked.
+	"""
+	if not is_available():
+		return _err("bridge_unavailable")
+	if not frappe.has_permission("WhatsApp Templates", "write"):
+		raise frappe.PermissionError("Not permitted to edit WhatsApp Templates")
+	if not isinstance(payload, dict):
+		return _err("invalid_payload", message="payload must be an object")
+	if not name or not frappe.db.exists("WhatsApp Templates", name):
+		return _err("not_found")
+	row = frappe.db.get_value("WhatsApp Templates", name, _ROW_FIELDS, as_dict=True)
+	meta_name = row.get("actual_name") or row.get("template_name")
+	for key, current in (("template_name", meta_name), ("name", meta_name), ("language_code", row.get("language_code"))):
+		if payload.get(key) not in (None, "") and str(payload[key]) != str(current):
+			return _err("immutable_field", field=key, message="Template name and language cannot be changed after creation.")
+	if not row.get("id"):
+		return _err("no_template_id", message="This template has no Meta ID yet; sync templates first.")
+	state = _state_row(name) or {}
+	status = (state.get("status") or row.get("status") or "").upper()
+	quota = edit_quota(status, state.get("edit_log"))
+	if not quota["editable"]:
+		return _err(quota["editable_reason"], message=quota["editable_message"], status=status,
+			next_edit_at=quota["next_edit_at"], edits_left=quota["edits_left"])
+	acct = resolve_account(row.get("whatsapp_account"))
+	if not acct or acct.get("error"):
+		return _err("no_account")
+
+	merged = _current_payload(row)
+	for key in ("body", "template", "sample_values", "header", "header_type", "sample", "footer", "buttons"):
+		if key in payload:
+			merged[key] = payload[key]
+	if "template" in payload and "body" not in payload:
+		merged.pop("body", None)
+	if "header_type" in payload and not payload["header_type"]:
+		for key in ("header_type", "header", "sample"):
+			merged.pop(key, None)
+	category = str(payload.get("category") or row.get("category") or "").upper()
+	if category not in TEMPLATE_CATEGORIES:
+		return _err("invalid_category", message="Category must be one of " + ", ".join(TEMPLATE_CATEGORIES))
+	ttl = payload.get("message_send_ttl_seconds")
+	if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, int)):
+		return _err("invalid_ttl", message="message_send_ttl_seconds must be an integer")
+
+	media_unchanged = row.get("header_type") in wt.MEDIA_HEADER_TYPES and not any(
+		k in payload for k in ("header_type", "header", "sample")
+	)
+	if media_unchanged:
+		merged["sample"] = "https://existing.invalid/header"  # satisfied by the reused Meta header below
+	spec, errors = wt.validate_template_spec(merged)
+	if spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged:
+		return _err(
+			"media_header_edit_unsupported",
+			message="Changing an image/document header needs a fresh upload; edit it in WhatsApp Manager.",
+		)
+	if errors:
+		return wt.validation_error(errors)
+	media_header = None
+	if media_unchanged:
+		for comp in _loads(state.get("components"), []) or []:
+			if isinstance(comp, dict) and str(comp.get("type")).upper() == "HEADER":
+				if (comp.get("example") or {}).get("header_handle"):
+					media_header = comp
+		if not media_header:
+			return _err("media_header_edit_unsupported", message="The current media header cannot be re-sent; edit it in WhatsApp Manager.")
+	components = wt.build_meta_components(spec, media_header)
+
+	local_buttons = frappe.get_all(
+		"WhatsApp Button", filters={"parent": name, "parenttype": "WhatsApp Templates"},
+		fields=["button_type", "button_label", "website_url", "phone_number"], order_by="idx asc",
+	)
+	same_header_text = (spec["header_text"] or "") == ((row.get("header") or "") if row.get("header_type") == "TEXT" else "")
+	if (
+		category == str(row.get("category") or "").upper()
+		and ttl is None
+		and spec["body"] == (row.get("template") or "")
+		and ",".join(spec["sample_values"]) == (row.get("sample_values") or "")
+		and (spec["header_type"] or "") == (row.get("header_type") or "")
+		and same_header_text
+		and (spec["footer"] or "") == (row.get("footer") or "")
+		and _button_sig(wt.button_rows(spec)) == _button_sig(local_buttons)
+	):
+		return _err("no_changes", message="Nothing changed; no edit was sent to Meta.")
+
+	body: dict[str, Any] = {"components": components}
+	if category != str(row.get("category") or "").upper():
+		body["category"] = category
+	if ttl is not None:
+		body["message_send_ttl_seconds"] = ttl
+	try:
+		resp = _default_post(
+			f"{acct['url']}/{acct['version']}/{row['id']}",
+			json=body,
+			headers={"Authorization": f"Bearer {acct['token']}", "Content-Type": "application/json"},
+			timeout=_HTTP_TIMEOUT,
+		)
+	except Exception as exc:
+		return _err("edit_failed", message=_redact(exc))
+	code = getattr(resp, "status_code", 200)
+	if isinstance(code, int) and code >= 400:
+		return _err("edit_failed", message=graph_error_message(resp))
+
+	changes: dict[str, Any] = {
+		"template": spec["body"],
+		"sample_values": ",".join(spec["sample_values"]),
+		"header_type": spec["header_type"] or "",
+		"footer": spec["footer"] or "",
+		"category": category,
+		"status": "PENDING",
+	}
+	if spec["header_type"] == "TEXT":
+		changes["header"] = spec["header_text"]
+		changes["sample"] = spec["header_sample"]
+	elif not spec["header_type"]:
+		changes["header"] = ""
+		changes["sample"] = ""
+	frappe.db.set_value("WhatsApp Templates", name, changes)
+	_write_buttons(name, wt.button_rows(spec))
+
+	log = _loads(state.get("edit_log"), []) or []
+	if status == "APPROVED":  # only edits of an APPROVED template count against Meta's quota
+		log.append(_utcnow().isoformat())
+		cutoff = _utcnow() - timedelta(days=60)
+		log = [t for t in log if (_parse_ts(t) or _utcnow()) > cutoff]
+	record_template_state(
+		docname=name, template_id=row["id"], account=row.get("whatsapp_account"), status="PENDING",
+		category=category, reason="", recommendation="", components=components, source="edit",
+	)
+	if frappe.db.exists(STATE_DOCTYPE, name):
+		frappe.db.set_value(STATE_DOCTYPE, name, "edit_log", json.dumps(log))
+	return {
+		"success": True,
+		"name": name,
+		"status": "PENDING",
+		"edits_left": edit_quota("APPROVED", log)["edits_left"] if status == "APPROVED" else None,
+	}
+
+
+# ------------------------------------------------------------------- drafts
+
+
+def _is_admin() -> bool:
+	return bool(set(frappe.get_roles() or []).intersection(ADMIN_ROLES))
+
+
+def _draft_row(doc_or_row: Any) -> dict[str, Any]:
+	g = doc_or_row.get
+	return {
+		"name": g("name"), "template_name": g("template_name"), "language_code": g("language_code"),
+		"category": g("category"), "whatsapp_account": g("whatsapp_account"), "status": g("status"),
+		"payload": _loads(g("payload"), {}), "requested_by": g("requested_by"), "requested_via": g("requested_via"),
+		"agent_run": g("agent_run"), "reviewed_by": g("reviewed_by"),
+		"reviewed_at": str(g("reviewed_at")) if g("reviewed_at") else None, "review_note": g("review_note"),
+		"submitted_template": g("submitted_template"), "submit_error": g("submit_error"),
+		"creation": str(g("creation")) if g("creation") else None,
+	}
+
+
+def create_draft(
+	payload: dict[str, Any],
+	requested_by: str | None = None,
+	via: str = "User",
+	agent_run: str | None = None,
+	account: str | None = None,
+	status: str = "Pending Review",
+	trusted: bool = False,
+) -> dict[str, Any]:
+	"""Save a template draft (validated like ``create_template``); nothing is sent to Meta.
+
+	``trusted`` skips the permission check (server-gated agent path only).
+	"""
+	if not isinstance(payload, dict):
+		return _err("invalid_payload", message="payload must be an object")
+	if status not in ("Draft", "Pending Review"):
+		return _err("invalid_status", message="A new draft is either Draft or Pending Review.")
+	if not trusted and not frappe.has_permission(DRAFT_DOCTYPE, "create"):
+		raise frappe.PermissionError("Not permitted to create WhatsApp Template Drafts")
+	checked = validate_create_payload(payload)
+	if checked.get("error"):
+		return checked["error"]
+	clean = {k: v for k, v in payload.items() if k not in ("allow_whatsapp_management", "allow_proactive")}
+	doc = frappe.get_doc(
+		{
+			"doctype": DRAFT_DOCTYPE,
+			"template_name": checked["name"],
+			"language_code": checked["language_code"],
+			"category": checked["category"],
+			"whatsapp_account": account or "",
+			"payload": json.dumps(clean, default=str),
+			"status": status,
+			"requested_by": requested_by or frappe.session.user,
+			"requested_via": "Agent run" if via == "Agent run" else "User",
+			"agent_run": agent_run or "",
+		}
+	)
+	doc.insert(ignore_permissions=bool(trusted))
+	return {"success": True, "name": doc.name, "status": doc.status, "draft": _draft_row(doc)}
+
+
+def _locked_draft(name: str) -> Any:
+	if not name or not frappe.db.exists(DRAFT_DOCTYPE, name):
+		return None
+	return frappe.get_doc(DRAFT_DOCTYPE, name, for_update=True)
+
+
+def approve_draft(name: str, note: str = "") -> dict[str, Any]:
+	"""Admin approval: re-validate the payload and submit it to Meta exactly once.
+
+	Sets ``Approved & Submitted`` (+ ``submitted_template``) on success, ``Failed`` (+
+	``submit_error``) when Meta or validation refuses. A draft that is already submitted or
+	rejected cannot be approved again.
+	"""
+	if not _is_admin():
+		raise frappe.PermissionError("System Manager or Huf Admin role required")
+	doc = _locked_draft(name)
+	if not doc:
+		return _err("not_found")
+	if doc.status not in _DRAFT_OPEN:
+		return _err("already_processed", status=doc.status, message=f"This draft is {doc.status}.")
+	payload = _loads(doc.payload, {}) or {}
+	doc.reviewed_by = frappe.session.user
+	doc.reviewed_at = frappe.utils.now_datetime()
+	doc.review_note = note or ""
+	account = doc.whatsapp_account
+	if not is_available():
+		result: dict[str, Any] = _err("bridge_unavailable")
+	else:
+		if not account:
+			acct = resolve_account(None)
+			account = (acct or {}).get("name") if acct and not acct.get("error") else None
+		try:
+			result = create_template(account, payload) if account else _err("no_account")
+		except frappe.PermissionError:
+			raise
+		except Exception as exc:
+			result = _err("create_failed", message=_redact(exc))
+	if result.get("success"):
+		doc.status = "Approved & Submitted"
+		doc.submitted_template = result.get("name")
+		doc.submit_error = ""
+		doc.whatsapp_account = account
+	else:
+		doc.status = "Failed"
+		detail = result.get("message") or "; ".join(str(e.get("message")) for e in result.get("errors") or [])
+		doc.submit_error = _redact(detail or result.get("error"))[:1000]
+	doc.save(ignore_permissions=True)
+	out = {
+		"success": bool(result.get("success")),
+		"name": doc.name,
+		"status": doc.status,
+		"submitted_template": doc.submitted_template or "",
+		"submit_error": doc.submit_error or "",
+	}
+	if not out["success"]:
+		out["error"] = result.get("error")
+	return out
+
+
+def reject_draft(name: str, note: str = "") -> dict[str, Any]:
+	"""Admin rejection of a draft; never contacts Meta."""
+	if not _is_admin():
+		raise frappe.PermissionError("System Manager or Huf Admin role required")
+	doc = _locked_draft(name)
+	if not doc:
+		return _err("not_found")
+	if doc.status not in _DRAFT_OPEN:
+		return _err("already_processed", status=doc.status, message=f"This draft is {doc.status}.")
+	doc.status = "Rejected"
+	doc.reviewed_by = frappe.session.user
+	doc.reviewed_at = frappe.utils.now_datetime()
+	doc.review_note = note or ""
+	doc.save(ignore_permissions=True)
+	return {"success": True, "name": doc.name, "status": doc.status}
+
+
+def list_drafts(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+	"""Template drafts, newest first (permission-checked read)."""
+	if not frappe.has_permission(DRAFT_DOCTYPE, "read"):
+		raise frappe.PermissionError("Not permitted to read WhatsApp Template Drafts")
+	filters = {"status": status} if status else {}
+	rows = frappe.get_all(DRAFT_DOCTYPE, filters=filters, fields=["*"], order_by="creation desc", limit_page_length=limit)
+	return [_draft_row(r) for r in rows]
+
+
+def get_draft_or_state(ref: str) -> dict[str, Any]:
+	"""Agent-facing lookup by draft name or template name: draft state plus Meta review state."""
+	ref = str(ref or "").strip()
+	if not ref:
+		return _err("invalid_name", message="template_name is required")
+	out: dict[str, Any] = {"success": True}
+	draft = None
+	if frappe.db.exists(DRAFT_DOCTYPE, ref):
+		draft = frappe.get_doc(DRAFT_DOCTYPE, ref)
+	else:
+		hit = frappe.get_all(
+			DRAFT_DOCTYPE, filters={"template_name": ref}, order_by="creation desc", limit_page_length=1, pluck="name"
+		)
+		if hit:
+			draft = frappe.get_doc(DRAFT_DOCTYPE, hit[0])
+	docname = None
+	if draft is not None:
+		out["draft"] = {
+			"name": draft.name, "status": draft.status, "review_note": draft.review_note or "",
+			"submit_error": draft.submit_error or "", "submitted_template": draft.submitted_template or "",
+		}
+		docname = draft.submitted_template or None
+	if not docname and frappe.db.exists(STATE_DOCTYPE, ref):
+		docname = ref
+	if not docname:
+		hit = frappe.get_all(STATE_DOCTYPE, filters={"template": ["like", f"{ref}-%"]}, limit_page_length=1, pluck="name")
+		docname = hit[0] if hit else None
+	if docname:
+		state = _state_row(docname) or {}
+		out.update(
+			template=docname, status=state.get("status") or "", reason=state.get("rejected_reason") or "",
+			recommendation=state.get("rejection_recommendation") or "",
+			quality=state.get("quality_score") or "UNKNOWN",
+			category=state.get("category") or "", correct_category=state.get("correct_category") or "",
+		)
+	elif draft is None:
+		return _err("not_found", message=f"No template or draft named {ref}.")
+	return out
 
 
 def forward_status(change: dict[str, Any], _retry: bool = False) -> bool:
