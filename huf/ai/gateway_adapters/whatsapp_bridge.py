@@ -20,6 +20,7 @@ import re
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import quote, urlparse
 
 import frappe
 
@@ -29,7 +30,24 @@ DEFAULT_MAX_MEDIA_BYTES = 16 * 1024 * 1024
 DEFAULT_MIME_PREFIXES = ("image/", "audio/", "video/", "application/pdf", "text/plain")
 TEMPLATE_CATEGORIES = ("MARKETING", "UTILITY", "AUTHENTICATION")
 _TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
-_HTTP_TIMEOUT = 30
+_HTTP_TIMEOUT = 15
+_MEDIA_HOST_SUFFIXES = ("fbcdn.net", "facebook.com", "whatsapp.net", "fbsbx.com")
+_SECRET_QS_RE = re.compile(r"(?i)((?:access_)?token=)[^&\s\"'<>]+")
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+
+
+def _redact(text: Any) -> str:
+	"""Strip access tokens and full URLs from text destined for errors/logs."""
+	out = _SECRET_QS_RE.sub(r"\1[redacted]", str(text))
+	return _URL_RE.sub("[url]", out)
+
+
+def _is_media_host(url: str) -> bool:
+	parsed = urlparse(url)
+	host = (parsed.hostname or "").lower()
+	if parsed.scheme != "https" or not host:
+		return False
+	return any(host == suf or host.endswith("." + suf) for suf in _MEDIA_HOST_SUFFIXES)
 
 
 class BridgeError(Exception):
@@ -233,7 +251,7 @@ def send_text(
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
-		raise BridgeError(_err("send_failed", message=str(exc))) from exc
+		raise BridgeError(_err("send_failed", message=_redact(exc))) from exc
 	return _readback(doc)
 
 
@@ -290,7 +308,7 @@ def send_template(
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
-		raise BridgeError(_err("send_failed", message=str(exc))) from exc
+		raise BridgeError(_err("send_failed", message=_redact(exc))) from exc
 	return _readback(doc)
 
 
@@ -345,7 +363,7 @@ def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
-		return _err("create_failed", message=str(exc))
+		return _err("create_failed", message=_redact(exc))
 	return {"success": True, "name": doc.name, "status": doc.get("status"), "id": doc.get("id")}
 
 
@@ -362,7 +380,7 @@ def delete_template(name: str) -> dict[str, Any]:
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
-		return _err("delete_failed", message=str(exc))
+		return _err("delete_failed", message=_redact(exc))
 	return {"success": True, "name": name}
 
 
@@ -404,10 +422,15 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 						{"status": tpl.get("status"), "id": tpl.get("id")},
 					)
 					updated += 1
-			url = (data.get("paging") or {}).get("next")
+			next_url = (data.get("paging") or {}).get("next")
+			if next_url:
+				nxt, base = urlparse(str(next_url)), urlparse(acct["url"])
+				if nxt.scheme != "https" or (nxt.hostname or "").lower() != (base.hostname or "").lower():
+					return _err("sync_failed", message="Unexpected paging URL host")
+			url = next_url
 			params = None
 	except Exception as exc:
-		return _err("sync_failed", message=str(exc))
+		return _err("sync_failed", message=_redact(exc))
 	return {"success": True, "seen": seen, "updated": updated}
 
 
@@ -444,7 +467,12 @@ def download_media(
 		raise ValueError("no_account")
 	http_get = http_get or _default_get
 	headers = {"Authorization": f"Bearer {acct['token']}"}
-	meta_resp = http_get(f"{acct['url']}/{acct['version']}/{media_id}", headers=headers, timeout=_HTTP_TIMEOUT)
+	meta_resp = http_get(
+		f"{acct['url']}/{acct['version']}/{quote(str(media_id), safe='')}",
+		headers=headers,
+		timeout=_HTTP_TIMEOUT,
+		allow_redirects=False,
+	)
 	meta_resp.raise_for_status()
 	meta = meta_resp.json()
 	mime = str(meta.get("mime_type") or "").split(";")[0].strip().lower()
@@ -456,11 +484,26 @@ def download_media(
 	media_url = meta.get("url")
 	if not media_url:
 		raise ValueError("media_url_missing")
-	resp = http_get(media_url, headers=headers, timeout=_HTTP_TIMEOUT)
-	resp.raise_for_status()
-	content = resp.content
-	if len(content) > max_bytes:
-		raise ValueError("media_too_large")
+	if not _is_media_host(str(media_url)):
+		raise ValueError("media_url_host_not_allowed")
+	resp = http_get(media_url, headers=headers, timeout=_HTTP_TIMEOUT, allow_redirects=False, stream=True)
+	try:
+		resp.raise_for_status()
+		if hasattr(resp, "iter_content"):
+			buf = bytearray()
+			for chunk in resp.iter_content(chunk_size=64 * 1024):
+				buf.extend(chunk)
+				if len(buf) > max_bytes:
+					raise ValueError("media_too_large")
+			content = bytes(buf)
+		else:
+			content = resp.content
+			if len(content) > max_bytes:
+				raise ValueError("media_too_large")
+	finally:
+		close = getattr(resp, "close", None)
+		if callable(close):
+			close()
 	filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(meta.get("filename") or media_id))[:100] or "media"
 	return {"content": content, "mime_type": mime, "filename": filename}
 

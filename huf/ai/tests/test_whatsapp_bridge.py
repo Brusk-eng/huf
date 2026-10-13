@@ -1,5 +1,6 @@
 """Unit tests for the optional frappe_whatsapp bridge (mock-based)."""
 
+import json
 import sys
 import unittest
 from datetime import datetime, timedelta
@@ -34,6 +35,13 @@ class FakeResp:
 
 	def json(self):
 		return self._j
+
+	def iter_content(self, chunk_size=1):
+		for i in range(0, len(self.content), 2):
+			yield self.content[i : i + 2]
+
+	def close(self):
+		pass
 
 
 class FakeDoc(SimpleNamespace):
@@ -184,7 +192,7 @@ class TestBridge(unittest.TestCase):
 		self.assertEqual(v["template"], "hello_tpl-en_US")
 		self.assertEqual(v["template_parameters"], "a,b")
 		self.assertEqual(v["template_header_parameters"], "h")
-		self.assertEqual(doc.insert_kwargs, {})
+		self.assertEqual(doc.insert_kwargs, {"ignore_permissions": False})
 
 	def test_list_templates(self):
 		with avail(False):
@@ -272,7 +280,7 @@ class TestBridge(unittest.TestCase):
 		return http_get
 
 	def test_download_media(self):
-		meta = {"mime_type": "image/jpeg", "url": "https://cdn/x", "file_size": 4, "filename": "../a b.jpg"}
+		meta = {"mime_type": "image/jpeg", "url": "https://lookaside.fbsbx.com/x", "file_size": 4, "filename": "../a b.jpg"}
 		with patch.object(wb, "resolve_account", return_value=ACCT):
 			res = wb.download_media("ACC", "M1", http_get=self._media_get(meta))
 			self.assertEqual(res["content"], b"data")
@@ -287,6 +295,46 @@ class TestBridge(unittest.TestCase):
 		with patch.object(wb, "resolve_account", return_value={"error": "no_account"}):
 			with self.assertRaises(ValueError):
 				wb.download_media("ACC", "M1", http_get=self._media_get(meta))
+
+	def test_download_media_rejects_bad_hosts(self):
+		meta = {"mime_type": "image/jpeg", "file_size": 4}
+		with patch.object(wb, "resolve_account", return_value=ACCT):
+			for bad in ("http://lookaside.fbsbx.com/x", "https://evil.example.com/x", "https://fbcdn.net.evil.com/x"):
+				with self.assertRaises(ValueError) as ctx:
+					wb.download_media("ACC", "M1", http_get=self._media_get({**meta, "url": bad}))
+				self.assertEqual(str(ctx.exception), "media_url_host_not_allowed")
+
+	def test_download_media_no_redirects_and_quoted_id(self):
+		seen = []
+
+		def http_get(url, **kw):
+			seen.append((url, kw))
+			if "/v21.0/" in url:
+				return FakeResp({"mime_type": "image/jpeg", "url": "https://x.fbcdn.net/a"})
+			return FakeResp(content=b"ab")
+
+		with patch.object(wb, "resolve_account", return_value=ACCT):
+			wb.download_media("ACC", "a/../b", http_get=http_get)
+		self.assertTrue(seen[0][0].endswith("/a%2F..%2Fb"))
+		self.assertTrue(all(kw["allow_redirects"] is False for _, kw in seen))
+		self.assertTrue(seen[1][1]["stream"])
+
+	def test_sync_templates_rejects_foreign_paging_host(self):
+		def http_get(url, **kw):
+			return FakeResp({"data": [], "paging": {"next": "https://evil.example.com/next?access_token=SECRET"}})
+
+		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
+			wb, "resolve_account", return_value=ACCT
+		):
+			res = wb.sync_templates("ACC", http_get=http_get)
+		self.assertEqual(res["error"], "sync_failed")
+		self.assertNotIn("SECRET", json.dumps(res))
+
+	def test_redact_strips_tokens_and_urls(self):
+		out = wb._redact("boom https://graph.facebook.com/x?access_token=SECRET&a=1 token=ABC")
+		self.assertNotIn("SECRET", out)
+		self.assertNotIn("ABC", out)
+		self.assertNotIn("graph.facebook.com", out)
 
 	def test_list_messages_and_conversations(self):
 		with avail(False):
