@@ -1285,8 +1285,9 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                           </Button>
                         </div>
                         <div>
-                          <Label size="sm">Source field</Label>
+                          <Label htmlFor={`transform-${i}-source`} size="sm">Source field</Label>
                           <Input
+                            id={`transform-${i}-source`}
                             value={t.source_field || ''}
                             onChange={(e) => {
                               const updated = [...transformations];
@@ -1298,8 +1299,9 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                           />
                         </div>
                         <div>
-                          <Label size="sm">Target field</Label>
+                          <Label htmlFor={`transform-${i}-target`} size="sm">Target field</Label>
                           <Input
+                            id={`transform-${i}-target`}
                             value={t.target_field || ''}
                             onChange={(e) => {
                               const updated = [...transformations];
@@ -1311,7 +1313,7 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                           />
                         </div>
                         <div>
-                          <Label size="sm">Operation</Label>
+                          <Label htmlFor={`transform-${i}-operation`} size="sm">Operation</Label>
                           <Select
                             value={t.operation || 'copy'}
                             onValueChange={(v) => {
@@ -1320,7 +1322,7 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                               handleUpdateActionConfig('transformations', updated);
                             }}
                           >
-                            <SelectTrigger size="sm">
+                            <SelectTrigger id={`transform-${i}-operation`} size="sm">
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
