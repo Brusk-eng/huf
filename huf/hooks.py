@@ -232,9 +232,12 @@ has_permission = {
 # ---------------
 # Override standard doctype classes
 
-# override_doctype_class = {
-# 	"ToDo": "custom_app.overrides.CustomToDo"
-# }
+# Huf-owned WhatsApp templates must not be re-pushed or deleted on Meta by a Desk save/delete
+# (frappe_whatsapp's controller runs before doc_events hooks). Resolves lazily, and only when that
+# doctype exists, so sites without the optional connector app are unaffected.
+override_doctype_class = {
+	"WhatsApp Templates": "huf.ai.gateway_adapters.whatsapp_template_guard.GuardedWhatsAppTemplates",
+}
 
 # Document Events
 # ---------------
