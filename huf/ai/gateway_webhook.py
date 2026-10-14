@@ -292,6 +292,42 @@ def _record_failed_status(gateway_name: str, status: dict) -> None:
 		pass
 
 
+_REPLY_STATUSES = frozenset({"sent", "delivered", "read", "failed"})
+_REPLY_STATUS_RANK = {"sent": 1, "delivered": 2, "read": 3}
+
+
+def _update_reply_status(gateway_name: str, status: dict) -> None:
+	"""Mirror a Meta delivery status onto the Gateway Event that sent the reply. Never raises."""
+	try:
+		state = str(status.get("status") or "").lower()
+		message_id = str(status.get("id") or "")
+		if state not in _REPLY_STATUSES or not message_id:
+			return
+		row = frappe.db.get_value(
+			"Gateway Event",
+			{"gateway": gateway_name, "reply_message_id": message_id},
+			["name", "reply_status"],
+			as_dict=True,
+		)
+		if not isinstance(row, dict):
+			return
+		current = row.get("reply_status") or ""
+		if state != "failed" and _REPLY_STATUS_RANK.get(state, 0) < _REPLY_STATUS_RANK.get(current, 0):
+			return  # out-of-order webhook: never regress delivered/read back to sent
+		values: dict[str, Any] = {"reply_status": state}
+		if state == "failed":
+			from huf.ai.gateway_service import _redact_error_text
+
+			errors = status.get("errors") if isinstance(status.get("errors"), list) else []
+			first = errors[0] if errors and isinstance(errors[0], dict) else {}
+			code = first.get("code") or "unknown"
+			title = first.get("title") or first.get("message") or "no detail"
+			values["delivery_error"] = _redact_error_text(f"error {code}: {title}")[:_GATEWAY_ERROR_MAX]
+		frappe.db.set_value("Gateway Event", row["name"], values, update_modified=False)
+	except Exception:
+		pass
+
+
 def _record_unknown_phone_ids(gateway_name: str, phone_ids) -> None:
 	for phone_id in phone_ids:
 		text = (
@@ -474,6 +510,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 
 	_record_unknown_phone_ids(gateway.name, getattr(parsed, "unknown_phone_ids", ()) or ())
 	for status in parsed.statuses:
+		_update_reply_status(gateway.name, status)
 		if str(status.get("status") or "").lower() == "failed":
 			_record_failed_status(gateway.name, status)
 	routed_updates = [update for update in parsed.template_updates if _record_template_update(update, gateway.name)]

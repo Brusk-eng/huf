@@ -112,6 +112,18 @@ def _redact_error_text(text: str) -> str:
 _JSON_NATIVE_TYPES = (str, int, float, bool, type(None))
 
 
+def _record_reply_sent(event, provider_message_id) -> None:
+    """Remember the outbound wamid so delivery statuses can be joined back. Never raises."""
+    try:
+        if provider_message_id:
+            event.db_set(
+                {"reply_message_id": str(provider_message_id)[:255], "reply_status": "sent"},
+                update_modified=False,
+            )
+    except Exception:
+        pass
+
+
 def _redact_payload(value: Any) -> Any:
     """Retain support evidence without persisting provider credentials.
 
@@ -835,6 +847,7 @@ def process_gateway_event(event_name: str) -> dict:
                 _throttle_outbound_send(gateway.name, _outbound_rate_cap(gateway.provider))
                 delivery = send_gateway_reply(gateway, event, str(response))
                 provider_message_id = delivery.provider_message_id
+                _record_reply_sent(event, provider_message_id)
                 if (getattr(delivery, "provider_response", None) or {}).get("fallback_template_sent"):
                     fallback_note = WHATSAPP_FALLBACK_NOTE
             except _whatsapp_send_errors(gateway.provider) as exc:
