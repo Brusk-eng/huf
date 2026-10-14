@@ -39,6 +39,8 @@ CALLBACK_WARNING = (
 	"bypasses Huf's signature verification."
 )
 _TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+# Sends also accept the full record name "<name>-<language_code>" (e.g. huf_x-en_US).
+_TEMPLATE_RECORD_RE = re.compile(r"^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)?$")
 _MIN_PHONE_DIGITS = 7
 _MAX_PHONE_DIGITS = 15
 _MAX_LIMIT = 200
@@ -529,9 +531,13 @@ def send_template_message(
 	phone = _validate_recipient(to)
 	if isinstance(phone, dict):
 		return phone
-	name_error = _validate_template_name(template_name)
-	if name_error:
-		return name_error
+	if not template_name or not _TEMPLATE_RECORD_RE.match(str(template_name).strip()):
+		return {
+			"success": False,
+			"error": "invalid_name",
+			"message": "Template name must be the Meta name (^[a-z0-9_]+$) or '<name>-<language_code>'.",
+		}
+	template_name = str(template_name).strip()
 	try:
 		body = _parse_json_arg(body_params, "body_params") or []
 		header = _parse_json_arg(header_params, "header_params") or []

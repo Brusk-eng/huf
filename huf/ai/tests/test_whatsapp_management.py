@@ -108,6 +108,20 @@ class TestWhatsAppManagement(unittest.TestCase):
 		self.assertEqual(result["error"], "invalid_name")
 		send_template.assert_not_called()
 
+	def test_send_template_accepts_record_name_and_bare_name(self):
+		for name in ("invalid_wash_day-en", "huf_wait_test_x-en_US", "welcome"):
+			with patch.object(bridge, "send_template", return_value={"success": True}) as send_template:
+				result = mgmt.send_template_message(gateway_name="GW-1", to="447700900123", template_name=name)
+			self.assertNotEqual(result.get("error"), "invalid_name", name)
+			self.assertEqual(send_template.call_args.args[2], name)
+
+	def test_send_template_surfaces_language_required(self):
+		err = BridgeError({"success": False, "error": "language_required", "languages": ["en", "hi"]})
+		with patch.object(bridge, "send_template", side_effect=err):
+			result = mgmt.send_template_message(gateway_name="GW-1", to="447700900123", template_name="wash")
+		self.assertEqual(result["error"], "language_required")
+		self.assertEqual(result["languages"], ["en", "hi"])
+
 	def test_create_template_rejects_bad_name_without_bridge_call(self):
 		with patch.object(bridge, "create_template") as create:
 			result = mgmt.create_template(payload={"template_name": "Hello-World", "category": "UTILITY"})

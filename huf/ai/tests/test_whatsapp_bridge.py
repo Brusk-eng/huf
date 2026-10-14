@@ -296,6 +296,28 @@ class TestBridge(unittest.TestCase):
 				send()
 			self.assertEqual(order, ["insert", "commit"])
 
+	def test_docname_accepts_record_name_and_requires_language_when_ambiguous(self):
+		def get_value(dt, filters, field=None, *a, **k):
+			if isinstance(filters, dict) and filters.get("name") == "wash-en" and filters.get("whatsapp_account") == "ACC":
+				return "wash-en"
+			if isinstance(filters, dict) and filters.get("actual_name") == "wash" and "language_code" not in filters:
+				return "wash-en"
+			return None
+
+		rows = [{"name": "wash-en", "language_code": "en"}, {"name": "wash-hi", "language_code": "hi"}]
+		with patch.object(frappe.db, "get_value", side_effect=get_value), patch.object(
+			frappe, "get_all", return_value=rows
+		):
+			self.assertEqual(wb._template_docname("ACC", "wash-en"), "wash-en")
+			with self.assertRaises(wb.BridgeError) as ctx:
+				wb._template_docname("ACC", "wash")
+			self.assertEqual(ctx.exception.payload["error"], "language_required")
+			self.assertEqual(ctx.exception.payload["languages"], ["en", "hi"])
+		with patch.object(frappe.db, "get_value", side_effect=get_value), patch.object(
+			frappe, "get_all", return_value=rows[:1]
+		):
+			self.assertEqual(wb._template_docname("ACC", "wash"), "wash-en")
+
 	def test_template_language_and_docname_by_language(self):
 		def get_value(dt, filters, field=None, *a, **k):
 			if isinstance(filters, dict) and filters.get("language_code") == "hi":

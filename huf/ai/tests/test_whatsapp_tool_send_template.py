@@ -86,3 +86,21 @@ class TestWhatsAppSendTemplate(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+class TestWhatsAppSendTemplateRecordName(unittest.TestCase):
+	def test_record_name_and_language_required_pass_through_bridge(self):
+		acct = {"name": "ACC"}
+		kw = {"to": "15551234567", "template_name": "invalid_wash_day-en"}
+		with patch.object(whatsapp, "_resolve_bridge_account", return_value=acct), patch.object(
+			whatsapp.bridge, "send_template", return_value={"message_id": "w1", "name": "m"}
+		) as send:
+			result = json.loads(whatsapp.handle_action("send_template", **kw))
+		self.assertTrue(result["success"])
+		self.assertEqual(send.call_args.args[2], "invalid_wash_day-en")
+		err = whatsapp.bridge.BridgeError({"success": False, "error": "language_required", "languages": ["en", "hi"]})
+		with patch.object(whatsapp, "_resolve_bridge_account", return_value=acct), patch.object(
+			whatsapp.bridge, "send_template", side_effect=err
+		):
+			result = json.loads(whatsapp.handle_action("send_template", **{**kw, "template_name": "invalid_wash_day"}))
+		self.assertEqual(result["error"], "language_required")

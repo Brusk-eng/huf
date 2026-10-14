@@ -405,6 +405,17 @@ def _template_docname(account_name: str, template_name: str, language_code: str 
 			name = frappe.db.get_value("WhatsApp Templates", {**filters, "language_code": language_code}, "name")
 			if name:
 				return name
+		if not language_code:
+			rows = frappe.get_all("WhatsApp Templates", filters=filters, fields=["name", "language_code"], limit_page_length=50)
+			if len(rows) > 1:
+				langs = sorted({r.get("language_code") or "" for r in rows if r.get("language_code")})
+				raise BridgeError(
+					_err(
+						"language_required",
+						message=f"Template '{template_name}' exists in several languages; pass language_code.",
+						languages=langs,
+					)
+				)
 		name = frappe.db.get_value("WhatsApp Templates", filters, "name")
 		if name:
 			return name
