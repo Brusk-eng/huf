@@ -45,7 +45,7 @@ export interface GatewayPolicy {
 	room_sender_policy?: string | null;
 	mention_required?: boolean;
 	pairing_enabled?: boolean;
-	default_target?: string | null;
+	default_target?: { type: string; name: string } | null;
 }
 
 export interface GatewayEvents24h {
@@ -84,33 +84,40 @@ export interface TokenCheckSummary {
 export interface GatewayHealthStatus {
 	name: string;
 	enabled: boolean;
+	whatsapp_account: string | null;
+	phone_number_id: string | null;
+	account_phone_mismatch: boolean;
+	webhook_url: string;
 	health: HealthState;
 	reasons: HealthReason[];
 	next_step: NextStep | null;
 	checklist: ChecklistItem[];
-	webhook_url: string;
-	verify_token_present: boolean;
-	access_token_present: boolean;
-	app_secret_present: boolean;
-	app_id_present: boolean;
-	phone_number_id: string | null;
 	fallback_template: string | null;
 	fallback_template_language: string | null;
 	fallback_template_approved: boolean | null;
 	last_event_at: string | null;
 	last_error: string | null;
+	access_token_present: boolean;
+	app_id_present: boolean;
+	app_secret_present: boolean;
+	verify_token_present: boolean;
 	events_24h: GatewayEvents24h;
 	last_failed_event: LastFailedEvent | null;
 	unrouted_phone_ids: string[];
 	policy: GatewayPolicy;
-	account: { name: string; status?: string | null; phone_id?: string | null } | null;
 	meta_links: MetaLinks;
-	token_check: TokenCheckSummary | null;
+}
+
+export interface WhatsAppAccountSummary {
+	name: string;
+	phone_id?: string | null;
+	status?: string | null;
 }
 
 export interface SetupStatusResponse {
 	success: boolean;
 	connector_available: boolean;
+	accounts?: WhatsAppAccountSummary[]; // the gateway's own account (empty without the connector)
 	gateway?: GatewayHealthStatus; // when gateway_name was given
 	gateways?: { name: string; health: HealthState; enabled: boolean }[]; // site summary (switcher dots)
 	error?: string;
