@@ -153,20 +153,19 @@ class TestWhatsAppManagement(unittest.TestCase):
 		)
 		self.frappe.get_doc.return_value = settings
 
-		result = mgmt.get_setup_status()
+		result = mgmt.get_setup_status("GW-1")
 
 		self.assertTrue(result["success"])
-		self.assertTrue(result["bridge_available"])
+		self.assertTrue(result["connector_available"])
 		self.assertEqual(result["accounts"], [{"name": "ACC-1", "phone_id": "111", "status": "Active"}])
-		gateway = result["gateways"][0]
-		self.assertTrue(gateway["app_secret_missing"])
-		self.assertIn("app_secret_missing", gateway["failing_checks"])
+		gateway = result["gateway"]
+		self.assertFalse(gateway["app_secret_present"])
+		self.assertIn("app_secret_missing", [r["code"] for r in gateway["reasons"]])
 		self.assertTrue(gateway["verify_token_present"])
 		self.assertEqual(
 			gateway["webhook_url"],
 			"https://huf.example.com/api/method/huf.ai.gateway_webhook.handle_gateway_webhook?gateway_name=GW-1",
 		)
-		self.assertIn("connector", gateway["callback_warning"])
 		self.assertNotIn("verify-me", json.dumps(result))
 
 	def _status_with_phones(self, account_phone, credential_phone, linked=True):
@@ -184,17 +183,17 @@ class TestWhatsAppManagement(unittest.TestCase):
 				_cred("phone_number_id", credential_phone),
 			]
 		)
-		return mgmt.get_setup_status()["gateways"][0]
+		return mgmt.get_setup_status("GW-1")["gateway"]
 
 	def test_setup_status_flags_account_phone_mismatch(self):
 		gateway = self._status_with_phones("111", "222")
 		self.assertTrue(gateway["account_phone_mismatch"])
-		self.assertIn("account_phone_mismatch", gateway["failing_checks"])
+		self.assertIn("account_phone_mismatch", [r["code"] for r in gateway["reasons"]])
 
 	def test_setup_status_no_mismatch_when_phones_match_or_unlinked(self):
 		for gateway in (self._status_with_phones("111", "111"), self._status_with_phones("111", "222", linked=False)):
 			self.assertFalse(gateway["account_phone_mismatch"])
-			self.assertNotIn("account_phone_mismatch", gateway["failing_checks"])
+			self.assertNotIn("account_phone_mismatch", [r["code"] for r in gateway["reasons"]])
 
 	def test_setup_status_requires_admin_role(self):
 		self.frappe.get_roles.return_value = ["Guest"]
@@ -203,11 +202,15 @@ class TestWhatsAppManagement(unittest.TestCase):
 			mgmt.get_setup_status()
 
 	def test_setup_status_without_bridge_reports_no_accounts(self):
-		self.frappe.get_all.return_value = []
+		self.frappe.get_all.side_effect = lambda doctype, **kwargs: (
+			[{"name": "GW-1", "is_enabled": 1, "integration_settings": "IS-1"}]
+			if doctype == "Gateway"
+			else [{"name": "ACC-1", "phone_id": "111", "status": "Active"}]
+		)
 		with patch.object(bridge, "is_available", return_value=False):
-			result = mgmt.get_setup_status()
+			result = mgmt.get_setup_status("GW-1")
 
-		self.assertFalse(result["bridge_available"])
+		self.assertFalse(result["connector_available"])
 		self.assertEqual(result["accounts"], [])
 
 	def test_mutating_calls_never_use_ignore_permissions(self):

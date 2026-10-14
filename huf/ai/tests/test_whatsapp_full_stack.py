@@ -242,8 +242,8 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 		self.assertEqual(acct["token"], "meta-access-token")
 		self.assertTrue(bridge.account_matches_phone_id(self.account.name, PHONE_ID))
 		status = mgmt.get_setup_status(self.gateway.name)
-		self.assertTrue(status["bridge_available"])
-		gw = status["gateways"][0]
+		self.assertTrue(status["connector_available"])
+		gw = status["gateway"]
 		self.assertTrue(gw["enabled"])  # regression: Gateway field is is_enabled
 		self.assertTrue(gw["app_secret_present"])
 		self.assertEqual(gw["whatsapp_account"], self.account.name)
@@ -851,8 +851,9 @@ class TestWhatsAppCoreWithoutBridge(IntegrationTestCase):
 	def test_management_api_reports_bridge_unavailable(self):
 		status = mgmt.get_setup_status()
 		self.assertTrue(status["success"])
-		self.assertFalse(status["bridge_available"])
-		self.assertEqual(status["accounts"], [])
+		self.assertFalse(status["connector_available"])
+		self.assertIsInstance(status["gateways"], list)
+		self.assertNotIn("accounts", status)
 		for result in (
 			mgmt.list_templates(),
 			mgmt.create_template(payload={"template_name": "x_y", "category": "UTILITY", "language_code": "en"}),
