@@ -78,7 +78,7 @@ export function PolicySection({
 							<Item label="Who can talk in groups" value={policyText(policy.room_sender_policy)} />
 							<Item label="Mention required in groups" value={policy.mention_required ? 'Yes' : 'No'} />
 							<Item label="Pairing" value={policy.pairing_enabled ? 'On' : 'Off'} />
-							<Item label="Replies go to" value={policy.default_target || 'Not set'} />
+							<Item label="Replies go to" value={policy.default_target ? `${policy.default_target.type}: ${policy.default_target.name}` : 'Not set'} />
 						</dl>
 
 						{editHref && (

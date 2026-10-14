@@ -15,7 +15,7 @@ const base: PolicySectionProps = {
 		room_sender_policy: 'open',
 		mention_required: true,
 		pairing_enabled: false,
-		default_target: 'Support agent',
+		default_target: { type: 'Agent', name: 'Support agent' },
 	},
 	editHref: '/edit',
 };
@@ -36,7 +36,7 @@ describe('PolicySection', () => {
 		render(<PolicySection {...base} />);
 		await user.click(screen.getByText('Reply rules'));
 		expect(screen.getByText('Outside the 24-hour window we send hello_again (en_US).')).toBeInTheDocument();
-		expect(screen.getByText('Support agent')).toBeInTheDocument();
+		expect(screen.getByText('Agent: Support agent')).toBeInTheDocument();
 		expect(screen.getByText('Only approved people')).toBeInTheDocument();
 		expect(screen.getByRole('link', { name: 'Edit in gateway settings' })).toHaveAttribute('href', '/edit');
 	});

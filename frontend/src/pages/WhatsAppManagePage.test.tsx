@@ -90,7 +90,7 @@ describe('WhatsAppManagePage', () => {
 	it('the failed-event link carries the event name to Messages', async () => {
 		api.getSetupStatus.mockImplementation(async (name?: string) =>
 			name
-				? { ok: true, data: { success: true, connector_available: true, accounts: [], gateway: gatewayFixture({ name, last_failed_event: { name: 'EV 1', at: '2026-10-14T10:00:00Z' } }) } }
+				? { ok: true, data: { success: true, connector_available: true, accounts: [], gateway: gatewayFixture({ name, last_failed_event: { name: 'EV 1', at: '2026-10-14T10:00:00Z', error: null } }) } }
 				: summary()
 		);
 		open('/?gateway=GW-1');
