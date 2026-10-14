@@ -14,7 +14,7 @@ def _codes(errors):
 
 class TestTemplateSpec(unittest.TestCase):
 	def base(self, **extra):
-		return {"template": "Hi {{1}}", "sample_values": "Ann", **extra}
+		return {"template": "Hi {{1}}, welcome", "sample_values": "Ann", **extra}
 
 	def test_minimal_valid(self):
 		spec, errors = wt.validate_template_spec(self.base())
@@ -47,8 +47,8 @@ class TestTemplateSpec(unittest.TestCase):
 		self.assertEqual((errors, spec["header_type"]), ([], "IMAGE"))
 		_, errors = wt.validate_template_spec(self.base(header_type="DOCUMENT"))
 		self.assertIn(("sample", "required"), _codes(errors))
-		_, errors = wt.validate_template_spec(self.base(header_type="VIDEO", sample="https://cdn.example/a.mp4"))
-		self.assertIn(("header_type", "unsupported_header_type"), _codes(errors))
+		spec, errors = wt.validate_template_spec(self.base(header_type="VIDEO", sample="https://cdn.example/a.mp4"))
+		self.assertEqual((errors, spec["header_type"]), ([], "VIDEO"))
 
 	def test_buttons(self):
 		buttons = [
@@ -64,10 +64,10 @@ class TestTemplateSpec(unittest.TestCase):
 
 	def test_button_counts_and_grouping(self):
 		qr = lambda n: [{"type": "QUICK_REPLY", "text": f"q{i}"} for i in range(n)]  # noqa: E731
-		self.assertEqual(wt.validate_template_spec(self.base(buttons=qr(3)))[1], [])
-		self.assertIn(("buttons", "too_many_quick_replies"), _codes(wt.validate_template_spec(self.base(buttons=qr(4)))[1]))
+		self.assertEqual(wt.validate_template_spec(self.base(buttons=qr(10)))[1], [])
+		self.assertIn(("buttons", "too_many_buttons"), _codes(wt.validate_template_spec(self.base(buttons=qr(11)))[1]))
 		cta = [{"type": "URL", "text": f"u{i}", "url": f"https://x{i}.example"} for i in range(3)]
-		self.assertIn(("buttons", "too_many_cta_buttons"), _codes(wt.validate_template_spec(self.base(buttons=cta))[1]))
+		self.assertIn(("buttons", "too_many_url_buttons"), _codes(wt.validate_template_spec(self.base(buttons=cta))[1]))
 		mixed = [qr(1)[0], cta[0], qr(2)[1]]
 		self.assertIn(("buttons", "buttons_not_grouped"), _codes(wt.validate_template_spec(self.base(buttons=mixed))[1]))
 		bad_url = [{"type": "URL", "text": "u", "url": "https://x.example/{{1}}/y", "example": "https://x.example/1/y"}]
