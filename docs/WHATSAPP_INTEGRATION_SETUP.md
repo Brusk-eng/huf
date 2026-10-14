@@ -217,6 +217,34 @@ Set `override_callback_uri` to the Huf URL of the Gateway that owns that number 
 
 `frappe_whatsapp` names a template document `<name>-<language>` and keeps `template_name` unique for the whole site, so one name and language cannot exist on two accounts at once. Creating or importing such a template for a second account fails with `template_name_taken_by_other_account` (sync lists it under `skipped_reasons`); the first account's template is never overwritten. Pick a different template name for the second account. Huf's own review and quality state (`WhatsApp Template State`) is keyed `<account>::<template>`, and drafts carry their account, so state never mixes between accounts.
 
+## Message log
+
+`huf.ai.whatsapp_management.list_message_log` (GET) returns a gateway-scoped, newest-first log of the messages
+a WhatsApp gateway handled. It needs the same access as `list_messages` (read on the Gateway; the account is
+derived from `Gateway.whatsapp_account`).
+
+- Parameters: `gateway_name`, `direction` (`in`/`out`), `status`, `agent`, `template`, `phone`, `q`,
+  `date_from`, `date_to`, `cursor`, `limit` (1-100, default 50). Returns `{success, items, next_cursor, has_more}`.
+- Paging is keyset-based on `(creation desc, name desc)`; pass `next_cursor` back unchanged (opaque).
+- With frappe_whatsapp installed the rows come from `WhatsApp Message` for the gateway's account and are
+  joined to Gateway Events: inbound rows by `provider_event_id`, agent replies by `reply_message_id`. Each item has
+  `sent_by` = `customer`, `agent`, `template` (template send with no event) or `manual`.
+- Without frappe_whatsapp (direct mode) the log is built from Gateway Events only: one inbound row per event
+  plus one outbound row per sent reply. Reply bodies are not stored, so those rows have an empty `text`.
+- `list_message_log_filters(gateway_name)` returns the values for the filter dropdowns.
+- Delivery tracking: after a reply is sent the Gateway Event stores `reply_message_id` and `reply_status`
+  (`sent`). Meta status webhooks (`sent`, `delivered`, `read`, `failed`) update `reply_status` on the event of the
+  receiving gateway; a failure also stores a redacted `delivery_error` (code and title).
+- Migrate adds two Huf-owned indexes on `WhatsApp Message` (`whatsapp_account, creation` and `message_id`).
+  It is idempotent and skipped when frappe_whatsapp is absent.
+
+## App tile
+
+Huf seeds a first-party `WhatsApp` tile in the app launcher (`/huf/whatsapp`, category Communicate) on install
+and migrate. An admin's `enabled` choice is never overwritten. The tile is shown only to System Manager, Huf Admin
+or users with `system.integrations.manage`, and only while at least one enabled WhatsApp gateway exists
+(`huf.ai.whatsapp_management.can_launch_whatsapp_app`).
+
 ## 4. The 24-hour window and templates
 
 ### 4.1 Window rule
