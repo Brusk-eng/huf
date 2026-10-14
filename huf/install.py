@@ -114,6 +114,7 @@ def after_install():
     create_ocr_document_tool()
     create_flow_tools()
     create_memory_tools()
+    create_code_execution_tools()
     create_default_memory_policies()
     create_default_execution_profiles()
     register_integration_services()
@@ -185,6 +186,7 @@ def after_migrate():
 		create_ocr_document_tool()
 		create_flow_tools()
 		create_memory_tools()
+		create_code_execution_tools()
 		create_default_memory_policies()
 		create_default_execution_profiles()
 		register_integration_services()
@@ -1641,6 +1643,57 @@ def create_memory_tools():
 			tool_doc.save(ignore_permissions=True)
 		else:
 			tool_doc.insert(ignore_permissions=True)
+
+	frappe.db.commit()
+
+
+def create_code_execution_tools():
+	"""Create or update the sandboxed ``run_python`` Agent Tool Function.
+
+	The model-visible schema carries only ``code``. ``agent_doc`` is injected from
+	the agent whose tools are being built, and ``conversation`` / ``agent_run`` from
+	the run context (sdk_tools), so none of them are parameters here. Offer-time
+	(``_allows_code_execution``) and dispatch-time (``run_python``) gates decide who
+	may use it; Guest access is explicitly off. Idempotent.
+	"""
+	if not frappe.db.exists("Agent Tool Type", "Code Execution"):
+		type_doc = frappe.new_doc("Agent Tool Type")
+		type_doc.name1 = "Code Execution"
+		type_doc.insert(ignore_permissions=True)
+
+	parameter_rows = [
+		{
+			"label": "Code",
+			"fieldname": "code",
+			"type": "string",
+			"required": 1,
+			"description": (
+				"The Python source to execute. Never persisted verbatim; only its "
+				"SHA-256 digest is stored on the audit record."
+			),
+		},
+	]
+
+	tool_name = "run_python"
+	docname = frappe.db.exists("Agent Tool Function", {"tool_name": tool_name})
+	tool_doc = frappe.get_doc("Agent Tool Function", docname) if docname else frappe.new_doc("Agent Tool Function")
+	tool_doc.tool_name = tool_name
+	tool_doc.description = (
+		"Execute Python code in a sandboxed, resource-limited environment. "
+		"Availability and approval flow are controlled by the calling agent's "
+		"Execution Profile -- this tool may be disabled, auto-approved, or parked "
+		"behind a human approval step."
+	)
+	tool_doc.function_path = "huf.ai.tools.code_execution.run_python"
+	tool_doc.types = "Code Execution"
+	tool_doc.tool_type = "Code Execution"
+	tool_doc.allowed_for_guest = 0
+	tool_doc.pass_parameters_as_json = 1
+	tool_doc.set("parameters", parameter_rows)
+	if docname:
+		tool_doc.save(ignore_permissions=True)
+	else:
+		tool_doc.insert(ignore_permissions=True)
 
 	frappe.db.commit()
 
