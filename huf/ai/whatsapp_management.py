@@ -33,11 +33,6 @@ from huf.ai.gateway_adapters.whatsapp_bridge import BridgeError
 
 ADMIN_ROLES = ("System Manager", "Huf Admin")
 WHATSAPP_PROVIDER = "WhatsApp"
-CALLBACK_WARNING = (
-	"Meta allows one callback URL per app. Use the webhook URL shown above as the callback, "
-	"not the WhatsApp Business app connector's own webhook route. Using the connector's route "
-	"bypasses Huf's signature verification."
-)
 _TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 # Sends also accept the full record name "<name>-<language_code>" (e.g. huf_x-en_US).
 _TEMPLATE_RECORD_RE = re.compile(r"^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)?$")
@@ -209,9 +204,12 @@ def _gateway_whatsapp_account(gateway_name: str) -> str | None:
 		return None
 
 
+_PRESENCE_KEYS = ("app_secret", "webhook_verify_token", "access_token", "phone_number_id", "app_id")
+
+
 def _credential_presence(integration_settings: str | None) -> dict[str, bool]:
 	"""Report which credential keys are set, never their values."""
-	presence = {"app_secret": False, "webhook_verify_token": False}
+	presence = dict.fromkeys(_PRESENCE_KEYS, False)
 	if not integration_settings:
 		return presence
 	settings = frappe.get_doc("Integration Settings", integration_settings)
@@ -219,6 +217,17 @@ def _credential_presence(integration_settings: str | None) -> dict[str, bool]:
 		if row.key in presence:
 			presence[row.key] = bool(row.get_password("value") or "")
 	return presence
+
+
+def _credential_app_id(integration_settings: str | None) -> str:
+	"""Meta app id from an optional ``app_id`` credential (not a secret; used for dashboard links)."""
+	if not integration_settings:
+		return ""
+	settings = frappe.get_doc("Integration Settings", integration_settings)
+	for row in settings.credentials or []:
+		if row.key == "app_id":
+			return str(row.get_password("value") or "").strip()
+	return ""
 
 
 def _credential_phone_number_id(integration_settings: str | None) -> str:
@@ -252,64 +261,103 @@ def _webhook_url(gateway_name: str) -> str:
 	)
 
 
-def _gateway_status(gateway: dict[str, Any]) -> dict[str, Any]:
+_GATEWAY_FIELDS = [
+	"name",
+	"is_enabled",
+	"integration_settings",
+	"phone_number_id",
+	"fallback_template",
+	"fallback_template_language",
+	"direct_policy",
+	"room_policy",
+	"room_sender_policy",
+	"mention_required",
+	"default_target_type",
+	"default_agent",
+	"default_flow",
+	"last_event_at",
+	"last_error",
+]
+
+
+def _gateway_status(gateway: dict[str, Any], connector_available: bool | None = None) -> dict[str, Any]:
+	"""Full per-gateway payload: configuration presence plus health (see ``whatsapp_health``)."""
+	from huf.ai import whatsapp_health as health
+
+	if connector_available is None:
+		connector_available = bridge.is_available()
 	presence = _credential_presence(gateway.get("integration_settings"))
-	failing: list[str] = []
-	if not presence["app_secret"]:
-		failing.append("app_secret_missing")
-	if not presence["webhook_verify_token"]:
-		failing.append("webhook_verify_token_missing")
 	mismatch = _account_phone_mismatch(gateway)
-	if mismatch:
-		failing.append("account_phone_mismatch")
-	return {
+	app_id = _credential_app_id(gateway.get("integration_settings"))
+	account = gateway.get("whatsapp_account")
+	if not app_id and account and connector_available:
+		try:
+			app_id = str(frappe.db.get_value("WhatsApp Account", account, "app_id") or "").strip()
+		except Exception:
+			app_id = ""
+	payload = {
 		"name": gateway["name"],
 		"enabled": bool(gateway.get("is_enabled")),
-		"whatsapp_account": gateway.get("whatsapp_account"),
+		"whatsapp_account": account,
 		"phone_number_id": gateway.get("phone_number_id") or "",
-		"app_secret_present": presence["app_secret"],
-		"app_secret_missing": not presence["app_secret"],
-		"verify_token_present": presence["webhook_verify_token"],
 		"account_phone_mismatch": mismatch,
 		"webhook_url": _webhook_url(gateway["name"]),
-		"callback_warning": CALLBACK_WARNING,
-		"failing_checks": failing,
 	}
+	payload.update(
+		health.build_health(
+			gateway, presence, connector_available=connector_available, mismatch=mismatch, app_id=app_id
+		)
+	)
+	return payload
 
 
 @frappe.whitelist()
 @_bridge_guard
 def get_setup_status(gateway_name: str | None = None) -> dict[str, Any]:
-	"""Setup checks for the WhatsApp gateway: bridge, accounts, and per-gateway credentials."""
+	"""Setup and health for ONE WhatsApp gateway; without a name, a site summary for the switcher.
+
+	With ``gateway_name``: ``{success, connector_available, gateway, accounts}`` where ``accounts``
+	holds only that gateway's own linked account. Without: ``{success, connector_available,
+	gateways: [{name, health, enabled}]}`` and nothing else.
+	"""
 	_require_admin()
 	available = bridge.is_available()
-	accounts: list[dict[str, Any]] = []
-	if available:
-		accounts = frappe.get_all(
-			"WhatsApp Account", fields=["name", "phone_id", "status"], limit_page_length=100
+
+	if not gateway_name:
+		rows = frappe.get_all(
+			"Gateway", filters={"provider": WHATSAPP_PROVIDER}, fields=_GATEWAY_FIELDS, limit_page_length=100
 		)
+		summary = []
+		for row in rows or []:
+			row = dict(row)
+			row["whatsapp_account"] = _gateway_whatsapp_account(row["name"])
+			status = _gateway_status(row, available)
+			summary.append({"name": status["name"], "health": status["health"], "enabled": status["enabled"]})
+		return {"success": True, "connector_available": available, "gateways": summary}
 
-	filters: dict[str, Any] = {"provider": WHATSAPP_PROVIDER}
-	if gateway_name:
-		filters["name"] = gateway_name
-	gateways_raw = frappe.get_all(
+	rows = frappe.get_all(
 		"Gateway",
-		filters=filters,
-		fields=["name", "is_enabled", "integration_settings", "phone_number_id"],
-		limit_page_length=100,
+		filters={"provider": WHATSAPP_PROVIDER, "name": gateway_name},
+		fields=_GATEWAY_FIELDS,
+		limit_page_length=1,
 	)
-	gateways = []
-	for row in gateways_raw or []:
-		row = dict(row)
-		row["whatsapp_account"] = _gateway_whatsapp_account(row["name"])
-		gateways.append(_gateway_status(row))
-
+	if not rows:
+		return _error("not_found", "Gateway not found.")
+	row = dict(rows[0])
+	row["whatsapp_account"] = _gateway_whatsapp_account(row["name"])
+	accounts: list[dict[str, Any]] = []
+	if available and row["whatsapp_account"]:
+		accounts = frappe.get_all(
+			"WhatsApp Account",
+			filters={"name": row["whatsapp_account"]},
+			fields=["name", "phone_id", "status"],
+			limit_page_length=1,
+		)
 	return {
 		"success": True,
-		"bridge_available": available,
-		"accounts": accounts,
-		"gateways": gateways,
-		"callback_warning": CALLBACK_WARNING,
+		"connector_available": available,
+		"gateway": _gateway_status(row, available),
+		"accounts": [dict(a) for a in accounts or []],
 	}
 
 
