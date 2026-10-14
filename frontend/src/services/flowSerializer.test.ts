@@ -712,6 +712,41 @@ describe('flowSerializer', () => {
       expect(mapBackendStatusToFrontend('Unknown')).toBe('draft'); // falls back to draft
     });
   });
+
+  describe('trigger.unset and configured flag', () => {
+    it('serializes a trigger node with no chosen type to trigger.unset', () => {
+      const flow = createTestFlow([
+        {
+          id: 'empty_trigger',
+          type: 'trigger',
+          position: { x: 0, y: 0 },
+          data: { nodeType: 'trigger', label: 'Select trigger', configured: false },
+        },
+      ]);
+      const graph = serializeFlow(flow);
+      expect(graph.nodes[0].type).toBe('trigger.unset');
+      expect(graph.nodes[0].config).toEqual({});
+    });
+
+    it('round-trips trigger.unset as an unconfigured trigger', () => {
+      const graph = makeBackendGraph([{ id: 't', type: 'trigger.unset', config: {}, next: null }]);
+      const flow = deserializeFlow('f', 'F', 'Draft', graph);
+      expect(flow.nodes[0].type).toBe('trigger');
+      expect(flow.nodes[0].data.configured).toBe(false);
+      expect(serializeFlow(flow).nodes[0].type).toBe('trigger.unset');
+    });
+
+    it('computes configured from real config instead of hard-coding true', () => {
+      const graph = makeBackendGraph([
+        { id: 'a', type: 'agent.run', config: { agent: '', prompt: 'hi' }, next: 'b' },
+        { id: 'b', type: 'agent.run', config: { agent: 'X', prompt: 'hi' }, next: 'c' },
+        { id: 'c', type: 'trigger.webhook', config: { method: 'POST' }, next: null },
+        { id: 'd', type: 'output', config: {}, next: null },
+      ]);
+      const flow = deserializeFlow('f', 'F', 'Draft', graph);
+      expect(flow.nodes.map((n) => n.data.configured)).toEqual([false, true, true, true]);
+    });
+  });
 });
 
 // ─── Test Helpers ───────────────────────────────────────────────────

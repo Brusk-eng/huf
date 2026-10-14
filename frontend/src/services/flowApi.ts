@@ -49,7 +49,7 @@ export interface BackendFlowGraph {
 }
 
 export type BackendNodeType =
-    | 'trigger.webhook' | 'trigger.schedule' | 'trigger.doc-event'
+    | 'trigger.webhook' | 'trigger.schedule' | 'trigger.doc-event' | 'trigger.unset'
     | 'agent.run' | 'tool.call' | 'router.llm' | 'human.approval'
     | 'condition' | 'http_request' | 'transform' | 'loop' | 'output';
 

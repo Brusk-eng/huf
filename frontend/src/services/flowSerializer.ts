@@ -149,6 +149,8 @@ function mapFrontendNodeTypeToBackend(node: FlowNode): BackendNodeType {
         const triggerType = node.data?.triggerConfig?.type;
         if (triggerType === 'schedule') return 'trigger.schedule';
         if (triggerType === 'doc-event') return 'trigger.doc-event';
+        // No trigger type chosen yet (fresh flow): never invent a webhook.
+        if (!triggerType) return 'trigger.unset';
         return 'trigger.webhook';
     }
 
@@ -262,6 +264,32 @@ function mapBackendNodeTypeToFrontend(
     return 'action';
 }
 
+/**
+ * Config keys that must be non-blank for a node to count as configured.
+ * Mirrors the required string fields in graph_ir.schema.json (and the backend
+ * activation rules in flow_definition/activation_rules.py).
+ */
+const REQUIRED_CONFIG_KEYS: Partial<Record<string, string[]>> = {
+    'trigger.webhook': ['method'],
+    'trigger.schedule': ['cron'],
+    'trigger.doc-event': ['doctype', 'event'],
+    'agent.run': ['agent', 'prompt'],
+    'tool.call': ['tool_id'],
+    'router.llm': ['prompt'],
+    'human.approval': ['message'],
+    'condition': ['expression'],
+};
+
+/** Computed from the real stored config, so the "unconfigured" warning survives reload. */
+export function isBackendNodeConfigured(node: BackendNode): boolean {
+    if (node.type === 'trigger.unset') return false;
+    const config = (node.config ?? {}) as Record<string, unknown>;
+    return (REQUIRED_CONFIG_KEYS[node.type] ?? []).every((key) => {
+        const v = config[key];
+        return v != null && !(typeof v === 'string' && v.trim() === '');
+    });
+}
+
 function buildNodeData(node: BackendNode): FlowNodeData {
     const frontendType = mapBackendNodeTypeToFrontend(node.type);
 
@@ -269,10 +297,13 @@ function buildNodeData(node: BackendNode): FlowNodeData {
         label: node._label || getDefaultLabel(node.type),
         nodeType: frontendType as FlowNodeData['nodeType'],
         icon: node._icon || getDefaultIcon(node.type),
-        configured: true,
+        configured: isBackendNodeConfigured(node),
     };
 
-    if (frontendType === 'trigger') {
+    if (node.type === 'trigger.unset') {
+        base.description = 'Select a trigger';
+        base.triggerConfig = { type: undefined };
+    } else if (frontendType === 'trigger') {
         const triggerType =
             node.type === 'trigger.schedule'
                 ? ('schedule' as const)
@@ -298,6 +329,7 @@ function getDefaultLabel(backendType: string): string {
         'trigger.webhook': 'Webhook trigger',
         'trigger.schedule': 'Schedule trigger',
         'trigger.doc-event': 'Document event trigger',
+        'trigger.unset': 'Select trigger',
         'agent.run': 'Run agent',
         'tool.call': 'Call tool',
         'router.llm': 'LLM router',
@@ -316,6 +348,7 @@ function getDefaultIcon(backendType: string): string {
         'trigger.webhook': 'Webhook',
         'trigger.schedule': 'Clock',
         'trigger.doc-event': 'Database',
+        'trigger.unset': 'CircleDashed',
         'agent.run': 'Bot',
         'tool.call': 'Play',
         'router.llm': 'GitBranch',
