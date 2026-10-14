@@ -394,6 +394,13 @@ def _send_media(kwargs: dict) -> str:
 		return _error(f"Failed to send WhatsApp media: {str(e)}")
 
 
+def _body_values(parameters: Any) -> Any:
+	"""Body parameters as the bridge takes them: strings in a list, or a ``{name: value}`` map."""
+	if isinstance(parameters, dict):
+		return {str(k): str(v) for k, v in parameters.items()}
+	return [p if isinstance(p, dict) else str(p) for p in parameters]
+
+
 def _send_template(kwargs: dict) -> str:
 	"""Send a pre-approved WhatsApp template message.
 
@@ -412,8 +419,8 @@ def _send_template(kwargs: dict) -> str:
 
 	if not recipient or not template_name:
 		return _error("Recipient ('to') and 'template_name' are required")
-	if not isinstance(parameters, list):
-		return _error("'parameters' must be a list of strings")
+	if not isinstance(parameters, (list, dict)):
+		return _error("'parameters' must be a list of strings (or a {name: value} map for a named-variable template)")
 	if header_params is None or button_params is None:
 		return _error("'header_params' and 'button_params' must be lists (or JSON lists)")
 
@@ -427,7 +434,7 @@ def _send_template(kwargs: dict) -> str:
 				extra["button_params"] = button_params
 			if kwargs.get("language_code"):
 				extra["language_code"] = language_code
-			res = bridge.send_template(acct["name"], recipient, template_name, [str(p) for p in parameters], **extra)
+			res = bridge.send_template(acct["name"], recipient, template_name, _body_values(parameters), **extra)
 		except bridge.BridgeError as e:
 			return json.dumps(e.payload, default=str)
 		except frappe.PermissionError:
@@ -445,20 +452,13 @@ def _send_template(kwargs: dict) -> str:
 		"Authorization": f"Bearer {access_token}",
 		"Content-Type": "application/json",
 	}
-	errors: list[dict[str, str]] = []
-	body_n = [wt.validate_param_text(f"parameters[{i}]", p, errors) for i, p in enumerate(parameters)]
-	headers_n, herr = wt.normalize_header_params(header_params)
-	buttons_n, berr = wt.normalize_button_params(button_params)
-	errors += herr + berr
-	if any(isinstance(h, dict) and not h.get("type") for h in headers_n):
-		errors.append(wt._e("header_params", "invalid_type", "Media header needs a type (image, document or video)."))
+	components, errors = bridge.direct_send_components(_body_values(parameters), header_params, button_params)
 	if errors:
-		return json.dumps(wt.validation_error(errors), default=str)
+		return json.dumps(bridge.send_error(errors), default=str)
 	template: dict[str, Any] = {
 		"name": template_name,
 		"language": {"code": language_code},
 	}
-	components = wt.build_template_components(body_n, headers_n, buttons_n)
 	if components:
 		template["components"] = components
 	payload = {

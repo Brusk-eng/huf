@@ -491,7 +491,11 @@ def _graph_post_message(acct: dict[str, Any], data: dict[str, Any], http_post: C
 
 
 def _template_row(docname: str) -> dict[str, Any] | None:
-	"""Header/body/button definition of a WhatsApp Templates document (None if unknown)."""
+	"""Header/body/button definition of a WhatsApp Templates document (None if unknown).
+
+	``parameter_format`` / ``header_format`` come from the Template Extra when Huf holds one
+	(NAMED variables, VIDEO / LOCATION headers); empty otherwise.
+	"""
 	if not frappe.db.exists("WhatsApp Templates", docname):
 		return None
 	row = frappe.db.get_value(
@@ -509,7 +513,20 @@ def _template_row(docname: str) -> dict[str, Any] | None:
 		fields=["button_type", "button_label", "url_type", "website_url"],
 		order_by="idx asc",
 	)
+	extra = _get_extra(row.get("whatsapp_account"), docname) or {}
+	row["parameter_format"] = extra.get("parameter_format") or ""
+	row["header_format"] = extra.get("header_format") or ""
 	return row
+
+
+def _get_extra(account: str | None, template: str) -> dict[str, Any] | None:
+	"""Template Extra (``whatsapp_template_guard.get_extra``), None when unavailable."""
+	try:
+		from huf.ai.gateway_adapters import whatsapp_template_guard as guard
+
+		return guard.get_extra(account, template)
+	except Exception:
+		return None
 
 
 def _mirror_template_send(acct: dict[str, Any], docname: str, to: str, wamid: str, values: dict[str, Any], trusted: bool) -> dict[str, Any]:
@@ -540,12 +557,115 @@ def _mirror_template_send(acct: dict[str, Any], docname: str, to: str, wamid: st
 		return {"success": True, "name": None, "message_id": wamid, "status": "Success", "mirrored": False}
 
 
+def _named_names(raw: Any) -> list[str]:
+	"""Variable names carried by a NAMED parameter value (``{name: v}`` or ``[{name, value}]``)."""
+	if isinstance(raw, dict):
+		return [str(k) for k in raw]
+	if isinstance(raw, (list, tuple)) and raw and all(isinstance(x, dict) for x in raw):
+		return [str(x.get("name") or x.get("parameter_name") or "") for x in raw]
+	return []
+
+
+def _params_template_view(body_params: Any, header_params: Any) -> dict[str, Any]:
+	"""Stand-in template for a send with no known template: NAMED when the params are named."""
+	body_names = _named_names(body_params)
+	header_names = _named_names(header_params) if isinstance(header_params, dict) and "type" not in header_params else []
+	if not body_names and not header_names:
+		return {}
+	return {
+		"parameter_format": "NAMED",
+		"body": " ".join("{{%s}}" % n for n in body_names),
+		"header_type": "TEXT" if header_names else "",
+		"header_text": "{{%s}}" % header_names[0] if header_names else "",
+	}
+
+
+def split_copy_code_params(button_params: Any) -> tuple[list[Any], list[dict[str, Any]], list[dict[str, str]]]:
+	"""Split COPY_CODE button params (``{"index", "sub_type": "copy_code", "code"|"text"}``) off ``button_params``.
+
+	Returns ``(other_params, copy_code_components, errors)``; the copy-code components are ready
+	Graph ``button`` components.
+	"""
+	rest: list[Any] = []
+	comps: list[dict[str, Any]] = []
+	errors: list[dict[str, str]] = []
+	for i, item in enumerate(button_params or []):
+		if isinstance(item, dict) and str(item.get("sub_type") or item.get("type") or "").lower() == "copy_code":
+			code = str(item.get("code") if item.get("code") is not None else item.get("text") or "").strip()
+			try:
+				index = int(item.get("index", i))
+			except (TypeError, ValueError):
+				index = -1
+			if not 0 <= index <= 9:
+				errors.append(wt._e(f"button_params[{i}].index", "invalid_index", "Button index must be an integer 0-9."))
+			elif not code or len(code) > 15:
+				errors.append(wt._e(f"button_params[{i}]", "invalid_code", "A copy-code parameter needs a code of at most 15 characters."))
+			else:
+				comps.append({
+					"type": "button", "sub_type": "copy_code", "index": str(index),
+					"parameters": [{"type": "coupon_code", "coupon_code": code}],
+				})
+		else:
+			rest.append(item)
+	return rest, comps, errors
+
+
+def _header_list(header_params: Any, has_template: bool) -> Any:
+	"""Raw header params as ``build_send_components`` expects them (media URL strings get a default kind
+	only when no template says which)."""
+	if isinstance(header_params, dict):
+		return header_params
+	items = list(header_params or [])
+	if not has_template:
+		items = [{"type": "image", "link": h.strip()} if isinstance(h, str) and wt.is_http_url(h.strip()) else h for h in items]
+	return items
+
+
+def send_error(errors: list[dict[str, str]]) -> dict[str, Any]:
+	"""Structured send error; missing/unknown NAMED parameters surface as the top-level ``error`` code."""
+	out = wt.validation_error(errors)
+	if errors and errors[0].get("code") in ("param_missing", "param_unknown"):
+		out["error"] = errors[0]["code"]
+	return out
+
+
+def direct_send_components(
+	body_params: Any = None, header_params: Any = None, button_params: Any = None, template: Any = None
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+	"""Graph ``template.components`` for a send that bypasses the local template row (direct mode).
+
+	``template`` (spec or Meta components) is optional: without it NAMED params are recognised from their
+	shape (a ``{name: value}`` dict). Media header objects must carry their kind here.
+	"""
+	rest, copy_comps, cerr = split_copy_code_params(button_params)
+	view = template if template else _params_template_view(body_params, header_params)
+	components, errors = wt.build_send_components(view, body_params, _header_list(header_params, False), rest)
+	if isinstance(header_params, dict):
+		header_items = [header_params] if "type" in header_params else []
+	else:
+		header_items = list(header_params or [])
+	if any(isinstance(h, dict) and not h.get("type") for h in header_items):
+		errors.append(wt._e("header_params", "invalid_type", "Media header needs a type (image, document or video)."))
+	return components + copy_comps, cerr + errors
+
+
+def _send_view(tpl: dict[str, Any]) -> dict[str, Any]:
+	"""Template definition in the shape ``build_send_components`` reads."""
+	htype = str(tpl.get("header_format") or tpl.get("header_type") or "").upper()
+	return {
+		"body": tpl.get("template") or "",
+		"header_type": htype,
+		"header_text": (tpl.get("header") or "") if htype == "TEXT" else "",
+		"parameter_format": tpl.get("parameter_format") or "",
+	}
+
+
 def send_template(
 	account_name: str,
 	to: str,
 	template_name: str,
-	body_params: list | None = None,
-	header_params: list | None = None,
+	body_params: Any = None,
+	header_params: Any = None,
 	trusted: bool = False,
 	language_code: str | None = None,
 	button_params: list | None = None,
@@ -553,59 +673,70 @@ def send_template(
 ) -> dict[str, Any]:
 	"""Send an approved template.
 
-	Plain body-only sends use an Outgoing ``WhatsApp Message`` (use_template=1),
-	which frappe_whatsapp sends. Sends with header or button parameters (text
-	header variable, media header link, dynamic URL suffix) need components that
-	frappe_whatsapp cannot build without a reference document, so those are
-	posted to Graph with the account credentials and mirrored into
-	``WhatsApp Message`` without a second send.
+	Plain body-only sends of POSITIONAL templates use an Outgoing ``WhatsApp Message``
+	(use_template=1), which frappe_whatsapp sends. Everything else (header or button parameters,
+	NAMED variables, LOCATION / VIDEO headers) needs components frappe_whatsapp cannot build, so
+	it is posted to Graph with the account credentials and mirrored into ``WhatsApp Message``
+	without a second send.
 
-	``header_params``: one text string or one ``{"type": image|document|video,
-	"link": ..., "filename"?: ...}``. ``button_params``: ``[{"index": 0,
-	"sub_type": "url", "text": "<suffix>"}]`` (a bare string is the URL suffix at
-	its list position). Permission-checked unless ``trusted=True`` (gateway-internal
-	reply path). Raises :class:`BridgeError` (``.payload`` is the error dict).
+	``body_params``: an ordered list; for NAMED templates also a ``{name: value}`` dict or a list of
+	``{name, value}`` (every body / text-header parameter then carries ``parameter_name``).
+	``header_params``: one text string, one ``{"type": image|document|video, "link": ...,
+	"filename"?: ...}``, or ``{"type": "location", "latitude", "longitude", "name"?, "address"?}``;
+	for a NAMED text header a one-entry ``{name: value}`` dict. ``button_params``: ``[{"index": 0,
+	"sub_type": "url", "text": "<suffix>"}]`` (a bare string is the URL suffix at its list
+	position) and ``{"index": n, "sub_type": "copy_code", "code": "..."}``. Permission-checked
+	unless ``trusted=True`` (gateway-internal reply path). Raises :class:`BridgeError` (``.payload``
+	is the error dict; ``error`` is ``validation_failed``, or ``param_missing`` / ``param_unknown``
+	for NAMED mismatches, with the full ``errors`` list).
 	"""
 	acct = _account_or_error(account_name)
-	errors: list[dict[str, str]] = []
-	params = [wt.validate_param_text(f"body_params[{i}]", p, errors) for i, p in enumerate(body_params or [])]
-	headers_n, header_errors = wt.normalize_header_params(header_params)
-	buttons_n, button_errors = wt.normalize_button_params(button_params)
-	errors += header_errors + button_errors
 	docname = _template_docname(account_name, template_name, language_code)
 	tpl = _template_row(docname)
 	if tpl and (tpl.get("whatsapp_account") or "") != (account_name or ""):
 		# the docname resolves to another account's template: never send it from this account
 		raise BridgeError(_err("template_not_found", message="That template does not belong to this WhatsApp account."))
+
+	other_buttons, copy_comps, errors = split_copy_code_params(button_params)
+	view = _send_view(tpl) if tpl else _params_template_view(body_params, header_params)
+	header_raw = _header_list(header_params, bool(tpl))
+	components, build_errors = wt.build_send_components(view, body_params, header_raw, other_buttons)
+	errors += build_errors
 	if tpl:
-		errors += _check_send_against_template(tpl, params, headers_n, buttons_n)
+		seen = {(e["field"], e["code"]) for e in errors}
+		errors += [
+			e for e in _check_send_against_template(tpl, view, body_params, header_raw, other_buttons, copy_comps)
+			if (e["field"], e["code"]) not in seen
+		]
 	if errors:
-		raise BridgeError(wt.validation_error(errors))
+		raise BridgeError(send_error(errors))
+	components += copy_comps
 
-	header_type = (tpl or {}).get("header_type") or ""
-	if (
-		tpl
-		and header_type in wt.MEDIA_HEADER_TYPES
-		and not headers_n
-		and not (header_type == "IMAGE" and wt.is_http_url(str(tpl.get("sample") or "")))
-	):
-		raise BridgeError(
-			wt.validation_error(
-				[wt._e("header_params", "required", f"This template has an {header_type} header; provide a media link.")]
+	header_type = view.get("header_type") or ""
+	header_given = any(c.get("type") == "header" for c in components)
+	if tpl and header_type in wt.MEDIA_HEADER_TYPES and not header_given:
+		if not (header_type == "IMAGE" and wt.is_http_url(str(tpl.get("sample") or ""))):
+			raise BridgeError(
+				wt.validation_error(
+					[wt._e("header_params", "required", f"This template has an {header_type} header; provide a media link.")]
+				)
 			)
-		)
+	named = wt._template_view(view)["fmt"] == "NAMED"
+	body_comp = next((c for c in components if c.get("type") == "body"), None)
+	body_items = (body_comp or {}).get("parameters") or []
+	params = [str(p.get("text")) for p in body_items]
+	if named:
+		body_map = {p["parameter_name"]: p["text"] for p in body_items if p.get("parameter_name")}
+	else:
+		body_map = {str(i + 1): p for i, p in enumerate(params)}
 
-	if headers_n or buttons_n or (tpl and _has_dynamic_url(tpl)):
+	if named or any(c.get("type") in ("header", "button") for c in components) or (tpl and _has_dynamic_url(tpl)):
 		if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
 			raise frappe.PermissionError("Not permitted to send WhatsApp messages")
-		for item in headers_n:
-			if isinstance(item, dict) and not item.get("type"):
-				item["type"] = header_type.lower() if header_type else "image"
 		template_payload: dict[str, Any] = {
 			"name": (tpl or {}).get("actual_name") or (tpl or {}).get("template_name") or template_name,
 			"language": {"code": (tpl or {}).get("language_code") or language_code or "en_US"},
 		}
-		components = wt.build_template_components(params, headers_n, buttons_n, header_type, always_body=bool(params))
 		if components:
 			template_payload["components"] = components
 		wamid = _graph_post_message(
@@ -620,13 +751,15 @@ def send_template(
 			http_post,
 		)
 		mirror: dict[str, Any] = {"template_parameters": ",".join(params)}
-		if params:
-			mirror["body_param"] = json.dumps({str(i + 1): p for i, p in enumerate(params)})
-		media = next((h for h in headers_n if isinstance(h, dict)), None)
-		if media:
-			mirror["attach"] = media["link"]
-		elif headers_n:
-			mirror["template_header_parameters"] = str(headers_n[0])
+		if body_map:
+			mirror["body_param"] = json.dumps(body_map)
+		header_comp = next((c for c in components if c.get("type") == "header"), None)
+		if header_comp:
+			hp = header_comp["parameters"][0]
+			if hp.get("type") == "text":
+				mirror["template_header_parameters"] = str(hp.get("text"))
+			elif hp.get("type") in ("image", "video", "document"):
+				mirror["attach"] = (hp.get(hp["type"]) or {}).get("link")
 		return _mirror_template_send(acct, docname, to, wamid, mirror, trusted)
 
 	values: dict[str, Any] = {
@@ -639,7 +772,7 @@ def send_template(
 		"content_type": "text",
 		"template_parameters": ",".join(params),
 		# frappe_whatsapp builds the Meta payload from body_param (JSON dict values)
-		"body_param": json.dumps({str(i + 1): p for i, p in enumerate(params)}),
+		"body_param": json.dumps(body_map),
 	}
 	try:
 		doc = frappe.get_doc(values)
@@ -660,41 +793,70 @@ def _has_dynamic_url(tpl: dict[str, Any]) -> bool:
 
 
 def _check_send_against_template(
-	tpl: dict[str, Any], params: list[str], headers_n: list[Any], buttons_n: list[dict[str, Any]]
+	tpl: dict[str, Any],
+	view: dict[str, Any],
+	body_params: Any,
+	header_raw: Any,
+	button_params: list[Any],
+	copy_comps: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
+	"""Compare raw send params with the template definition (counts, header kind, button kinds)."""
 	errors: list[dict[str, str]] = []
-	expected = len(wt.placeholders(tpl.get("template") or ""))
-	if expected != len(params):
-		errors.append(wt._e("body_params", "param_count_mismatch", f"This template takes {expected} body parameter(s); got {len(params)}."))
-	header_type = tpl.get("header_type") or ""
-	header_vars = len(wt.placeholders(tpl.get("header") or "")) if header_type == "TEXT" else 0
+	tv = wt._template_view(view)
+	if tv["fmt"] != "NAMED":  # NAMED mismatches (param_missing / param_unknown) come from build_send_components
+		given = list(body_params.values()) if isinstance(body_params, dict) else list(body_params or [])
+		expected = len(tv["body_vars"])
+		if expected != len(given):
+			errors.append(wt._e("body_params", "param_count_mismatch", f"This template takes {expected} body parameter(s); got {len(given)}."))
+	header_type = tv["header_type"]
+	if isinstance(header_raw, dict):
+		items = [header_raw] if "type" in header_raw else list(header_raw.values())
+	else:
+		items = list(header_raw or [])
+	first = items[0] if items else None
+	first_kind = str(first.get("type") or "").lower() if isinstance(first, dict) else ""
 	if header_type == "TEXT":
-		if header_vars and not headers_n:
+		header_vars = len(tv["header_vars"])
+		if header_vars and not items:
 			errors.append(wt._e("header_params", "required", "This template header has a variable; provide one header parameter."))
-		elif not header_vars and headers_n:
+		elif not header_vars and items:
 			errors.append(wt._e("header_params", "not_expected", "This template header takes no parameter."))
-		elif headers_n and isinstance(headers_n[0], dict):
+		elif isinstance(first, dict):
 			errors.append(wt._e("header_params", "invalid_type", "This template header needs text, not media."))
 	elif header_type in wt.MEDIA_HEADER_TYPES:
-		if headers_n and not isinstance(headers_n[0], dict):
+		if items and not isinstance(first, (dict, str)):
 			errors.append(wt._e("header_params", "invalid_type", f"This template has an {header_type} header; provide a media link."))
-		elif headers_n and headers_n[0].get("type") and headers_n[0]["type"] != header_type.lower():
+		elif items and not isinstance(first, dict):
+			pass  # a bare link: the kind is the template's
+		elif first_kind and first_kind != header_type.lower():
 			errors.append(wt._e("header_params", "invalid_type", f"This template has an {header_type} header."))
-	elif headers_n:
+	elif header_type == "LOCATION":
+		if not items:
+			errors.append(wt._e("header_params", "required", "This template has a LOCATION header; provide latitude and longitude."))
+		elif first_kind != "location":
+			errors.append(wt._e("header_params", "invalid_type", "This template has a LOCATION header; provide a location."))
+	elif items:
 		errors.append(wt._e("header_params", "not_expected", "This template has no header."))
+	buttons_n, _ = wt.normalize_button_params(button_params)
 	buttons = tpl.get("buttons") or []
 	dynamic = {i for i, b in enumerate(buttons) if b.get("button_type") == "Visit Website" and b.get("url_type") == "Dynamic"}
-	given = set()
+	copy_idx = {i for i, b in enumerate(buttons) if b.get("button_type") == wt.DOCTYPE_BUTTON_TYPE["COPY_CODE"]}
+	given_idx = set()
 	for bp in buttons_n:
 		idx = bp["index"]
 		if bp["sub_type"] == "url":
 			if idx not in dynamic:
 				errors.append(wt._e("button_params", "unexpected", f"Button {idx} is not a dynamic URL button."))
-			given.add(idx)
+			given_idx.add(idx)
 		elif idx >= len(buttons) or buttons[idx].get("button_type") != "Quick Reply":
 			errors.append(wt._e("button_params", "unexpected", f"Button {idx} is not a quick-reply button."))
-	for idx in sorted(dynamic - given):
+	for idx in sorted(dynamic - given_idx):
 		errors.append(wt._e("button_params", "required", f"Button {idx} is a dynamic URL button and needs its URL suffix."))
+	copy_given = {int(c["index"]) for c in copy_comps or []}
+	for idx in sorted(copy_given - copy_idx):
+		errors.append(wt._e("button_params", "unexpected", f"Button {idx} is not a copy-code button."))
+	for idx in sorted(copy_idx - copy_given):
+		errors.append(wt._e("button_params", "required", f"Button {idx} is a copy-code button and needs its code."))
 	return errors
 
 
@@ -902,15 +1064,196 @@ def _docname_taken_by_other_account(account_name: str, docname: str) -> dict[str
 	return None
 
 
-def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-	"""Create a WhatsApp Templates row (its after_insert pushes to Meta). Permission-checked (A8).
+_MEDIA_MIME_PREFIXES = {"IMAGE": ("image/",), "VIDEO": ("video/",), "DOCUMENT": ("application/", "text/")}
+_HEADER_SAMPLE_LIMITS = {"IMAGE": 5 * _MB, "VIDEO": 16 * _MB, "DOCUMENT": 100 * _MB}
 
-	Supports an optional header (TEXT with at most one variable, or IMAGE/DOCUMENT
-	with a sample file), footer and up to 3 quick-reply / 2 call-to-action
-	buttons, validated against Meta limits first. Field mapping follows the
-	``WhatsApp Templates`` / ``WhatsApp Button`` doctypes: ``header_type``,
-	``header``, ``sample``, ``footer``, ``sample_values`` and ``buttons`` child
-	rows. Validation failures return ``{"error": "validation_failed", "errors": [...]}``.
+
+def _sample_problem(code: str, message: str) -> BridgeError:
+	return BridgeError(wt.validation_error([wt._e("sample", code, message)]))
+
+
+def _read_header_sample(
+	sample: str, header_type: str, http_get: Callable[..., Any] | None = None
+) -> tuple[bytes, str]:
+	"""Bytes and MIME type of a media header sample: a public URL or an uploaded Frappe File."""
+	import mimetypes
+
+	if wt.is_http_url(sample):
+		get = http_get or _default_get
+		try:
+			resp = get(sample, timeout=30, allow_redirects=False)
+		except Exception as exc:
+			raise _sample_problem("sample_unreachable", f"Could not fetch the sample: {_redact(exc)}") from exc
+		code = getattr(resp, "status_code", 200)
+		if not isinstance(code, int) or code >= 300:
+			raise _sample_problem("sample_unreachable", f"The sample URL answered HTTP {code}.")
+		content = resp.content
+		mime = str((getattr(resp, "headers", None) or {}).get("Content-Type") or "").split(";")[0].strip().lower()
+		mime = mime or (mimetypes.guess_type(urlparse(sample).path)[0] or "")
+	else:
+		name = frappe.db.get_value("File", {"file_url": sample}, "name")
+		if not name:
+			raise _sample_problem("sample_not_found", "No uploaded file matches this sample path.")
+		content = frappe.get_doc("File", name).get_content()
+		if isinstance(content, str):
+			content = content.encode()
+		mime = mimetypes.guess_type(sample)[0] or ""
+	if not mime.startswith(_MEDIA_MIME_PREFIXES[header_type]):
+		raise _sample_problem("invalid_sample", f"The sample is {mime or 'of unknown type'}, not an {header_type} file.")
+	if not content:
+		raise _sample_problem("invalid_sample", "The sample file is empty.")
+	if len(content) > _HEADER_SAMPLE_LIMITS[header_type]:
+		raise _sample_problem("sample_too_large", f"The {header_type} sample is larger than {_HEADER_SAMPLE_LIMITS[header_type] // _MB} MB.")
+	return content, mime
+
+
+def upload_header_handle(
+	acct: dict[str, Any],
+	header_type: str,
+	sample: str,
+	http_post: Callable[..., Any] | None = None,
+	http_get: Callable[..., Any] | None = None,
+) -> str:
+	"""Meta resumable upload of a header sample; returns the ``header_handle`` (``h``).
+
+	Two calls, as in Meta's Resumable Upload API: ``POST /{app_id}/uploads`` opens a session
+	(file length and type), ``POST /{session id}`` with the raw bytes returns the handle. Raises
+	:class:`BridgeError` (validation error for a bad sample, ``upload_failed`` for a Meta refusal).
+	"""
+	if not acct.get("app_id"):
+		raise _sample_problem("app_id_missing", "Set the App ID on the WhatsApp Account to upload header samples.")
+	content, mime = _read_header_sample(sample, header_type, http_get)
+	http_post = http_post or _default_post
+	base = f"{acct['url']}/{acct['version']}"
+	try:
+		opened = http_post(
+			f"{base}/{acct['app_id']}/uploads",
+			data={"file_length": len(content), "file_type": mime, "messaging_product": "whatsapp"},
+			headers={"Authorization": f"Bearer {acct['token']}"},
+			timeout=_HTTP_TIMEOUT,
+		)
+		code = getattr(opened, "status_code", 200)
+		if isinstance(code, int) and code >= 400:
+			raise BridgeError(_err("upload_failed", message=graph_error_message(opened)))
+		session = str(opened.json()["id"])
+		sent = http_post(
+			f"{base}/{session}",
+			data=content,
+			headers={"Authorization": f"OAuth {acct['token']}", "file_offset": "0"},
+			timeout=60,
+		)
+		code = getattr(sent, "status_code", 200)
+		if isinstance(code, int) and code >= 400:
+			raise BridgeError(_err("upload_failed", message=graph_error_message(sent)))
+		return str(sent.json()["h"])
+	except BridgeError:
+		raise
+	except Exception as exc:
+		raise BridgeError(_err("upload_failed", message=_redact(exc))) from exc
+
+
+def _guard():
+	from huf.ai.gateway_adapters import whatsapp_template_guard as guard
+
+	return guard
+
+
+def _meta_extras(components: Any, parameter_format: Any = None, ttl: Any = None) -> dict[str, Any]:
+	"""Extras derivable from Meta's ``components``: format, named samples, header format, TTL."""
+	named_samples: list[dict[str, str]] = []
+	header_format = ""
+	inferred = "POSITIONAL"
+	for comp in components if isinstance(components, list) else []:
+		if not isinstance(comp, dict):
+			continue
+		ctype = str(comp.get("type") or "").upper()
+		if ctype == "HEADER":
+			header_format = str(comp.get("format") or "").upper()
+		text_vars = wt.variables(str(comp.get("text") or "")) if ctype in ("HEADER", "BODY") else []
+		if any(not v.isdigit() for v in text_vars):
+			inferred = "NAMED"
+		if ctype == "BODY":
+			for item in (comp.get("example") or {}).get("body_text_named_params") or []:
+				if isinstance(item, dict) and item.get("param_name"):
+					named_samples.append({"name": str(item["param_name"]), "example": str(item.get("example") or "")})
+	fmt = str(parameter_format or "").upper()
+	return {
+		"parameter_format": fmt if fmt in wt.PARAMETER_FORMATS else inferred,
+		"named_samples": named_samples,
+		"header_format": header_format,
+		"ttl_seconds": ttl if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl != 0 else None,
+	}
+
+
+def _button_rows(spec: dict[str, Any]) -> list[dict[str, Any]]:
+	"""``wt.button_rows`` with the doctype's ``url_type`` default (Static) filled in."""
+	return [{**row, "url_type": row.get("url_type") or "Static"} for row in wt.button_rows(spec)]
+
+
+def _check_row_lengths(doc: Any) -> None:
+	"""Raise ValueError when a Data column value would overflow (checked before any write)."""
+	checks = [("WhatsApp Templates", _TEMPLATE_DATA_FIELDS, [doc])]
+	checks.append(("WhatsApp Button", _BUTTON_DATA_FIELDS, list(doc.get("buttons") or [])))
+	for dt, fieldnames, docs in checks:
+		for row_doc in docs:
+			for fieldname in fieldnames:
+				value = getattr(row_doc, fieldname, None)
+				if value is not None and len(str(value)) > _DATA_COLUMN_LEN:
+					raise ValueError(f"{dt}.{fieldname} exceeds {_DATA_COLUMN_LEN} characters")
+
+
+def _insert_mirror_row(doc: Any) -> str:
+	"""``db_insert`` a ``WhatsApp Templates`` row and its buttons without controller hooks (so frappe_whatsapp's
+	``after_insert`` never POSTs to Meta). Validates column lengths first so nothing is half-written."""
+	_check_row_lengths(doc)
+	now = frappe.utils.now()
+	user = frappe.session.user
+	doc.owner = doc.modified_by = user
+	doc.creation = doc.modified = now
+	doc.docstatus = 0
+	doc.db_insert()
+	for child in doc.get("buttons"):
+		child.parent, child.parenttype, child.parentfield = doc.name, doc.doctype, "buttons"
+		child.owner = child.modified_by = user
+		child.creation = child.modified = now
+		child.db_insert()
+	return doc.name
+
+
+def _extra_values(
+	spec: dict[str, Any], tid: Any, components: list[dict[str, Any]], created_via: str | None = None
+) -> dict[str, Any]:
+	values: dict[str, Any] = {
+		"template_id": str(tid or ""),
+		"parameter_format": spec.get("parameter_format") or "POSITIONAL",
+		"named_samples": list(spec.get("named_samples") or []),
+		"header_format": spec.get("header_type") or "",
+		"components_json": components,
+	}
+	if spec.get("ttl_seconds") is not None:
+		values["ttl_seconds"] = spec["ttl_seconds"]
+	if created_via:
+		values["created_via"] = created_via
+	return values
+
+
+def create_template(
+	account_name: str,
+	payload: dict[str, Any],
+	http_post: Callable[..., Any] | None = None,
+	http_get: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	"""Create a template on Meta (``POST /{waba}/message_templates``) and mirror it locally. Permission-checked (A8).
+
+	Huf pushes straight to Graph with ``wt.build_meta_payload`` (``parameter_format``, full
+	``components``, ``message_send_ttl_seconds``); frappe_whatsapp's own ``after_insert`` push is never
+	used. IMAGE / VIDEO / DOCUMENT header samples (public URL or uploaded File) are uploaded through
+	Meta's resumable upload API first to obtain the ``header_handle`` (or pass ``header_handle``).
+	Only after Meta accepts is a ``WhatsApp Templates`` row written (``db_insert``, under
+	``frappe.flags.huf_template_write``, ``doc.flags.huf_mirror``) together with its Template Extra
+	(``created_via`` Huf). A Meta refusal leaves no local row and returns
+	``{"error": "create_failed", "message": <redacted Meta message>}``. Validation failures return
+	``{"error": "validation_failed", "errors": [...]}``.
 	"""
 	if not is_available():
 		return _err("bridge_unavailable")
@@ -921,51 +1264,91 @@ def create_template(account_name: str, payload: dict[str, Any]) -> dict[str, Any
 		return checked["error"]
 	name, category, language_code = checked["name"], checked["category"], checked["language_code"]
 	language, spec = checked["language"], checked["spec"]
-	taken = _docname_taken_by_other_account(account_name, f"{name}-{language_code}")
+	docname = f"{name}-{language_code}"
+	taken = _docname_taken_by_other_account(account_name, docname)
 	if taken:
 		return taken
-	values: dict[str, Any] = {k: payload[k] for k in _TEMPLATE_PASSTHROUGH if payload.get(k)}
-	values.update(
+	if frappe.db.exists("WhatsApp Templates", docname):
+		return _err("create_failed", message=f"The template {docname} already exists for this account.")
+	acct = resolve_account(account_name)
+	if not acct or acct.get("error"):
+		return _err("no_account")
+
+	doc = frappe.new_doc("WhatsApp Templates")
+	for key in _TEMPLATE_PASSTHROUGH:
+		if payload.get(key):
+			doc.set(key, payload[key])
+	doc.update(
 		{
-			"doctype": "WhatsApp Templates",
+			"name": docname,
 			"template_name": name,
+			"actual_name": name,
 			"category": category,
 			"language": language,
 			"language_code": language_code,
 			"whatsapp_account": account_name,
 			"template": spec["body"],
 			"sample_values": ",".join(spec["sample_values"]),
+			"header_type": spec["header_type"] or "",
+			"footer": spec["footer"] or "",
 		}
 	)
-	if spec["header_type"]:
-		values["header_type"] = spec["header_type"]
-		if spec["header_type"] == "TEXT":
-			values["header"] = spec["header_text"]
-		if spec["header_sample"]:
-			values["sample"] = spec["header_sample"]
-	if spec["footer"]:
-		values["footer"] = spec["footer"]
-	rows = wt.button_rows(spec)
-	if rows:
-		values["buttons"] = rows
-	doc = None
+	if spec["header_type"] == "TEXT":
+		doc.header = spec["header_text"]
+	if spec["header_sample"]:
+		doc.sample = spec["header_sample"]
+	for row in _button_rows(spec):
+		doc.append("buttons", row)
 	try:
-		doc = frappe.get_doc(values)
-		doc.insert()
-	except frappe.PermissionError:
-		raise
-	except Exception as exc:
-		# frappe_whatsapp pushes to Meta in after_insert, so a Meta rejection leaves a
-		# local row that never existed on Meta. Drop it (no hooks) so it cannot linger as PENDING.
-		orphan = getattr(doc, "name", None)
-		if orphan and not doc.get("id") and frappe.db.exists("WhatsApp Templates", orphan):
-			frappe.db.delete("WhatsApp Templates", {"name": orphan})
+		_check_row_lengths(doc)
+	except ValueError as exc:
 		return _err("create_failed", message=_redact(exc))
+
+	if spec["header_type"] in wt.MEDIA_HEADER_TYPES and not spec["header_handle"]:
+		try:
+			spec["header_handle"] = upload_header_handle(acct, spec["header_type"], spec["header_sample"], http_post, http_get)
+		except BridgeError as exc:
+			return exc.payload
+
+	meta = wt.build_meta_payload(spec)
+	body = {"name": name, "language": language_code, "category": category, **meta}
+	try:
+		resp = (http_post or _default_post)(
+			f"{acct['url']}/{acct['version']}/{acct['business_id']}/message_templates",
+			json=body,
+			headers={"Authorization": f"Bearer {acct['token']}", "Content-Type": "application/json"},
+			timeout=_HTTP_TIMEOUT,
+		)
+	except Exception as exc:
+		return _err("create_failed", message=_redact(exc))
+	code = getattr(resp, "status_code", 200)
+	if isinstance(code, int) and code >= 400:
+		return _err("create_failed", message=graph_error_message(resp))
+	try:
+		data = resp.json() or {}
+		tid = str(data["id"])
+	except Exception:
+		return _err("create_failed", message="Unexpected response from WhatsApp.")
+	status = str(data.get("status") or "PENDING").upper()
+	meta_category = str(data.get("category") or category).upper()
+
+	doc.id, doc.status, doc.category = tid, status, meta_category
+	doc.flags.huf_mirror = True
+	result: dict[str, Any] = {"success": True, "name": docname, "status": status, "id": tid}
+	try:
+		with _guard().huf_template_write():
+			_insert_mirror_row(doc)
+			_guard().upsert_extra(
+				account_name, docname, **_extra_values(spec, tid, meta["components"], created_via="Huf")
+			)
+	except Exception as exc:
+		# Meta has the template; the next sync imports it. Never report a Meta-accepted template as failed.
+		result.update(mirrored=False, mirror_error=_redact(exc))
 	record_template_state(
-		docname=doc.name, template_id=doc.get("id"), account=account_name, status=doc.get("status") or "PENDING",
-		category=category, source="create",
+		docname=docname, template_id=tid, account=account_name, status=status, category=meta_category,
+		components=meta["components"], source="create",
 	)
-	return {"success": True, "name": doc.name, "status": doc.get("status"), "id": doc.get("id")}
+	return result
 
 
 def delete_template(name: str) -> dict[str, Any]:
@@ -983,8 +1366,11 @@ def delete_template(name: str) -> dict[str, Any]:
 			"template_in_use",
 			message="This template has been used in sent messages and cannot be deleted.",
 		)
+	account = frappe.db.get_value("WhatsApp Templates", name, "whatsapp_account")
 	try:
-		frappe.delete_doc("WhatsApp Templates", name)
+		with _guard().huf_template_write():  # Huf's own delete: the desk guard must let it through
+			frappe.delete_doc("WhatsApp Templates", name)
+			_guard().delete_extra(account, name)
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
@@ -999,6 +1385,7 @@ _META_BUTTON_TYPES = {
 	"FLOW": "Flow",
 	"MPM": "Multi-Product Message",
 	"CATALOG": "Catalog",
+	"COPY_CODE": wt.DOCTYPE_BUTTON_TYPE["COPY_CODE"],
 }
 
 
@@ -1147,27 +1534,33 @@ def _import_template(account_name: str, tpl: dict[str, Any]) -> str:
 			setattr(doc, key, parsed[key])
 	for row in parsed["buttons"]:
 		doc.append("buttons", row)
-	# validate before any insert so an overflowing template never leaves a half-written parent row
-	checks = [("WhatsApp Templates", _TEMPLATE_DATA_FIELDS, [doc])]
-	checks.append(("WhatsApp Button", _BUTTON_DATA_FIELDS, list(doc.get("buttons") or [])))
-	for dt, fieldnames, docs in checks:
-		for row_doc in docs:
-			for fieldname in fieldnames:
-				value = getattr(row_doc, fieldname, None)
-				if value is not None and len(str(value)) > _DATA_COLUMN_LEN:
-					raise ValueError(f"{dt}.{fieldname} exceeds {_DATA_COLUMN_LEN} characters")
-	now = frappe.utils.now()
-	user = frappe.session.user
-	doc.owner = doc.modified_by = user
-	doc.creation = doc.modified = now
-	doc.docstatus = 0
-	doc.db_insert()
-	for child in doc.get("buttons"):
-		child.parent, child.parenttype, child.parentfield = doc.name, doc.doctype, "buttons"
-		child.owner = child.modified_by = user
-		child.creation = child.modified = now
-		child.db_insert()
+	_insert_mirror_row(doc)  # validated before any insert so an overflowing template never leaves a half-written row
 	return doc.name
+
+
+def _sync_extra(account_name: str, docname: str, tpl: dict[str, Any], imported: bool) -> None:
+	"""Keep the Template Extra in line with what Meta returned (best effort; never fails a sync)."""
+	comps = tpl.get("components")
+	if not isinstance(comps, list) or not comps:
+		return
+	try:
+		guard = _guard()
+		derived = _meta_extras(comps, tpl.get("parameter_format"), tpl.get("message_send_ttl_seconds"))
+		fields: dict[str, Any] = {
+			"template_id": str(tpl.get("id") or ""),
+			"parameter_format": derived["parameter_format"],
+			"named_samples": derived["named_samples"],
+			"header_format": derived["header_format"],
+			"components_json": comps,
+		}
+		if derived["ttl_seconds"] is not None:
+			fields["ttl_seconds"] = derived["ttl_seconds"]
+		existing = guard.get_extra(account_name, docname)
+		if imported or not existing:
+			fields["created_via"] = "Meta sync"
+		guard.upsert_extra(account_name, docname, **fields)
+	except Exception:
+		frappe.logger("huf").warning("WhatsApp template extra sync failed", exc_info=True)
 
 
 def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None) -> dict[str, Any]:
@@ -1226,6 +1619,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 							continue
 						imported += 1
 						_record_state_from_meta(account_name, tpl, f"{tpl['name']}-{language}")
+						_sync_extra(account_name, f"{tpl['name']}-{language}", tpl, True)
 						continue
 					current = frappe.db.get_value("WhatsApp Templates", name, ["status", "category", "id"], as_dict=True) or {}
 					changes = {
@@ -1237,6 +1631,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 						frappe.db.set_value("WhatsApp Templates", name, changes)
 					refreshed = _refresh_local_components(name, tpl)
 					_record_state_from_meta(account_name, tpl, name)
+					_sync_extra(account_name, name, tpl, False)
 					if changes or refreshed:
 						updated += 1
 					else:
@@ -1612,8 +2007,24 @@ _ROW_FIELDS = [
 ]
 
 
-def _current_payload(row: dict[str, Any]) -> dict[str, Any]:
-	"""Local row as a create-style payload (the base an edit is merged onto)."""
+def _extra_ttl(extra: dict[str, Any]) -> int | None:
+	"""Stored TTL; the Int column's 0 means 'not set'."""
+	ttl = extra.get("ttl_seconds")
+	return ttl if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl != 0 else None
+
+
+def _row_parameter_format(row: dict[str, Any], extra: dict[str, Any]) -> str:
+	fmt = str(extra.get("parameter_format") or "").upper()
+	if fmt in wt.PARAMETER_FORMATS:
+		return fmt
+	named = any(not v.isdigit() for v in wt.variables(row.get("template") or "") + wt.variables(row.get("header") or ""))
+	return "NAMED" if named else "POSITIONAL"
+
+
+def _current_payload(row: dict[str, Any], extra: dict[str, Any] | None = None) -> dict[str, Any]:
+	"""Local row (plus its Template Extra) as a create-style payload (the base an edit is merged onto)."""
+	extra = extra or {}
+	htype = str(extra.get("header_format") or row.get("header_type") or "").upper()
 	payload: dict[str, Any] = {
 		"template_name": row.get("actual_name") or row.get("template_name"),
 		"category": row.get("category"),
@@ -1622,18 +2033,38 @@ def _current_payload(row: dict[str, Any]) -> dict[str, Any]:
 		"sample_values": row.get("sample_values") or "",
 		"footer": row.get("footer") or "",
 		"buttons": _button_dicts(row["name"]),
+		"parameter_format": _row_parameter_format(row, extra),
 	}
-	if row.get("header_type"):
-		payload["header_type"] = row["header_type"]
-		if row["header_type"] == "TEXT":
+	if payload["parameter_format"] == "NAMED" and extra.get("named_samples"):
+		payload["named_samples"] = extra["named_samples"]
+	if _extra_ttl(extra) is not None:
+		payload["ttl_seconds"] = _extra_ttl(extra)
+	if htype:
+		payload["header_type"] = htype
+		if htype == "TEXT":
 			payload["header"] = row.get("header") or ""
-		if row.get("sample"):
+		if row.get("sample") and htype != "LOCATION":
 			payload["sample"] = row["sample"]
 	return payload
 
 
+def _existing_header_handle(extra: dict[str, Any], state: dict[str, Any]) -> str:
+	"""The Meta upload handle of the template's current media header, '' when unknown."""
+	comps = extra.get("components_json") or _loads(state.get("components"), []) or []
+	for comp in comps if isinstance(comps, list) else []:
+		if isinstance(comp, dict) and str(comp.get("type")).upper() == "HEADER":
+			handles = (comp.get("example") or {}).get("header_handle")
+			if handles:
+				return str(handles[0])
+	return ""
+
+
 def get_template(name: str) -> dict[str, Any]:
-	"""Full detail of one template: components, review/quality state, edit allowance, manager link."""
+	"""Full detail of one template: components, review/quality state, edit allowance, manager link.
+
+	Also ``parameter_format``, ``ttl_seconds``, ``header_format`` and ``named_samples`` (from the Template
+	Extra when present, else derived from the stored Meta components) so an editor can prefill.
+	"""
 	if not is_available():
 		return _err("bridge_unavailable")
 	if not frappe.has_permission("WhatsApp Templates", "read"):
@@ -1644,12 +2075,22 @@ def get_template(name: str) -> dict[str, Any]:
 	state = _state_row(name, row.get("whatsapp_account")) or {}
 	status = (state.get("status") or row.get("status") or "").upper()
 	quota = edit_quota(status, state.get("edit_log"))
+	extra = _get_extra(row.get("whatsapp_account"), name) or {}
+	meta_components = extra.get("components_json") or _loads(state.get("components"), []) or []
+	derived = _meta_extras(meta_components, extra.get("parameter_format"), _extra_ttl(extra))
+	header_format = str(extra.get("header_format") or derived["header_format"] or row.get("header_type") or "").upper()
+	named_samples = extra.get("named_samples") or derived["named_samples"] or []
+	parameter_format = _row_parameter_format(row, {"parameter_format": extra.get("parameter_format") or derived["parameter_format"]})
 	view = {
 		"header": (
-			{"type": row["header_type"], "text": row.get("header") or "", "sample": row.get("sample") or ""}
-			if row.get("header_type") else None
+			{"type": header_format, "text": row.get("header") or "", "sample": row.get("sample") or ""}
+			if header_format else None
 		),
-		"body": {"text": row.get("template") or "", "sample_values": [s for s in (row.get("sample_values") or "").split(",") if s]},
+		"body": {
+			"text": row.get("template") or "",
+			"sample_values": [s for s in (row.get("sample_values") or "").split(",") if s],
+			**({"named_samples": named_samples} if named_samples else {}),
+		},
 		"footer": {"text": row["footer"]} if row.get("footer") else None,
 		"buttons": _button_dicts(name),
 	}
@@ -1670,6 +2111,10 @@ def get_template(name: str) -> dict[str, Any]:
 		"category_change_pending": bool(correct and correct != category),
 		"status": status,
 		"whatsapp_account": row.get("whatsapp_account"),
+		"parameter_format": parameter_format,
+		"ttl_seconds": _extra_ttl(extra) if _extra_ttl(extra) is not None else derived["ttl_seconds"],
+		"header_format": header_format,
+		"named_samples": named_samples,
 		"components": view,
 		"meta_components": _loads(state.get("components"), []),
 		"state": {
@@ -1688,14 +2133,22 @@ def get_template(name: str) -> dict[str, Any]:
 	}
 
 
-def edit_template(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+def edit_template(
+	name: str,
+	payload: dict[str, Any],
+	http_post: Callable[..., Any] | None = None,
+	http_get: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
 	"""Edit a template on Meta (``POST /{template-id}`` with the FULL components) and locally.
 
 	Meta rules enforced here before any call: status must be APPROVED/REJECTED/PAUSED, an
-	APPROVED template allows 1 edit/24h and 10/30 days, name and language are immutable.
-	``payload`` keys (body, sample_values, header*, sample, footer, buttons, category,
-	message_send_ttl_seconds) are merged onto the current definition. After the edit the
-	template is PENDING re-review. Permission-checked.
+	APPROVED template allows 1 edit/24h and 10/30 days, name, language and ``parameter_format`` are
+	immutable. ``payload`` keys (body, sample_values, named_samples, header*, sample, header_handle,
+	footer, buttons, category, ttl_seconds / message_send_ttl_seconds) are merged onto the current
+	definition (local row + Template Extra) and sent through ``wt.build_meta_payload``. An unchanged
+	media header re-sends its stored upload handle; a NEW media header needs a ``sample`` (uploaded
+	again) or ``header_handle``, otherwise ``media_header_edit_unsupported``. After the edit the
+	template is PENDING re-review and its row and Template Extra are updated. Permission-checked.
 	"""
 	if not is_available():
 		return _err("bridge_unavailable")
@@ -1722,69 +2175,96 @@ def edit_template(name: str, payload: dict[str, Any]) -> dict[str, Any]:
 	if not acct or acct.get("error"):
 		return _err("no_account")
 
-	merged = _current_payload(row)
-	for key in ("body", "template", "sample_values", "header", "header_type", "sample", "footer", "buttons"):
+	extra = _get_extra(row.get("whatsapp_account"), name) or {}
+	merged = _current_payload(row, extra)
+	declared = payload.get("parameter_format")
+	if declared not in (None, "") and str(declared).upper() != merged["parameter_format"]:
+		return _err("immutable_field", field="parameter_format", message="The variable format (numbered or named) cannot be changed after creation.")
+	current_header = str(merged.get("header_type") or "").upper()
+	for key in ("body", "template", "sample_values", "named_samples", "header", "header_type", "sample", "header_handle", "footer", "buttons"):
 		if key in payload:
 			merged[key] = payload[key]
 	if "template" in payload and "body" not in payload:
 		merged.pop("body", None)
 	if "header_type" in payload and not payload["header_type"]:
-		for key in ("header_type", "header", "sample"):
+		for key in ("header_type", "header", "sample", "header_handle"):
 			merged.pop(key, None)
+	elif "header_type" in payload and str(payload["header_type"]).upper() != current_header:
+		if "sample" not in payload:
+			merged.pop("sample", None)  # the old header's sample belongs to the old media kind
+		if str(payload["header_type"]).upper() != "TEXT" and "header" not in payload:
+			merged.pop("header", None)
 	category = str(payload.get("category") or row.get("category") or "").upper()
 	if category not in TEMPLATE_CATEGORIES:
 		return _err("invalid_category", message="Category must be one of " + ", ".join(TEMPLATE_CATEGORIES))
-	ttl = payload.get("message_send_ttl_seconds")
+	merged["category"] = category
+	ttl = payload.get("message_send_ttl_seconds") if payload.get("message_send_ttl_seconds") is not None else payload.get("ttl_seconds")
 	if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, int)):
 		return _err("invalid_ttl", message="message_send_ttl_seconds must be an integer")
+	if ttl is not None:
+		merged["ttl_seconds"] = ttl
+	elif category != "UTILITY":
+		merged.pop("ttl_seconds", None)  # a TTL only exists on UTILITY templates
 
-	media_unchanged = row.get("header_type") in wt.MEDIA_HEADER_TYPES and not any(
-		k in payload for k in ("header_type", "header", "sample")
+	merged_header = str(merged.get("header_type") or "").upper()
+	new_media_requested = bool(payload.get("sample") or payload.get("header_handle"))
+	media_unchanged = (
+		current_header in wt.MEDIA_HEADER_TYPES
+		and merged_header == current_header
+		and not new_media_requested
+		and "header" not in payload
 	)
 	if media_unchanged:
-		merged["sample"] = "https://existing.invalid/header"  # satisfied by the reused Meta header below
-	spec, errors = wt.validate_template_spec(merged)
-	if spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged:
+		handle = _existing_header_handle(extra, state)
+		if not handle:
+			return _err("media_header_edit_unsupported", message="The current media header cannot be re-sent; provide a new sample file.")
+		merged["header_handle"] = handle
+	elif merged_header in wt.MEDIA_HEADER_TYPES and not (merged.get("sample") or merged.get("header_handle")):
 		return _err(
 			"media_header_edit_unsupported",
-			message="Changing an image/document header needs a fresh upload; edit it in WhatsApp Manager.",
+			message="A new image, video or document header needs a sample file (or an upload handle).",
 		)
+	spec, errors = wt.validate_template_spec(merged)
 	if errors:
 		return wt.validation_error(errors)
-	media_header = None
-	if media_unchanged:
-		for comp in _loads(state.get("components"), []) or []:
-			if isinstance(comp, dict) and str(comp.get("type")).upper() == "HEADER":
-				if (comp.get("example") or {}).get("header_handle"):
-					media_header = comp
-		if not media_header:
-			return _err("media_header_edit_unsupported", message="The current media header cannot be re-sent; edit it in WhatsApp Manager.")
-	components = wt.build_meta_components(spec, media_header)
+	if spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged and not spec["header_handle"]:
+		problem = _check_sample_reference(spec["header_sample"])
+		if problem:
+			return wt.validation_error([problem])
+		try:
+			spec["header_handle"] = upload_header_handle(acct, spec["header_type"], spec["header_sample"], http_post, http_get)
+		except BridgeError as exc:
+			return exc.payload
+	meta = wt.build_meta_payload(spec)
+	components = meta["components"]
 
 	local_buttons = frappe.get_all(
 		"WhatsApp Button", filters={"parent": name, "parenttype": "WhatsApp Templates"},
 		fields=["button_type", "button_label", "website_url", "phone_number"], order_by="idx asc",
 	)
-	same_header_text = (spec["header_text"] or "") == ((row.get("header") or "") if row.get("header_type") == "TEXT" else "")
+	current_ttl = _extra_ttl(extra)
+	same_header_text = (spec["header_text"] or "") == ((row.get("header") or "") if current_header == "TEXT" else "")
 	if (
 		category == str(row.get("category") or "").upper()
-		and ttl is None
+		and (spec["ttl_seconds"] or None) == (current_ttl or None)
 		and spec["body"] == (row.get("template") or "")
 		and ",".join(spec["sample_values"]) == (row.get("sample_values") or "")
-		and (spec["header_type"] or "") == (row.get("header_type") or "")
+		and (spec["header_type"] or "") == current_header
+		and not (spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged)
 		and same_header_text
 		and (spec["footer"] or "") == (row.get("footer") or "")
 		and _button_sig(wt.button_rows(spec)) == _button_sig(local_buttons)
+		and (spec["named_samples"] or []) == list(extra.get("named_samples") or spec["named_samples"] or [])
 	):
 		return _err("no_changes", message="Nothing changed; no edit was sent to Meta.")
 
 	body: dict[str, Any] = {"components": components}
 	if category != str(row.get("category") or "").upper():
 		body["category"] = category
-	if ttl is not None:
-		body["message_send_ttl_seconds"] = ttl
+	if spec["ttl_seconds"] is not None:
+		body["message_send_ttl_seconds"] = spec["ttl_seconds"]
 	try:
-		resp = _default_post(
+		resp = (http_post or _default_post)(
 			f"{acct['url']}/{acct['version']}/{row['id']}",
 			json=body,
 			headers={"Authorization": f"Bearer {acct['token']}", "Content-Type": "application/json"},
@@ -1810,8 +2290,19 @@ def edit_template(name: str, payload: dict[str, Any]) -> dict[str, Any]:
 	elif not spec["header_type"]:
 		changes["header"] = ""
 		changes["sample"] = ""
-	frappe.db.set_value("WhatsApp Templates", name, changes)
-	_write_buttons(name, wt.button_rows(spec))
+	elif spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged:
+		changes["header"] = ""
+		changes["sample"] = spec["header_sample"]
+	elif spec["header_type"] == "LOCATION":
+		changes["header"] = ""
+		changes["sample"] = ""
+	with _guard().huf_template_write():
+		frappe.db.set_value("WhatsApp Templates", name, changes)
+		_write_buttons(name, _button_rows(spec))
+		try:
+			_guard().upsert_extra(row.get("whatsapp_account"), name, **_extra_values(spec, row["id"], components))
+		except Exception:
+			frappe.logger("huf").warning("WhatsApp template extra update failed", exc_info=True)
 
 	log = _loads(state.get("edit_log"), []) or []
 	if status == "APPROVED":  # only edits of an APPROVED template count against Meta's quota

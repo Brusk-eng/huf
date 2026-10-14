@@ -372,7 +372,7 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 					template_name="promo",
 					category="MARKETING",
 					language_code="en_US",
-					body="Hello {{1}}",
+					body="Hello {{1}}, welcome",
 				)
 			)
 		self.assertTrue(result["success"])
@@ -380,7 +380,7 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 		account_name, payload = mock_create.call_args.args
 		self.assertEqual(account_name, "WA-1")
 		self.assertEqual(payload["template_name"], "promo")
-		self.assertEqual(payload["body"], "Hello {{1}}")
+		self.assertEqual(payload["body"], "Hello {{1}}, welcome")
 
 	def test_create_template_bridge_unavailable(self):
 		with (

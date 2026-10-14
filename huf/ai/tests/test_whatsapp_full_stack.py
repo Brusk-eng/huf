@@ -172,6 +172,7 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 			("frappe.utils.get_url", lambda *a, **k: "http://gw-wa-full.localhost"),
 			("frappe.integrations.utils.get_request_session", lambda: self.meta),
 			("huf.ai.gateway_adapters.whatsapp_bridge._default_get", self._meta_get),
+			("huf.ai.gateway_adapters.whatsapp_bridge._default_post", self._meta_post),
 			("huf.ai.gateway_webhook._ingest_rate_gate", lambda: None),
 		):
 			patcher = patch(target, new)
@@ -204,6 +205,10 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 		self.meta.calls.append({"method": "GET", "url": url, "body": None, "headers": kwargs.get("headers", {})})
 		return _Resp(self.meta.template_list)
 
+	def _meta_post(self, url, **kwargs):
+		"""Huf pushes templates / edits straight to Graph with requests; route that into the fake Meta."""
+		return self.meta.request("POST", url, json=kwargs.get("json"), data=kwargs.get("data"), headers=kwargs.get("headers"))
+
 	# ----------------------------------------------------------------- helpers
 	def _post_webhook(self, payload):
 		request = _signed_request(payload)
@@ -230,7 +235,7 @@ class TestWhatsAppFullStack(IntegrationTestCase):
 			"category": "UTILITY",
 			"language": "en",
 			"language_code": "en_US",
-			"body": "Hello {{1}}",
+			"body": "Hello {{1}}, welcome",
 			"sample_values": "Ann",
 		}
 		values.update(extra)
@@ -461,6 +466,7 @@ class TestWhatsAppMultiGateway(IntegrationTestCase):
 			("frappe.utils.get_url", lambda *a, **k: "http://gw-wa-full.localhost"),
 			("frappe.integrations.utils.get_request_session", lambda: self.meta),
 			("huf.ai.gateway_adapters.whatsapp_bridge._default_get", self._meta_get),
+			("huf.ai.gateway_adapters.whatsapp_bridge._default_post", self._meta_post),
 			("huf.ai.gateway_webhook._ingest_rate_gate", lambda: None),
 			("huf.ai.gateway_service._throttle_outbound_send", lambda *a, **k: None),
 			("huf.ai.agent_integration.run_agent_sync", fake_run),
@@ -489,6 +495,10 @@ class TestWhatsAppMultiGateway(IntegrationTestCase):
 	def _meta_get(self, url, **kwargs):
 		self.meta.calls.append({"method": "GET", "url": url, "body": None, "headers": kwargs.get("headers", {})})
 		return _Resp(self.meta.template_list)
+
+	def _meta_post(self, url, **kwargs):
+		"""Huf pushes templates / edits straight to Graph with requests; route that into the fake Meta."""
+		return self.meta.request("POST", url, json=kwargs.get("json"), data=kwargs.get("data"), headers=kwargs.get("headers"))
 
 	def _make_pair(self, label, phone, secret, waba, default=0):
 		account = frappe.get_doc(
@@ -701,7 +711,7 @@ class TestWhatsAppMultiGateway(IntegrationTestCase):
 		self.assertEqual(frappe.db.get_value("WhatsApp Templates", doc_a, "status"), "PENDING")
 
 	def test_template_docname_owned_by_another_account_is_never_overwritten(self):
-		payload = {"template_name": "shared_name", "category": "UTILITY", "language": "en", "language_code": "en_US", "body": "Hello {{1}}", "sample_values": "Ann"}
+		payload = {"template_name": "shared_name", "category": "UTILITY", "language": "en", "language_code": "en_US", "body": "Hello {{1}}, welcome", "sample_values": "Ann"}
 		first = mgmt.create_template(account=self.account_a.name, payload=payload)
 		self.assertTrue(first["success"], first)
 		before = len(self.meta.posts("/message_templates"))
@@ -747,7 +757,7 @@ class TestWhatsAppMultiGateway(IntegrationTestCase):
 			self.assertEqual((result["success"], result["error"]), (False, "gateway_required"))
 
 	def test_drafts_and_states_are_per_account(self):
-		payload = json.dumps({"template_name": "dr_promo", "category": "UTILITY", "language_code": "en_US", "body": "Hi {{1}}", "sample_values": "Ann"})
+		payload = json.dumps({"template_name": "dr_promo", "category": "UTILITY", "language_code": "en_US", "body": "Hi {{1}}, welcome", "sample_values": "Ann"})
 		draft_a = mgmt.create_template_draft(gateway_name=self.gateway_a.name, payload=payload)
 		self.assertTrue(draft_a["success"], draft_a)
 		self.assertEqual(frappe.db.get_value("WhatsApp Template Draft", draft_a["name"], "whatsapp_account"), self.account_a.name)

@@ -353,7 +353,7 @@ class TestSyncState(LifecycleCase):
 		tpl = self.server.templates[("lc_comp", "en_US")]
 		tpl["components"] = [
 			{"type": "HEADER", "format": "TEXT", "text": "New header"},
-			{"type": "BODY", "text": "New body {{1}}", "example": {"body_text": [["Ann"]]}},
+			{"type": "BODY", "text": "New body {{1}} ok", "example": {"body_text": [["Ann"]]}},
 			{"type": "FOOTER", "text": "Bye"},
 			{"type": "BUTTONS", "buttons": [
 				{"type": "URL", "text": "Open", "url": "https://shop.example.com/x"},
@@ -363,9 +363,9 @@ class TestSyncState(LifecycleCase):
 		changed = mgmt.sync_templates(account=self.account.name)
 		self.assertEqual((changed["updated"], changed["unchanged"]), (1, 0))
 		row = frappe.get_doc("WhatsApp Templates", "lc_comp-en_US")
-		self.assertEqual((row.header_type, row.header, row.template, row.footer, row.sample_values), ("TEXT", "New header", "New body {{1}}", "Bye", "Ann"))
+		self.assertEqual((row.header_type, row.header, row.template, row.footer, row.sample_values), ("TEXT", "New header", "New body {{1}} ok", "Bye", "Ann"))
 		self.assertEqual([(b.button_type, b.button_label) for b in row.buttons], [("Visit Website", "Open"), ("Call Phone", "Call")])
-		self.assertEqual(json.loads(self._state("lc_comp-en_US").components)[1]["text"], "New body {{1}}")
+		self.assertEqual(json.loads(self._state("lc_comp-en_US").components)[1]["text"], "New body {{1}} ok")
 		self.assertEqual(self.server.requests_to("POST", "/message_templates"), [])  # never pushed back to Meta
 		again = mgmt.sync_templates(account=self.account.name)
 		self.assertEqual((again["updated"], again["unchanged"]), (0, 1))
@@ -420,22 +420,27 @@ class TestEditTemplate(LifecycleCase):
 		docname = self._created("lc_cat")
 		self.assertEqual(mgmt.edit_template(name=docname, payload=json.dumps({"category": "AUTHENTICATION"}))["error"], "invalid_category")
 		self.assertEqual(self._edit_posts(), [])
-		out = mgmt.edit_template(name=docname, payload=json.dumps({"category": "MARKETING", "message_send_ttl_seconds": 3600}))
+		# a TTL only exists on UTILITY templates: a MARKETING edit carrying one is refused before Meta is called
+		refused = mgmt.edit_template(name=docname, payload=json.dumps({"category": "MARKETING", "message_send_ttl_seconds": 3600}))
+		self.assertIn("ttl_not_allowed", [e["code"] for e in refused["errors"]])
+		self.assertEqual(self._edit_posts(), [])
+		out = mgmt.edit_template(name=docname, payload=json.dumps({"category": "MARKETING"}))
 		self.assertTrue(out["success"], out)
 		sent = json.loads(self._edit_posts()[0]["raw"])
-		self.assertEqual((sent["category"], sent["message_send_ttl_seconds"]), ("MARKETING", 3600))
+		self.assertEqual(sent["category"], "MARKETING")
+		self.assertNotIn("message_send_ttl_seconds", sent)
 		self.assertEqual(frappe.db.get_value("WhatsApp Templates", docname, "category"), "MARKETING")
 
 	def test_24h_and_30d_quota(self):
 		docname = self._created("lc_quota")
-		self.assertTrue(mgmt.edit_template(name=docname, payload={"body": "One {{1}}"})["success"])
+		self.assertTrue(mgmt.edit_template(name=docname, payload={"body": "One {{1}} ok"})["success"])
 		# PENDING again: not editable until review finishes
-		blocked = mgmt.edit_template(name=docname, payload={"body": "Two {{1}}"})
+		blocked = mgmt.edit_template(name=docname, payload={"body": "Two {{1}} ok"})
 		self.assertEqual(blocked["error"], "status_not_editable")
 		# review done (approved) but the 24h window is still closed
 		self.server.approve("lc_quota")
 		mgmt.sync_templates(account=self.account.name)
-		blocked = mgmt.edit_template(name=docname, payload={"body": "Two {{1}}"})
+		blocked = mgmt.edit_template(name=docname, payload={"body": "Two {{1}} ok"})
 		self.assertEqual(blocked["error"], "edit_limit_24h")
 		self.assertTrue(blocked["next_edit_at"])
 		self.assertEqual(len(self._edit_posts()), 1)  # refused locally, Meta never asked
@@ -444,13 +449,13 @@ class TestEditTemplate(LifecycleCase):
 		self._set_log(docname, [self._ago(hours=25)])
 		self.server.template_by_id(frappe.db.get_value("WhatsApp Templates", docname, "id"))["edit_times"].clear()
 		self.assertEqual(mgmt.get_template(name=docname)["edits_left"], 9)
-		self.assertTrue(mgmt.edit_template(name=docname, payload={"body": "Two {{1}}"})["success"])
+		self.assertTrue(mgmt.edit_template(name=docname, payload={"body": "Two {{1}} ok"})["success"])
 		self.assertEqual(len(json.loads(self._state(docname).edit_log)), 2)
 		# ten edits within 30 days exhaust the allowance
 		self.server.approve("lc_quota")
 		mgmt.sync_templates(account=self.account.name)
 		self._set_log(docname, [self._ago(days=2 + 2 * i) for i in range(10)])
-		out = mgmt.edit_template(name=docname, payload={"body": "Three {{1}}"})
+		out = mgmt.edit_template(name=docname, payload={"body": "Three {{1}} ok"})
 		self.assertEqual((out["error"], out["edits_left"]), ("edit_limit_30d", 0))
 		self.assertEqual(len(self._edit_posts()), 2)
 
@@ -461,7 +466,7 @@ class TestEditTemplate(LifecycleCase):
 			mgmt.sync_templates(account=self.account.name)
 			detail = mgmt.get_template(name=docname)
 			self.assertEqual((detail["status"], detail["editable"], detail["edits_left"]), (status, True, None))
-			out = mgmt.edit_template(name=docname, payload={"body": f"Try {i} {{{{1}}}}"})
+			out = mgmt.edit_template(name=docname, payload={"body": f"Try {i} {{{{1}}}} ok"})
 			self.assertTrue(out["success"], out)
 			self.assertEqual(out["status"], "PENDING")
 		self.assertEqual(len(self._edit_posts()), 3)
@@ -472,7 +477,7 @@ class TestEditTemplate(LifecycleCase):
 		for status in ("PENDING", "DISABLED", "IN_APPEAL", "LIMIT_EXCEEDED", "PENDING_DELETION", "DELETED"):
 			self.server.set_template_status("lc_status", status)
 			mgmt.sync_templates(account=self.account.name)
-			out = mgmt.edit_template(name=docname, payload={"body": "x {{1}}"})
+			out = mgmt.edit_template(name=docname, payload={"body": "x {{1}} ok"})
 			self.assertEqual(out["error"], "status_not_editable", status)
 			self.assertFalse(mgmt.get_template(name=docname)["editable"])
 		self.assertEqual(self._edit_posts(), [])
@@ -480,7 +485,7 @@ class TestEditTemplate(LifecycleCase):
 	def test_name_and_language_are_immutable_and_no_op_is_refused(self):
 		docname = self._created("lc_imm")
 		for key, value in (("template_name", "lc_renamed"), ("name", "lc_renamed"), ("language_code", "fr")):
-			out = mgmt.edit_template(name=docname, payload={key: value, "body": "x {{1}}"})
+			out = mgmt.edit_template(name=docname, payload={key: value, "body": "x {{1}} ok"})
 			self.assertEqual((out["error"], out["field"]), ("immutable_field", key))
 		same = mgmt.edit_template(name=docname, payload={"template_name": "lc_imm", "language_code": "en_US", "body": "Hi {{1}}, order shipped"})
 		self.assertEqual(same["error"], "no_changes")
@@ -495,7 +500,7 @@ class TestEditTemplate(LifecycleCase):
 		docname = self._created("lc_meta_no")
 		tid = frappe.db.get_value("WhatsApp Templates", docname, "id")
 		self.server.template_by_id(tid)["edit_times"].append(__import__("time").time() - 60)  # Meta saw an edit we did not
-		out = mgmt.edit_template(name=docname, payload={"body": "Changed {{1}}"})
+		out = mgmt.edit_template(name=docname, payload={"body": "Changed {{1}} ok"})
 		self.assertEqual(out["error"], "edit_failed")
 		self.assertIn("once in 24 hours", out["message"])
 		self.server.violations.clear()  # expected refusal
@@ -507,7 +512,7 @@ class TestEditTemplate(LifecycleCase):
 		frappe.set_user(fgc.EXEC_USER)
 		try:
 			with self.assertRaises(frappe.PermissionError):
-				mgmt.edit_template(name=docname, payload={"body": "x {{1}}"})
+				mgmt.edit_template(name=docname, payload={"body": "x {{1}} ok"})
 		finally:
 			frappe.set_user("Administrator")
 		self.assertEqual(self._edit_posts(), [])

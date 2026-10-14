@@ -46,6 +46,8 @@ _TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9_]{1,512}$")
 _LANG_RE = re.compile(r"^[a-z]{2,3}(_[A-Z]{2})?$")
 _PHONE_RE = re.compile(r"^\+?[0-9]{7,15}$")
 _VAR_RE = re.compile(r"\{\{(\d+)\}\}")
+_NAMED_RE = re.compile(r"\{\{([a-z][a-z0-9_]*)\}\}")
+_PARAMETER_FORMATS = ("POSITIONAL", "NAMED")
 _BAD_PARAM_RE = re.compile(r"[\n\t]| {4,}")
 _MESSAGE_TYPES = {
 	"text", "template", "image", "document", "audio", "video", "sticker",
@@ -71,6 +73,14 @@ def _variables(text: str) -> list[int]:
 		n = int(m.group(1))
 		if n not in seen:
 			seen.append(n)
+	return seen
+
+
+def _named_variables(text: str) -> list[str]:
+	seen: list[str] = []
+	for m in _NAMED_RE.finditer(text):
+		if m.group(1) not in seen:
+			seen.append(m.group(1))
 	return seen
 
 
@@ -211,10 +221,12 @@ class FakeGraphServer:
 			{"type": "FOOTER", "text": "WhatsApp Business Platform sample message"},
 		]
 		spec = {str(c["type"]).upper(): c for c in comps}
+		named = any(_named_variables(str(c.get("text") or "")) for c in comps)
 		with self.lock:
 			tid = str(900000000000000 + self._next())
 			self.templates[(name, language)] = {"id": tid, "name": name, "language": language, "category": category,
-				"status": status, "spec": spec, "components": comps, "edit_times": [], **extra}
+				"status": status, "spec": spec, "components": comps, "edit_times": [],
+				"parameter_format": "NAMED" if named else "POSITIONAL", **extra}
 		return self.templates[(name, language)]
 
 	def template_by_id(self, template_id: str) -> dict:
@@ -486,10 +498,18 @@ class FakeGraphServer:
 			code=132001, title="Template name does not exist in the translation")
 		_need(tpl["status"] == "APPROVED", f"Template {name} is {tpl['status']}, only APPROVED templates can be sent", code=132015)
 		spec = tpl["spec"]
+		named = tpl.get("parameter_format") == "NAMED"
 		# body parameter count
-		body_vars = len(_variables(spec["BODY"]["text"]))
+		body_names = _named_variables(spec["BODY"]["text"]) if named else []
+		body_vars = len(body_names) if named else len(_variables(spec["BODY"]["text"]))
 		given = sum(len(c["parameters"]) for c in by_type["body"])
 		_need(given == body_vars, f"Number of parameters does not match the expected number of params: body expects {body_vars}, got {given}", code=132000)
+		for c in by_type["body"]:
+			sent = [p.get("parameter_name") for p in c["parameters"]]
+			if named:
+				_need(sorted(map(str, sent)) == sorted(body_names), f"Named parameters {sent} do not match the template variables {body_names}", code=132000)
+			else:
+				_need(not any(sent), "parameter_name is only valid for NAMED templates", code=132000)
 		# header
 		header = spec.get("HEADER")
 		hc = by_type["header"]
@@ -498,9 +518,13 @@ class FakeGraphServer:
 		else:
 			fmt = header["format"]
 			if fmt == "TEXT":
-				if _variables(header.get("text", "")):
+				hvars = _named_variables(header.get("text", "")) if named else _variables(header.get("text", ""))
+				if hvars:
 					_need(len(hc) == 1 and len(hc[0]["parameters"]) == 1 and hc[0]["parameters"][0]["type"] == "text",
 						"Header expects one text parameter", code=132000)
+					if named:
+						_need(hc[0]["parameters"][0].get("parameter_name") == hvars[0],
+							f"Header parameter_name must be {hvars[0]}", code=132000)
 				else:
 					_need(not hc, "Template header takes no parameters", code=132000)
 			else:
@@ -516,6 +540,9 @@ class FakeGraphServer:
 			want = btn["type"].lower()
 			_need(c["sub_type"] == want, f"Button {idx} is {btn['type']}, got sub_type {c['sub_type']}", code=132012)
 		for idx, btn in enumerate(buttons):
+			if btn["type"] == "COPY_CODE":
+				_need(any(int(c["index"]) == idx and c["sub_type"] == "copy_code" for c in by_type["button"]),
+					f"Copy-code button {idx} requires a coupon_code parameter", code=132000)
 			if btn["type"] == "URL" and _variables(btn["url"]):
 				_need(any(int(c["index"]) == idx and c["sub_type"] == "url" for c in by_type["button"]),
 					f"Dynamic URL button {idx} requires a url parameter", code=132000)
@@ -524,6 +551,17 @@ class FakeGraphServer:
 	def _check_template_param(field: str, ctype: str, comp: dict, p: dict) -> None:
 		_need(isinstance(p, dict), f"{field} must be an object")
 		ptype = p.get("type")
+		if ptype == "coupon_code":
+			_need(ctype == "button" and comp.get("sub_type") == "copy_code", f"{field}: coupon_code is only valid for copy_code buttons")
+			_need(_is_str(p.get("coupon_code"), max_len=15) and set(p) <= {"type", "coupon_code"}, f"{field}.coupon_code must be a string of at most 15 characters")
+			return
+		if ptype == "location":
+			_need(ctype == "header", f"{field}: location parameters are only valid in the header")
+			loc = p.get("location")
+			_need(isinstance(loc, dict) and isinstance(loc.get("latitude"), (int, float)) and isinstance(loc.get("longitude"), (int, float)),
+				f"{field}.location needs numeric latitude and longitude")
+			_need(set(loc) <= {"latitude", "longitude", "name", "address"} and set(p) <= {"type", "location"}, f"Unexpected field in {field}.location")
+			return
 		if ctype == "button" and comp.get("sub_type") == "quick_reply":
 			_need(ptype == "payload" and _is_str(p.get("payload"), max_len=256), f"{field} must be a payload parameter")
 			return
@@ -531,7 +569,9 @@ class FakeGraphServer:
 			_need(_is_str(p.get("text"), max_len=1024), f"{field}.text must be a non-empty string up to 1024 characters")
 			_need(not _BAD_PARAM_RE.search(p["text"]),
 				f"{field}.text cannot contain new-line, tab characters or more than 4 consecutive spaces", code=132018)
-			_need(set(p) <= {"type", "text"}, f"Unexpected field in {field}")
+			_need(set(p) <= {"type", "text", "parameter_name"}, f"Unexpected field in {field}")
+			_need("parameter_name" not in p or (isinstance(p["parameter_name"], str) and _NAMED_RE.fullmatch("{{" + p["parameter_name"] + "}}")),
+				f"{field}.parameter_name is invalid")
 		elif ptype in ("image", "video", "document"):
 			_need(ctype == "header", f"{ptype} parameters are only valid in the header")
 			obj = p.get(ptype)
@@ -554,8 +594,12 @@ class FakeGraphServer:
 		_need(cat in ("AUTHENTICATION", "MARKETING", "UTILITY"), "category must be AUTHENTICATION, MARKETING or UTILITY")
 		comps = body.get("components")
 		_need(isinstance(comps, list) and comps, "components must be a non-empty list")
-		_need(set(body) <= {"name", "language", "category", "components", "allow_category_change", "parameter_format"},
-			"Unexpected top-level field in template")
+		_need(set(body) <= {"name", "language", "category", "components", "allow_category_change", "parameter_format",
+			"message_send_ttl_seconds"}, "Unexpected top-level field in template")
+		pfmt = body.get("parameter_format")
+		_need(pfmt is None or pfmt in _PARAMETER_FORMATS, "parameter_format must be POSITIONAL or NAMED")
+		pfmt = pfmt or "POSITIONAL"
+		self._check_ttl(body.get("message_send_ttl_seconds"), cat)
 		spec: dict[str, dict] = {}
 		for i, c in enumerate(comps):
 			_need(isinstance(c, dict), f"components[{i}] must be an object")
@@ -563,20 +607,53 @@ class FakeGraphServer:
 			_need(ctype in ("HEADER", "BODY", "FOOTER", "BUTTONS"), f"components[{i}].type must be HEADER, BODY, FOOTER or BUTTONS")
 			_need(ctype not in spec, f"Duplicate {ctype} component")
 			spec[ctype] = c
-			getattr(self, f"_tpl_{ctype.lower()}")(f"components[{i}]", c)
+			self._tpl_component(ctype, f"components[{i}]", c, pfmt)
 		_need("BODY" in spec, "A BODY component is required")
 		key = (name, lang)
 		with self.lock:
 			_need(key not in self.templates, "Content in this language already exists", code=100, subcode=2388024,
 				title="Message template already exists")
 			tid = str(900000000000000 + self._next())
-			self.templates[key] = {"id": tid, "name": name, "language": lang, "category": cat, "status": "PENDING", "spec": spec, "components": comps, "edit_times": []}
+			self.templates[key] = {"id": tid, "name": name, "language": lang, "category": cat, "status": "PENDING", "spec": spec, "components": comps, "edit_times": [],
+				"parameter_format": pfmt}
+			if body.get("message_send_ttl_seconds") is not None:
+				self.templates[key]["message_send_ttl_seconds"] = body["message_send_ttl_seconds"]
 		return 200, {"id": tid, "status": "PENDING", "category": cat}, "application/json"
 
 	@staticmethod
-	def _tpl_body(f: str, c: dict) -> None:
+	def _check_ttl(ttl, category) -> None:
+		if ttl is None:
+			return
+		_need(category == "UTILITY", "message_send_ttl_seconds is only allowed for UTILITY templates")
+		_need(isinstance(ttl, int) and not isinstance(ttl, bool) and (ttl == -1 or 30 <= ttl <= 43200),
+			"message_send_ttl_seconds must be -1 or between 30 and 43200")
+
+	def _tpl_component(self, ctype: str, f: str, c: dict, pfmt: str) -> None:
+		fn = getattr(self, f"_tpl_{ctype.lower()}")
+		if ctype in ("BODY", "HEADER"):
+			fn(f, c, pfmt)
+		else:
+			fn(f, c)
+
+	@staticmethod
+	def _tpl_body(f: str, c: dict, pfmt: str = "POSITIONAL") -> None:
 		text = c.get("text")
 		_need(_is_str(text, max_len=1024), f"{f}.text is required (max 1024 characters)")
+		if pfmt == "NAMED":
+			names = _named_variables(text)
+			_need(not _VAR_RE.search(text) and "{{" not in _NAMED_RE.sub("", text), f"{f}.text has a malformed or positional placeholder in a NAMED template")
+			ex = c.get("example")
+			if names:
+				rows = (ex or {}).get("body_text_named_params") if isinstance(ex, dict) else None
+				_need(isinstance(rows, list) and all(isinstance(x, dict) and set(x) == {"param_name", "example"} for x in rows),
+					f"{f}.example.body_text_named_params must be a list of {{param_name, example}}")
+				_need(sorted(x["param_name"] for x in rows) == sorted(names) and all(_is_str(x["example"]) for x in rows),
+					f"{f}.example.body_text_named_params must cover exactly the variables {names}")
+				_need("body_text" not in ex, f"{f}.example.body_text is not valid for a NAMED template")
+			else:
+				_need(not ex, f"{f}.example is not allowed without variables")
+			_need(set(c) <= {"type", "text", "example"}, f"Unexpected field in {f}")
+			return
 		holes = _variables(text)
 		_need(holes == list(range(1, len(holes) + 1)), f"{f}.text placeholders must be sequential {{{{1}}}}.. without gaps")
 		stripped = _VAR_RE.sub("", text)
@@ -592,12 +669,25 @@ class FakeGraphServer:
 			_need(not ex, f"{f}.example is not allowed without variables")
 		_need(set(c) <= {"type", "text", "example"}, f"Unexpected field in {f}")
 
-	def _tpl_header(self, f: str, c: dict) -> None:
+	def _tpl_header(self, f: str, c: dict, pfmt: str = "POSITIONAL") -> None:
 		fmt = str(c.get("format", "")).upper()
 		_need(fmt in ("TEXT", "IMAGE", "VIDEO", "DOCUMENT", "LOCATION"), f"{f}.format is invalid")
 		c["format"] = fmt
 		ex = c.get("example")
-		if fmt == "TEXT":
+		if fmt == "LOCATION":
+			_need("text" not in c and not ex, f"{f}: a LOCATION header takes no text or example")
+		elif fmt == "TEXT" and pfmt == "NAMED":
+			text = c.get("text")
+			_need(_is_str(text, max_len=60), f"{f}.text is required (max 60 characters)")
+			names = _named_variables(text)
+			_need(len(names) <= 1 and not _VAR_RE.search(text), f"{f}.text allows at most one named variable")
+			if names:
+				rows = (ex or {}).get("header_text_named_params") if isinstance(ex, dict) else None
+				_need(isinstance(rows, list) and len(rows) == 1 and rows[0].get("param_name") == names[0] and _is_str(rows[0].get("example")),
+					f"{f}.example.header_text_named_params must hold exactly one {{param_name, example}}")
+			else:
+				_need(not ex, f"{f}.example is not allowed without a variable")
+		elif fmt == "TEXT":
 			text = c.get("text")
 			_need(_is_str(text, max_len=60), f"{f}.text is required (max 60 characters)")
 			holes = _variables(text)
@@ -627,15 +717,19 @@ class FakeGraphServer:
 	def _tpl_buttons(f: str, c: dict) -> None:
 		buttons = c.get("buttons")
 		_need(isinstance(buttons, list) and 1 <= len(buttons) <= 10, f"{f}.buttons must hold 1-10 buttons")
-		counts = {"URL": 0, "PHONE_NUMBER": 0, "QUICK_REPLY": 0}
+		counts = {"URL": 0, "PHONE_NUMBER": 0, "QUICK_REPLY": 0, "COPY_CODE": 0}
 		kinds: list[str] = []
 		for i, b in enumerate(buttons):
 			bf = f"{f}.buttons[{i}]"
 			_need(isinstance(b, dict), f"{bf} must be an object")
 			btype = b.get("type")
-			_need(btype in counts, f"{bf}.type must be QUICK_REPLY, URL or PHONE_NUMBER")
+			_need(btype in counts, f"{bf}.type must be QUICK_REPLY, URL, PHONE_NUMBER or COPY_CODE")
 			counts[btype] += 1
 			kinds.append(btype)
+			if btype == "COPY_CODE":
+				_need(_is_str(b.get("example"), max_len=20) and set(b) <= {"type", "example"},
+					f"{bf} needs an example code (max 20 characters) and no text")
+				continue
 			_need(_is_str(b.get("text"), max_len=25), f"{bf}.text is required (max 25 characters)")
 			if btype == "URL":
 				url = b.get("url")
@@ -656,6 +750,7 @@ class FakeGraphServer:
 				_need(set(b) <= {"type", "text"}, f"Unexpected field in {bf}")
 		_need(counts["URL"] <= 2, "At most 2 URL buttons are allowed")
 		_need(counts["PHONE_NUMBER"] <= 1, "At most 1 phone-number button is allowed")
+		_need(counts["COPY_CODE"] <= 1, "At most 1 copy-code button is allowed")
 		switches = sum(1 for a, b in zip(kinds, kinds[1:]) if (a == "QUICK_REPLY") != (b == "QUICK_REPLY"))
 		_need(switches <= 1, "Quick-reply and call-to-action buttons must each be grouped together")
 
@@ -665,7 +760,11 @@ class FakeGraphServer:
 		"""POST /{template-id}: Meta's documented edit rules (status, 1/24h and 10/30d quota for APPROVED)."""
 		body = self._json(rec)
 		_need(set(body) <= {"category", "components", "message_send_ttl_seconds"}, "Unexpected top-level field in template edit "
-			"(name and language cannot be edited)")
+			"(name, language and parameter_format cannot be edited)")
+		with self.lock:
+			current = self.template_by_id(template_id)
+		pfmt = current.get("parameter_format") or "POSITIONAL"
+		self._check_ttl(body.get("message_send_ttl_seconds"), body.get("category") or current["category"])
 		comps = body.get("components")
 		_need(comps is None or (isinstance(comps, list) and comps), "components must be a non-empty list")
 		if body.get("category") is not None:
@@ -678,7 +777,7 @@ class FakeGraphServer:
 			_need(ctype in ("HEADER", "BODY", "FOOTER", "BUTTONS"), f"components[{i}].type must be HEADER, BODY, FOOTER or BUTTONS")
 			_need(ctype not in spec, f"Duplicate {ctype} component")
 			spec[ctype] = c
-			getattr(self, f"_tpl_{ctype.lower()}")(f"components[{i}]", c)
+			self._tpl_component(ctype, f"components[{i}]", c, pfmt)
 		_need(comps is None or "BODY" in spec, "A BODY component is required")
 		with self.lock:
 			t = self.template_by_id(template_id)
@@ -717,7 +816,7 @@ class FakeGraphServer:
 					"id": t["id"], "name": name, "language": lang, "status": t["status"],
 					"category": t["category"], "components": json.loads(json.dumps(t["components"])),
 				}
-				for opt in ("rejected_reason", "quality_score", "previous_category", "correct_category", "message_send_ttl_seconds"):
+				for opt in ("rejected_reason", "quality_score", "previous_category", "correct_category", "message_send_ttl_seconds", "parameter_format"):
 					if t.get(opt) is not None:
 						row[opt] = t[opt]
 				data.append(row)

@@ -18,6 +18,7 @@ from typing import Any
 import frappe
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 from huf.ai.gateway_adapters import whatsapp_templates as wt
+from huf.ai.gateway_adapters.whatsapp_bridge import direct_send_components, send_error
 from huf.ai.gateway_adapters.adapter import GatewayAdapter
 from huf.ai.gateway_adapters.types import (
 	GatewayAttachment,
@@ -417,34 +418,33 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		to: str,
 		template_name: str,
 		language_code: str = DEFAULT_TEMPLATE_LANGUAGE,
-		body_params: list | tuple | None = None,
+		body_params: list | tuple | dict | None = None,
 		trusted: bool = False,
-		header_params: list | tuple | None = None,
+		header_params: list | tuple | dict | None = None,
 		button_params: list | tuple | None = None,
 	) -> OutboundDelivery:
 		"""Send an approved template (always allowed, window-independent).
 
-		``header_params``: a text variable string or a ``{"type", "link"}`` media dict.
-		``button_params``: ``[{"index": 0, "sub_type": "url", "text": "<suffix>"}]``.
+		``body_params``: an ordered list, or (NAMED templates) ``{name: value}`` / ``[{name, value}]``; named
+		values are sent with ``parameter_name``. ``header_params``: a text variable string, a ``{"type", "link"}``
+		media dict or a ``{"type": "location", "latitude", "longitude"}`` dict. ``button_params``:
+		``[{"index": 0, "sub_type": "url", "text": "<suffix>"}]`` or ``{"index": n, "sub_type": "copy_code", "code": ...}``.
 		"""
-		params = [str(p) for p in (body_params or [])]
+		if isinstance(body_params, dict):
+			params: Any = {str(k): str(v) for k, v in body_params.items()}
+		else:
+			params = [p if isinstance(p, dict) else str(p) for p in (body_params or [])]
+		header_arg: Any = header_params if isinstance(header_params, dict) else list(header_params or [])
 		if self._bridge_mode():
 			result = bridge.send_template(
-				self._account, to, template_name, params, header_params=list(header_params or []),
+				self._account, to, template_name, params, header_params=header_arg,
 				trusted=trusted, language_code=language_code, button_params=list(button_params or []),
 			)
 			return _delivery_from_bridge(result)
-		errors: list[dict[str, str]] = []
-		params = [wt.validate_param_text(f"body_params[{i}]", p, errors) for i, p in enumerate(params)]
-		headers_n, herr = wt.normalize_header_params(list(header_params or []))
-		buttons_n, berr = wt.normalize_button_params(list(button_params or []))
-		errors += herr + berr
-		if any(isinstance(h, dict) and not h.get("type") for h in headers_n):
-			errors.append(wt._e("header_params", "invalid_type", "Media header needs a type (image, document or video)."))
+		components, errors = direct_send_components(params, header_arg, list(button_params or []))
 		if errors:
-			raise bridge.BridgeError(wt.validation_error(errors))
+			raise bridge.BridgeError(send_error(errors))
 		template: dict[str, Any] = {"name": template_name, "language": {"code": language_code or DEFAULT_TEMPLATE_LANGUAGE}}
-		components = wt.build_template_components(params, headers_n, buttons_n)
 		if components:
 			template["components"] = components
 		return self._graph_send(

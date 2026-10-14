@@ -350,7 +350,7 @@ class TestBridge(unittest.TestCase):
 			self.assertEqual(gl.call_args.kwargs["filters"], {"whatsapp_account": "ACC", "status": "APPROVED"})
 
 	def test_create_template(self):
-		good = {"template_name": "promo_1", "category": "marketing", "language_code": "en_US", "template": "Hi {{1}}", "sample_values": "Ann"}
+		good = {"template_name": "promo_1", "category": "marketing", "language_code": "en_US", "template": "Hi {{1}}, welcome", "sample_values": "Ann"}
 		with avail(False):
 			self.assertEqual(wb.create_template("ACC", good)["error"], "bridge_unavailable")
 		with avail(), patch.object(frappe, "has_permission", return_value=False):
@@ -364,14 +364,47 @@ class TestBridge(unittest.TestCase):
 			too_long = wb.create_template("ACC", {**good, "template_name": "a" * 513})
 			self.assertEqual(too_long["error"], "validation_failed")
 			self.assertEqual(too_long["errors"][0]["code"], "too_long")
-			with patch.object(frappe, "get_doc", return_value=FakeDoc(status="PENDING", id="1")):
-				self.assertTrue(wb.create_template("ACC", {**good, "template_name": "a" * 512})["success"])
 			self.assertEqual(wb.create_template("ACC", {**good, "language_code": ""})["error"], "invalid_language")
-			doc = FakeDoc(status="PENDING", id="1")
-			with patch.object(frappe, "get_doc", return_value=doc) as gd, patch.object(wb, "record_template_state"):
-				res = wb.create_template("ACC", good)
-			self.assertTrue(res["success"])
-			self.assertEqual(gd.call_args.args[0]["category"], "MARKETING")
+		calls = []
+
+		def post(url, **kw):
+			calls.append((url, kw))
+			return SimpleNamespace(status_code=200, json=lambda: {"id": "900", "status": "PENDING", "category": "MARKETING"})
+
+		with self._direct_create() as m:
+			for tname in ("a" * 128, "promo_1"):
+				res = wb.create_template("ACC", {**good, "template_name": tname}, http_post=post)
+				self.assertTrue(res["success"], res)
+				self.assertEqual(res["id"], "900")
+			url, kw = calls[-1]
+			self.assertEqual(url, "https://graph.facebook.com/v25.0/BIZ/message_templates")
+			self.assertEqual(kw["json"]["category"], "MARKETING")
+			self.assertEqual(kw["json"]["parameter_format"], "POSITIONAL")
+			self.assertEqual(kw["json"]["components"][0], {"type": "BODY", "text": "Hi {{1}}, welcome", "example": {"body_text": [["Ann"]]}})
+			self.assertEqual(m["insert"].call_count, 2)
+
+	def _direct_create(self):
+		import contextlib
+
+		@contextlib.contextmanager
+		def ctx():
+			def new_doc(dt):
+				doc = FakeDoc(flags=SimpleNamespace(), buttons=[])
+				doc.update = lambda d: doc.__dict__.update(d)
+				doc.set = lambda k, v: setattr(doc, k, v)
+				doc.append = lambda k, v: doc.buttons.append(v)
+				return doc
+
+			with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
+				wb, "_docname_taken_by_other_account", return_value=None
+			), patch.object(frappe.db, "exists", side_effect=lambda dt, *a, **k: dt == "Language"), patch.object(
+				wb, "resolve_account", return_value=ACCT
+			), patch.object(frappe, "new_doc", side_effect=new_doc), patch.object(
+				wb, "_insert_mirror_row"
+			) as insert, patch.object(wb, "_guard"), patch.object(wb, "record_template_state"):
+				yield {"insert": insert}
+
+		return ctx()
 
 	def test_create_template_refuses_a_docname_owned_by_another_account(self):
 		"""frappe_whatsapp names templates <name>-<language> site-wide: never overwrite another account's."""
@@ -383,22 +416,65 @@ class TestBridge(unittest.TestCase):
 		self.assertEqual(res["error"], "template_name_taken_by_other_account")
 		gd.assert_not_called()
 
-	def test_create_template_meta_rejection_drops_local_orphan(self):
+	def test_create_template_meta_rejection_writes_no_local_row(self):
 		good = {"template_name": "promo_2", "category": "utility", "language_code": "en_US", "template": "Hi {{1}} there", "sample_values": "Ann"}
 
-		class Rejecting(FakeDoc):
-			def insert(self, *a, **k):
-				raise Exception("Variables can't be at the start or end of the template.")
+		def post(url, **kw):
+			return SimpleNamespace(
+				status_code=400, text="",
+				json=lambda: {"error": {"code": 100, "message": "Invalid parameter access_token=SECRET123", "error_data": {"details": "bad body"}}},
+			)
 
-		doc = Rejecting(name="promo_2-en_US")
-		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
-			frappe, "get_doc", return_value=doc
-		), patch.object(frappe.db, "exists", return_value=True), patch.object(frappe.db, "delete") as dele, patch.object(
-			wb, "_docname_taken_by_other_account", return_value=None
-		):
-			res = wb.create_template("ACC", good)
+		with self._direct_create() as m, patch.object(frappe.db, "delete") as dele:
+			res = wb.create_template("ACC", good, http_post=post)
 		self.assertEqual(res["error"], "create_failed")
-		dele.assert_called_once_with("WhatsApp Templates", {"name": "promo_2-en_US"})
+		self.assertIn("bad body", res["message"])
+		self.assertNotIn("SECRET123", res["message"])
+		m["insert"].assert_not_called()
+		dele.assert_not_called()
+
+	def test_direct_send_components_named_location_and_copy_code(self):
+		comps, errors = wb.direct_send_components(
+			{"first_name": "Ann", "order_id": "A1"},
+			{"type": "location", "latitude": 1.5, "longitude": 2.5},
+			[{"index": 1, "sub_type": "copy_code", "code": "SAVE"}, {"index": 0, "sub_type": "url", "text": "x"}],
+		)
+		self.assertEqual(errors, [])
+		self.assertEqual(comps[0], {"type": "header", "parameters": [{"type": "location", "location": {"latitude": 1.5, "longitude": 2.5}}]})
+		self.assertEqual(comps[1]["parameters"], [
+			{"type": "text", "parameter_name": "first_name", "text": "Ann"},
+			{"type": "text", "parameter_name": "order_id", "text": "A1"},
+		])
+		self.assertEqual([c.get("sub_type") for c in comps[2:]], ["url", "copy_code"])
+		_, errors = wb.direct_send_components(["Ann"], [{"type": "", "link": "https://x.example/a.png"}], None)
+		self.assertEqual(errors[0]["code"], "invalid_type")
+		_, errors = wb.direct_send_components(None, None, [{"index": 0, "sub_type": "copy_code", "code": "x" * 16}])
+		self.assertEqual(errors[0]["code"], "invalid_code")
+
+	def test_send_template_named_params_use_the_stored_parameter_format(self):
+		tpl = {
+			"template": "Hi {{first_name}}, bye", "header_type": "", "header": "", "sample": "", "actual_name": "named_t",
+			"template_name": "named_t", "language_code": "en_US", "status": "APPROVED", "whatsapp_account": "ACC",
+			"buttons": [], "parameter_format": "NAMED", "header_format": "",
+		}
+		posted = []
+		with avail(), patch.object(wb, "resolve_account", return_value=ACCT), patch.object(
+			wb, "_template_docname", return_value="named_t-en_US"
+		), patch.object(wb, "_template_row", return_value=tpl), patch.object(
+			wb, "_mirror_template_send", side_effect=lambda *a, **k: {"success": True}
+		), patch.object(frappe, "has_permission", return_value=True):
+			post = lambda url, **kw: posted.append(kw["json"]) or SimpleNamespace(  # noqa: E731
+				status_code=200, json=lambda: {"messages": [{"id": "wamid.1"}]}
+			)
+			self.assertTrue(wb.send_template("ACC", "15551234567", "named_t", {"first_name": "Zed"}, http_post=post)["success"])
+			self.assertEqual(posted[0]["template"]["components"], [{"type": "body", "parameters": [{"type": "text", "parameter_name": "first_name", "text": "Zed"}]}])
+			with self.assertRaises(wb.BridgeError) as ctx:
+				wb.send_template("ACC", "15551234567", "named_t", {}, http_post=post)
+			self.assertEqual(ctx.exception.payload["error"], "param_missing")
+			with self.assertRaises(wb.BridgeError) as ctx:
+				wb.send_template("ACC", "15551234567", "named_t", {"first_name": "Z", "nope": "x"}, http_post=post)
+			self.assertEqual(ctx.exception.payload["error"], "param_unknown")
+		self.assertEqual(len(posted), 1)
 
 	def test_delete_template(self):
 		with avail(False):
@@ -412,7 +488,9 @@ class TestBridge(unittest.TestCase):
 
 		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(
 			frappe.db, "exists", side_effect=exists
-		), patch.object(frappe, "delete_doc") as dd:
+		), patch.object(frappe.db, "get_value", return_value="ACC"), patch.object(wb, "_guard"), patch.object(
+			frappe, "delete_doc"
+		) as dd:
 			self.assertTrue(wb.delete_template("T")["success"])
 			dd.assert_called_once_with("WhatsApp Templates", "T")
 		with avail(), patch.object(frappe, "has_permission", return_value=True), patch.object(

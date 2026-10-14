@@ -199,7 +199,7 @@ class FakeGraphCase(IntegrationTestCase):
 			"template_name": "fg_order_update",
 			"category": "UTILITY",
 			"language_code": "en_US",
-			"body": "Hi {{1}}, order ships {{2}}",
+			"body": "Hi {{1}}, order ships {{2}} soon",
 			"sample_values": "Ann,tomorrow",
 			"header_type": "TEXT",
 			"header": "Order {{1}}",
@@ -483,7 +483,7 @@ class TestBridgeMode(FakeGraphCase):
 		sample = self.server.add_file("samples/header.png", "image/png", PNG)
 		created = self._make_template(
 			template_name="fg_promo_image", header_type="IMAGE", header=None, sample=sample,
-			body="Sale for {{1}}", sample_values="Ann", buttons=[
+			body="Sale for {{1}} today", sample_values="Ann", buttons=[
 				{"type": "QUICK_REPLY", "text": "Yes"}, {"type": "QUICK_REPLY", "text": "No"},
 			],
 		)
@@ -513,7 +513,7 @@ class TestBridgeMode(FakeGraphCase):
 	def test_plain_template_send_goes_through_frappe_whatsapp(self):
 		created = self._make_template(
 			template_name="fg_plain", header_type=None, header=None, sample=None, footer=None, buttons=None,
-			body="Hello {{1}}", sample_values="Ann",
+			body="Hello {{1}}, welcome", sample_values="Ann",
 		)
 		self.assertTrue(created["success"], created)
 		self.server.approve("fg_plain")
@@ -524,14 +524,14 @@ class TestBridgeMode(FakeGraphCase):
 
 	def test_invalid_templates_return_structured_errors_without_calling_meta(self):
 		cases = {
-			"too_many_quick_replies": {"buttons": [{"type": "QUICK_REPLY", "text": f"b{i}"} for i in range(4)]},
-			"too_many_cta_buttons": {"buttons": [
+			"too_many_buttons": {"buttons": [{"type": "QUICK_REPLY", "text": f"b{i}"} for i in range(11)]},
+			"too_many_url_buttons": {"buttons": [
 				{"type": "URL", "text": "a", "url": "https://a.example"}, {"type": "URL", "text": "b", "url": "https://b.example"},
-				{"type": "PHONE_NUMBER", "text": "c", "phone_number": "+15550001234"}]},
+				{"type": "URL", "text": "c", "url": "https://c.example"}]},
 			"too_long": {"footer": "x" * 61},
-			"unsupported_header_type": {"header_type": "VIDEO", "header": None},
+			"unsupported_header_type": {"header_type": "AUDIO", "header": None},
 			"sample_count": {"sample_values": "only-one"},
-			"bad_placeholder": {"body": "Hi {{x}}"},
+			"bad_placeholder": {"body": "Hi {{x y}} there"},
 		}
 		for code, override in cases.items():
 			res = self._make_template(**override)
@@ -617,6 +617,253 @@ class TestBridgeMode(FakeGraphCase):
 		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "status"), "APPROVED")
 
 
+class TestTemplateWizard(FakeGraphCase):
+	"""Direct-to-Meta create / edit / send of the wizard's template shapes (bridge mode, fake Graph)."""
+
+	MODE = "bridge"
+
+	def setUp(self):
+		super().setUp()
+		self._need_bridge()
+
+	def _create(self, **override):
+		payload = {
+			"template_name": "fg_wiz",
+			"category": "UTILITY",
+			"language_code": "en_US",
+			"body": "Hi {{1}}, your order shipped",
+			"sample_values": "Ann",
+		}
+		payload.update({k: v for k, v in override.items() if v is not None})
+		for key in [k for k, v in override.items() if v is None]:
+			payload.pop(key, None)
+		return mgmt.create_template(account=self.account.name, payload=json.dumps(payload))
+
+	def _meta_post(self, index=-1):
+		return self.server.requests_to("POST", "/message_templates")[index]["body"]
+
+	def _extra(self, docname):
+		from huf.ai.gateway_adapters import whatsapp_template_guard as guard
+
+		return guard.get_extra(self.account.name, docname)
+
+	def _approve(self, name):
+		self.assertEqual(self._deliver_webhook(self.bridge_gateway, self.server.approve(name))["template_updates"], 1)
+
+	def _set_status(self, name, status):
+		self.assertEqual(self._deliver_webhook(self.bridge_gateway, self.server.set_template_status(name, status))["template_updates"], 1)
+
+	def _send(self, template, **kw):
+		for key in ("body_params", "header_params", "button_params"):
+			if key in kw:
+				kw[key] = json.dumps(kw[key])
+		return mgmt.send_template_message(to=SENDER, template_name=template, gateway_name=self.bridge_gateway.name, **kw)
+
+	def test_positional_create_pushes_directly_and_mirrors_under_the_guard_flag(self):
+		seen = {}
+		original = bridge._insert_mirror_row
+
+		def spy(doc):
+			seen["write_flag"] = frappe.flags.get("huf_template_write")
+			seen["mirror_flag"] = doc.flags.get("huf_mirror")
+			return original(doc)
+
+		with patch.object(bridge, "_insert_mirror_row", side_effect=spy):
+			created = self._create()
+		self.assertTrue(created["success"], created)
+		self.assertEqual(seen, {"write_flag": True, "mirror_flag": True})
+		self.assertFalse(frappe.flags.get("huf_template_write"))  # restored after the block
+		self.assertEqual(len(self.server.requests_to("POST", "/message_templates")), 1)  # frappe_whatsapp never pushes
+		body = self._meta_post()
+		self.assertEqual(body["parameter_format"], "POSITIONAL")
+		self.assertNotIn("message_send_ttl_seconds", body)
+		self.assertEqual(body["components"], [{"type": "BODY", "text": "Hi {{1}}, your order shipped", "example": {"body_text": [["Ann"]]}}])
+		row = frappe.db.get_value("WhatsApp Templates", created["name"], ["status", "id", "actual_name", "category", "language_code", "template", "whatsapp_account"], as_dict=True)
+		self.assertEqual((row.status, row.actual_name, row.category, row.language_code), ("PENDING", "fg_wiz", "UTILITY", "en_US"))
+		self.assertEqual((row.id, row.whatsapp_account), (created["id"], self.account.name))
+		extra = self._extra(created["name"])
+		self.assertEqual((extra["created_via"], extra["parameter_format"], extra["template_id"]), ("Huf", "POSITIONAL", created["id"]))
+		self.assertEqual(extra["components_json"], body["components"])
+
+	def test_named_create_edit_prefill_and_send_use_parameter_name(self):
+		created = self._create(
+			template_name="fg_named", body="Hi {{first_name}}, your order {{order_id}} shipped",
+			named_samples={"first_name": "Ann", "order_id": "A100"}, sample_values=None,
+		)
+		self.assertTrue(created["success"], created)
+		body = self._meta_post()
+		self.assertEqual(body["parameter_format"], "NAMED")
+		self.assertEqual(
+			body["components"][0]["example"],
+			{"body_text_named_params": [{"param_name": "first_name", "example": "Ann"}, {"param_name": "order_id", "example": "A100"}]},
+		)
+		extra = self._extra(created["name"])
+		self.assertEqual(extra["parameter_format"], "NAMED")
+		self.assertEqual(extra["named_samples"], [{"name": "first_name", "example": "Ann"}, {"name": "order_id", "example": "A100"}])
+		self._approve("fg_named")
+
+		# send: dict, list-of-pairs and ordered list all produce parameter_name entries
+		for params in ({"order_id": "B7", "first_name": "Zed"}, [{"name": "first_name", "value": "Zed"}, {"name": "order_id", "value": "B7"}], ["Zed", "B7"]):
+			sent = self._send("fg_named", body_params=params)
+			self.assertTrue(sent["success"], sent)
+			self.assertEqual(
+				self.server.sent[-1]["template"]["components"],
+				[{"type": "body", "parameters": [
+					{"type": "text", "parameter_name": "first_name", "text": "Zed"},
+					{"type": "text", "parameter_name": "order_id", "text": "B7"},
+				]}],
+			)
+		missing = self._send("fg_named", body_params={"first_name": "Zed"})
+		self.assertEqual(missing["error"], "param_missing")
+		self.assertEqual(missing["errors"][0]["field"], "body_params.order_id")
+		unknown = self._send("fg_named", body_params={"first_name": "Zed", "order_id": "1", "extra": "x"})
+		self.assertEqual(unknown["error"], "param_unknown")
+		self.assertEqual(len(self.server.sent), 3)
+
+		# prefill for the wizard
+		detail = mgmt.get_template(name=created["name"])
+		self.assertEqual(detail["parameter_format"], "NAMED")
+		self.assertEqual(detail["named_samples"], extra["named_samples"])
+		self.assertEqual((detail["header_format"], detail["ttl_seconds"]), ("", None))
+
+		bad = mgmt.edit_template(name=created["name"], payload=json.dumps({"parameter_format": "POSITIONAL"}))
+		self.assertEqual((bad["error"], bad["field"]), ("immutable_field", "parameter_format"))
+
+		# edit: full components, no parameter_format on the edit call, row + extras updated
+		edited = mgmt.edit_template(name=created["name"], payload=json.dumps({
+			"body": "Hi {{first_name}}, order {{order_id}} left the warehouse",
+			"named_samples": {"first_name": "Ann", "order_id": "A100"},
+		}))
+		self.assertTrue(edited["success"], edited)
+		edit_body = self.server.requests_to("POST", f"/{created['id']}")[-1]["body"]
+		self.assertEqual(set(edit_body), {"components"})
+		self.assertEqual(edit_body["components"][0]["text"], "Hi {{first_name}}, order {{order_id}} left the warehouse")
+		self.assertIn("body_text_named_params", edit_body["components"][0]["example"])
+		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "status"), "PENDING")
+		self.assertEqual(self._extra(created["name"])["components_json"], edit_body["components"])
+
+	def test_video_header_uploads_a_handle_and_edits_reuse_it(self):
+		sample = self.server.add_file("samples/clip.mp4", "video/mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
+		created = self._create(template_name="fg_video", header_type="VIDEO", sample=sample)
+		self.assertTrue(created["success"], created)
+		self.assertEqual(len(self.server.requests_to("POST", "/uploads")), 1)
+		header = self._meta_post()["components"][0]
+		self.assertEqual(header["format"], "VIDEO")
+		handle = header["example"]["header_handle"][0]
+		self.assertTrue(handle.startswith("4:"))
+		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "VIDEO")
+		self.assertEqual(self._extra(created["name"])["header_format"], "VIDEO")
+		self.assertEqual(mgmt.get_template(name=created["name"])["header_format"], "VIDEO")
+		self._approve("fg_video")
+		# send needs a video link of the right kind
+		self.assertEqual(self._send("fg_video", body_params=["Ann"])["errors"][0]["code"], "required")
+		wrong = self._send("fg_video", body_params=["Ann"], header_params=[{"type": "image", "link": sample}])
+		self.assertEqual(wrong["errors"][0]["code"], "invalid_type")
+		ok = self._send("fg_video", body_params=["Ann"], header_params=[{"type": "video", "link": sample}])
+		self.assertTrue(ok["success"], ok)
+		self.assertEqual(self.server.sent[-1]["template"]["components"][0], {"type": "header", "parameters": [{"type": "video", "video": {"link": sample}}]})
+		# body-only edit re-sends the stored handle without a new upload (REJECTED templates edit freely)
+		self._set_status("fg_video", "REJECTED")
+		edited = mgmt.edit_template(name=created["name"], payload=json.dumps({"body": "Hi {{1}}, your video order shipped", "sample_values": "Ann"}))
+		self.assertTrue(edited["success"], edited)
+		self.assertEqual(len(self.server.requests_to("POST", "/uploads")), 1)
+		self.assertEqual(self.server.requests_to("POST", f"/{created['id']}")[-1]["body"]["components"][0]["example"]["header_handle"], [handle])
+		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "VIDEO")
+		# a replacement sample is uploaded again; a header switch without a sample is refused
+		self._set_status("fg_video", "REJECTED")
+		newer = self.server.add_file("samples/clip2.mp4", "video/mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom2")
+		swapped = mgmt.edit_template(name=created["name"], payload=json.dumps({"sample": newer}))
+		self.assertTrue(swapped["success"], swapped)
+		self.assertEqual(len(self.server.requests_to("POST", "/uploads")), 2)
+		self._set_status("fg_video", "REJECTED")
+		no_sample = mgmt.edit_template(name=created["name"], payload=json.dumps({"header_type": "IMAGE"}))
+		self.assertEqual(no_sample["error"], "media_header_edit_unsupported")
+
+	def test_location_header_create_and_send(self):
+		created = self._create(template_name="fg_loc", header_type="LOCATION")
+		self.assertTrue(created["success"], created)
+		self.assertEqual(self._meta_post()["components"][0], {"type": "HEADER", "format": "LOCATION"})
+		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "LOCATION")
+		self._approve("fg_loc")
+		self.assertEqual(self._send("fg_loc", body_params=["Ann"])["errors"][0]["code"], "required")
+		loc = {"type": "location", "latitude": 12.97, "longitude": 77.59, "name": "HQ", "address": "1 Main St"}
+		ok = self._send("fg_loc", body_params=["Ann"], header_params=[loc])
+		self.assertTrue(ok["success"], ok)
+		self.assertEqual(
+			self.server.sent[-1]["template"]["components"][0],
+			{"type": "header", "parameters": [{"type": "location", "location": {"latitude": 12.97, "longitude": 77.59, "name": "HQ", "address": "1 Main St"}}]},
+		)
+
+	def test_copy_code_button_create_and_send(self):
+		created = self._create(
+			template_name="fg_copy", category="MARKETING", body="Use your code at checkout today", sample_values=None,
+			buttons=[{"type": "COPY_CODE", "example": "SAVE20"}],
+		)
+		self.assertTrue(created["success"], created)
+		self.assertEqual(self._meta_post()["components"][-1], {"type": "BUTTONS", "buttons": [{"type": "COPY_CODE", "example": "SAVE20"}]})
+		button = frappe.db.get_value("WhatsApp Button", {"parent": created["name"]}, ["button_type", "button_label", "example_url"], as_dict=True)
+		self.assertEqual((button.button_type, button.example_url), ("Copy Code", "SAVE20"))
+		self._approve("fg_copy")
+		self.assertEqual(self._send("fg_copy")["errors"][0]["code"], "required")
+		ok = self._send("fg_copy", button_params=[{"index": 0, "sub_type": "copy_code", "code": "SAVE30"}])
+		self.assertTrue(ok["success"], ok)
+		self.assertEqual(
+			self.server.sent[-1]["template"]["components"],
+			[{"type": "button", "sub_type": "copy_code", "index": "0", "parameters": [{"type": "coupon_code", "coupon_code": "SAVE30"}]}],
+		)
+
+	def test_utility_ttl_is_sent_stored_and_rejected_for_marketing(self):
+		created = self._create(template_name="fg_ttl", ttl_seconds=3600)
+		self.assertTrue(created["success"], created)
+		self.assertEqual(self._meta_post()["message_send_ttl_seconds"], 3600)
+		self.assertEqual(self._extra(created["name"])["ttl_seconds"], 3600)
+		self.assertEqual(mgmt.get_template(name=created["name"])["ttl_seconds"], 3600)
+		before = len(self.server.requests_to("POST", "/message_templates"))
+		marketing = self._create(template_name="fg_ttl_mkt", category="MARKETING", ttl_seconds=3600)
+		self.assertIn("ttl_not_allowed", [e["code"] for e in marketing["errors"]])
+		self.assertEqual(len(self.server.requests_to("POST", "/message_templates")), before)
+		self._approve("fg_ttl")
+		edited = mgmt.edit_template(name=created["name"], payload=json.dumps({"ttl_seconds": 7200}))
+		self.assertTrue(edited["success"], edited)
+		self.assertEqual(self.server.requests_to("POST", f"/{created['id']}")[-1]["body"]["message_send_ttl_seconds"], 7200)
+		self.assertEqual(self._extra(created["name"])["ttl_seconds"], 7200)
+
+	def test_meta_refusal_leaves_no_local_row_and_a_redacted_error(self):
+		self.server.add_template("fg_taken", components=[{"type": "BODY", "text": "Already there"}])  # exists on Meta, not locally
+		res = self._create(template_name="fg_taken", body="Hello there friend", sample_values=None)
+		self.assertEqual(res["error"], "create_failed")
+		self.assertIn("already exists", res["message"])
+		self.assertNotIn(self.server.token, json.dumps(res))
+		self.assertEqual(frappe.db.count("WhatsApp Templates", {"template_name": "fg_taken"}), 0)
+		self.assertIsNone(self._extra("fg_taken-en_US"))
+		self.assertEqual(len(self.server.violations), 1)  # Meta's own duplicate refusal; expected here
+		self.server.violations.clear()
+
+	def test_draft_approval_carries_the_wizard_payload_and_submits_once(self):
+		payload = {
+			"template_name": "fg_draft", "category": "UTILITY", "language_code": "en_US",
+			"parameter_format": "NAMED", "body": "Hi {{first_name}}, your slot is booked",
+			"named_samples": {"first_name": "Ann"}, "ttl_seconds": 900,
+			"buttons": [{"type": "QUICK_REPLY", "text": "OK"}],
+		}
+		draft = mgmt.create_template_draft(account=self.account.name, payload=json.dumps(payload))
+		self.assertTrue(draft["success"], draft)
+		self.assertEqual(self.server.requests_to("POST", "/message_templates"), [])  # nothing sent before approval
+		stored = json.loads(frappe.db.get_value("WhatsApp Template Draft", draft["name"], "payload"))
+		for key in ("parameter_format", "named_samples", "ttl_seconds", "buttons", "category"):
+			self.assertEqual(stored[key], payload[key])
+		approved = mgmt.approve_template_draft(name=draft["name"])
+		self.assertTrue(approved["success"], approved)
+		self.assertEqual(len(self.server.requests_to("POST", "/message_templates")), 1)
+		body = self._meta_post()
+		self.assertEqual((body["parameter_format"], body["message_send_ttl_seconds"]), ("NAMED", 900))
+		again = mgmt.approve_template_draft(name=draft["name"])
+		self.assertEqual(again["error"], "already_processed")
+		self.assertEqual(len(self.server.requests_to("POST", "/message_templates")), 1)
+		extra = self._extra(approved["submitted_template"])
+		self.assertEqual((extra["parameter_format"], extra["ttl_seconds"], extra["created_via"]), ("NAMED", 900, "Huf"))
+
+
 class TestFakeGraphServerEnforcesSchema(unittest.TestCase):
 	"""The fake must itself reject what Meta rejects, otherwise the tests above prove nothing."""
 
@@ -683,6 +930,30 @@ class TestFakeGraphServerEnforcesSchema(unittest.TestCase):
 			self._template(components=[{"type": "BODY", "text": "Hi"}, {"type": "BUTTONS", "buttons": [{"type": "QUICK_REPLY", "text": "t" * 26}]}]),
 			self._template(components=[{"type": "BODY", "text": "Hi"}, {"type": "BUTTONS", "buttons": [{"type": "URL", "text": "u", "url": "https://a.example/{{1}}/x", "example": ["https://a.example/1/x"]}]}]),
 			self._template(components=[{"type": "BODY", "text": "Hi"}]),  # valid, but chk_tpl/en_US already exists
+		]
+		for resp in bad:
+			self.assertEqual(resp.status_code, 400, resp.text)
+		self.assertEqual(len(self.server.violations), len(bad))
+
+	def test_wizard_template_schema(self):
+		named = {"type": "BODY", "text": "Hi {{first_name}}, welcome", "example": {"body_text_named_params": [{"param_name": "first_name", "example": "Ann"}]}}
+		ok = [
+			self._template(name="n_ok", parameter_format="NAMED", components=[named]),
+			self._template(name="loc_ok", components=[{"type": "HEADER", "format": "LOCATION"}, {"type": "BODY", "text": "Hi"}]),
+			self._template(name="ttl_ok", message_send_ttl_seconds=3600, components=[{"type": "BODY", "text": "Hi"}]),
+			self._template(name="cc_ok", category="MARKETING", components=[{"type": "BODY", "text": "Hi"}, {"type": "BUTTONS", "buttons": [{"type": "COPY_CODE", "example": "SAVE20"}]}]),
+		]
+		for resp in ok:
+			self.assertEqual(resp.status_code, 200, resp.text)
+		bad = [
+			self._template(name="n_bad1", parameter_format="WEIRD", components=[{"type": "BODY", "text": "Hi"}]),
+			self._template(name="n_bad2", components=[named]),  # named variables need parameter_format NAMED
+			self._template(name="n_bad3", parameter_format="NAMED", components=[{"type": "BODY", "text": "Hi {{first_name}}, x", "example": {"body_text": [["Ann"]]}}]),
+			self._template(name="n_bad4", parameter_format="NAMED", components=[{**named, "example": {"body_text_named_params": [{"param_name": "other", "example": "Ann"}]}}]),
+			self._template(name="loc_bad", components=[{"type": "HEADER", "format": "LOCATION", "text": "x"}, {"type": "BODY", "text": "Hi"}]),
+			self._template(name="ttl_bad1", message_send_ttl_seconds=10, components=[{"type": "BODY", "text": "Hi"}]),
+			self._template(name="ttl_bad2", category="MARKETING", message_send_ttl_seconds=3600, components=[{"type": "BODY", "text": "Hi"}]),
+			self._template(name="cc_bad", components=[{"type": "BODY", "text": "Hi"}, {"type": "BUTTONS", "buttons": [{"type": "COPY_CODE", "example": "x" * 21}]}]),
 		]
 		for resp in bad:
 			self.assertEqual(resp.status_code, 400, resp.text)

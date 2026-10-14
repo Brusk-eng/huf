@@ -401,7 +401,7 @@ def list_templates(
 def create_template(
 	account: str | None = None, payload: Any = None, gateway_name: str | None = None
 ) -> dict[str, Any]:
-	"""Admin: create a WhatsApp Template; its doctype hook pushes it to Meta."""
+	"""Admin: create a WhatsApp Template; Huf pushes it straight to Meta, then mirrors it locally."""
 	_require_admin()
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
@@ -566,8 +566,9 @@ def send_template_message(
 	``gateway_name`` is required and the caller needs write authority on that Gateway; the
 	WhatsApp Account is the Gateway's own, never supplied by the caller.
 
-	``header_params`` is one text value or one ``{"type": "image|document", "link": ...}``
-	media object; ``button_params`` is ``[{"index": 0, "sub_type": "url", "text": "<suffix>"}]``
+	``body_params`` is an ordered list, or a ``{name: value}`` map for a template with named variables;
+	``header_params`` is one text value, one ``{"type": "image|document|video", "link": ...}`` media object,
+	one ``{"type": "location", "latitude": ..., "longitude": ...}`` object or (named) a one-entry map; ``button_params`` is ``[{"index": 0, "sub_type": "url", "text": "<suffix>"}]``
 	for dynamic URL buttons. Validation failures return ``validation_failed`` with
 	an ``errors`` list.
 	"""
@@ -592,10 +593,10 @@ def send_template_message(
 		buttons = _parse_json_arg(button_params, "button_params") or []
 	except ValueError as exc:
 		return {"success": False, "error": "invalid_params", "message": str(exc)}
-	if isinstance(header, (str, dict)):
-		header = [header]
-	if not isinstance(body, list) or not isinstance(header, list) or not isinstance(buttons, list):
-		return {"success": False, "error": "invalid_params", "message": "Params must be lists"}
+	if isinstance(header, str) or (isinstance(header, dict) and "type" in header):
+		header = [header]  # one text value or one media / location object; a dict without "type" is a named text header
+	if not isinstance(body, (list, dict)) or not isinstance(header, (list, dict)) or not isinstance(buttons, list):
+		return {"success": False, "error": "invalid_params", "message": "Params must be lists (body and header may be {name: value} maps for named-variable templates)"}
 	account_name = _resolve_account_name(_gateway_whatsapp_account(gateway_name))
 	if isinstance(account_name, dict):
 		return account_name
