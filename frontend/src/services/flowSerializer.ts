@@ -186,6 +186,9 @@ function extractNodeConfig(
 
     if (data?.triggerConfig && data.triggerConfig.type) {
         config = omitType(data.triggerConfig) as Record<string, unknown>;
+        // graph_ir.schema.json forbids extra keys on these two nodes; drop anything else.
+        const allowed = backendType === 'trigger.schedule' ? ['cron'] : backendType === 'trigger.doc-event' ? ['doctype', 'event'] : null;
+        if (allowed) config = Object.fromEntries(Object.entries(config).filter(([k]) => allowed.includes(k)));
     } else if (data?.actionConfig && data.actionConfig.type) {
         config = omitType(data.actionConfig) as Record<string, unknown>;
     }

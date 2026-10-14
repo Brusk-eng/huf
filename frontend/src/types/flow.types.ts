@@ -62,16 +62,15 @@ export interface WebhookTriggerConfig {
 
 export interface ScheduleTriggerConfig {
   type: 'schedule';
-  intervalType: ScheduleIntervalType;
-  interval?: number;
-  cronExpression?: string;
-  timezone?: string;
+  /** 5-field cron; mirrors the trigger saved via set_flow_trigger (FlowTriggerPanel). */
+  cron?: string;
 }
 
 export interface DocEventTriggerConfig {
   type: 'doc-event';
+  /** Mirror the trigger saved via set_flow_trigger (FlowTriggerPanel). */
   doctype?: string;
-  event?: DocEventType;
+  event?: 'after_insert' | 'on_update' | 'on_submit' | 'on_cancel' | 'on_trash';
 }
 
 export interface AppTriggerConfig {

@@ -12,6 +12,28 @@ _LOCK_PREFIX = "huf:automation_scheduler:lock:"
 _LOCK_TTL_SEC = 60
 
 
+def compute_next_execution(t, after):
+	"""Next fire time strictly after ``after`` for a Schedule trigger row/dict.
+
+	Cron schedules use croniter (bundled with Frappe); everything else keeps
+	the original calendar-interval behaviour.
+	"""
+	if t.get("schedule_type") == "Cron" and t.get("cron_expression"):
+		from croniter import croniter
+
+		return croniter(t["cron_expression"], after).get_next(type(after))
+	interval = t.get("interval_count") or 1
+	si = (t.get("scheduled_interval") or "").lower()
+	return add_to_date(
+		after,
+		hours=interval if si == "hourly" else 0,
+		days=interval if si == "daily" else 0,
+		weeks=interval if si == "weekly" else 0,
+		months=interval if si == "monthly" else 0,
+		years=interval if si == "yearly" else 0,
+	)
+
+
 def run_due_automations():
 	"""Fire every due Schedule-type Automation Trigger.
 
@@ -38,6 +60,8 @@ def run_due_automations():
 		fields=[
 			"name",
 			"automation",
+			"schedule_type",
+			"cron_expression",
 			"scheduled_interval",
 			"interval_count",
 			"next_execution",
@@ -74,16 +98,7 @@ def _fire_due_trigger(t, now):
 	# Claim immediately by advancing next_execution BEFORE executing, so a
 	# second overlapping tick (or a slow run) can't re-select this trigger
 	# while the first run is still in flight.
-	interval = t.get("interval_count") or 1
-	si = (t.get("scheduled_interval") or "").lower()
-	provisional_next = add_to_date(
-		now,
-		hours=interval if si == "hourly" else 0,
-		days=interval if si == "daily" else 0,
-		weeks=interval if si == "weekly" else 0,
-		months=interval if si == "monthly" else 0,
-		years=interval if si == "yearly" else 0,
-	)
+	provisional_next = compute_next_execution(t, now)
 	frappe.db.set_value(
 		"Automation Trigger",
 		trigger_name,
@@ -98,7 +113,11 @@ def _fire_due_trigger(t, now):
 
 	trigger_context = {"type": "schedule", "fired_at": now.isoformat()}
 
-	if t.get("execution_mode") == "Batch":
+	# Batch submission is an Agent-only concept; Procedure targets always run realtime.
+	if (
+		t.get("execution_mode") == "Batch"
+		and frappe.db.get_value("Automation", automation_name, "target_type") != "Agent Procedure"
+	):
 		automation_doc = frappe.get_doc("Automation", automation_name)
 		prompt = _resolve_instruction(automation_doc, trigger_context)
 		_submit_batch_job_for_automation_trigger(t, automation_doc, prompt)
