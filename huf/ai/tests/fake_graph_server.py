@@ -120,6 +120,23 @@ class FakeGraphServer:
 		self._uploads: dict[str, dict] = {}
 		self._handles: set[str] = set()
 		self._counter = 0
+		# token-health state (debug_token / phone number / subscribed_apps)
+		self.app_secret = APP_SECRET
+		self.token_revoked = False
+		self.token_info: dict = {
+			"type": "SYSTEM_USER",
+			"expires_at": 0,
+			"scopes": ["whatsapp_business_management", "whatsapp_business_messaging"],
+			"granular_scopes": None,  # None -> derived from scopes + waba_id
+		}
+		self.phone = {
+			"display_phone_number": "+1 555-010-0100",
+			"verified_name": "Fake Co",
+			"quality_rating": "GREEN",
+			"messaging_limit_tier": "TIER_1K",
+			"name_status": "APPROVED",
+		}
+		self.subscribed_apps: list[dict] = []
 		self._httpd: ThreadingHTTPServer | None = None
 		self._thread: threading.Thread | None = None
 		self.port = 0
@@ -283,6 +300,8 @@ class FakeGraphServer:
 				mime, content = self.files[key]
 				return 200, content, mime
 			return 404, b"not found", "text/plain"
+		if len(parts) == 2 and _VERSION_RE.match(parts[0]) and parts[1] == "debug_token" and method == "GET":
+			return self._get_debug_token(rec)
 		self._auth(rec, oauth_ok=len(parts) == 2 and parts[1].startswith("upload:"))
 		if parts and parts[0] == "media":
 			_need(method == "GET", "media download is GET only")
@@ -302,6 +321,11 @@ class FakeGraphServer:
 				return self._delete_template(rec)
 		if node.isdigit() and not rest and method == "POST" and any(t["id"] == node for t in self.templates.values()):
 			return self._edit_template(rec, node)
+		if node == self.phone_id and not rest and method == "GET":
+			fields = [f for f in rec["query"].get("fields", "").split(",") if f]
+			return 200, {"id": node, **{f: self.phone[f] for f in fields if f in self.phone}}, "application/json"
+		if node == self.waba_id and rest == ["subscribed_apps"] and method == "GET":
+			return 200, {"data": list(self.subscribed_apps), "paging": {}}, "application/json"
 		if node == self.app_id and rest == ["uploads"] and method == "POST":
 			return self._post_upload_session(rec)
 		if node.startswith("upload:") and not rest and method == "POST":
@@ -322,8 +346,30 @@ class FakeGraphServer:
 		auth = rec["headers"].get("authorization", "")
 		scheme, _, value = auth.partition(" ")
 		ok_scheme = scheme == "Bearer" or (oauth_ok and scheme in ("OAuth", "Bearer"))
+		if self.token_revoked:
+			raise SchemaViolation("Error validating access token: Session has expired", code=190)
 		if not (ok_scheme and hmac.compare_digest(value.encode(), self.token.encode())):
 			raise SchemaViolation("Invalid OAuth access token - Cannot parse access token", code=190)
+
+	def _get_debug_token(self, rec: dict):
+		q = rec["query"]
+		_need(q.get("access_token") == f"{self.app_id}|{self.app_secret}", "Invalid OAuth access token - app token", code=190)
+		if q.get("input_token") != self.token:
+			return 200, {"data": {"is_valid": False, "error": {"code": 190, "message": "Invalid OAuth access token."}}}, "application/json"
+		info = self.token_info
+		if self.token_revoked:
+			return 200, {"data": {"app_id": self.app_id, "type": info["type"], "is_valid": False,
+				"error": {"code": 190, "message": "Error validating access token: Session has expired", "subcode": 463}}}, "application/json"
+		gran = info["granular_scopes"]
+		if gran is None:
+			gran = [{"scope": s, "target_ids": [self.waba_id]} for s in info["scopes"]]
+		data = {"app_id": self.app_id, "type": info["type"], "application": "Fake App", "expires_at": info["expires_at"],
+			"is_valid": True, "scopes": list(info["scopes"]), "granular_scopes": gran, "user_id": "400000000000004"}
+		return 200, {"data": data}, "application/json"
+
+	def subscribe_app(self, fields=("messages",)) -> None:
+		self.subscribed_apps[:] = [{"whatsapp_business_api_data": {"id": self.app_id, "name": "Fake App"},
+			"subscribed_fields": list(fields)}]
 
 	@staticmethod
 	def _json(rec: dict) -> dict:

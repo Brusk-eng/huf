@@ -1142,3 +1142,14 @@ def can_launch_whatsapp_app(user: str | None = None, app: dict | None = None, **
 		return bool(frappe.db.exists("Gateway", {"provider": WHATSAPP_PROVIDER, "is_enabled": 1}))
 	except Exception:
 		return False
+
+
+@frappe.whitelist(methods=["POST"])
+def check_token(gateway_name: str | None = None, force: Any = None) -> dict[str, Any]:
+	"""Is this gateway's Meta access token still good? Admin only; 1 call/10 s per gateway, cached 10 min."""
+	_require_admin()
+	from huf.ai import whatsapp_token_check
+
+	return whatsapp_token_check.check_token_for_gateway(
+		gateway_name or "", force=str(force or "").lower() in ("1", "true", "yes")
+	)
