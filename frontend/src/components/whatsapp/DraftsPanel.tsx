@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { toast } from 'sonner';
-import { Loader2 } from 'lucide-react';
+import { ArrowLeft, Loader2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -10,8 +10,11 @@ import {
   approveTemplateDraft, errorText, getTemplate, isBridgeUnavailable, rejectTemplateDraft, type TemplateDraft,
 } from '@/services/whatsappApi';
 import { TemplatePreview } from './TemplatePreview';
+import { fromDraftPayload } from './template/payload';
+import { ReviewStep } from './TemplateWizard/ReviewStep';
+import { draftToPreviewModel } from './TemplateWizard/previewModel';
 import { StatusBadge } from './TemplateBadges';
-import { OPEN_DRAFT_STATUSES, draftStatusInfo, payloadToPreviewInput, timeAgo } from './templateModel';
+import { OPEN_DRAFT_STATUSES, draftStatusInfo, timeAgo } from './templateModel';
 
 const TONE = { success: 'pill-success', warning: 'pill-warning', danger: 'pill-danger', neutral: 'pill-neutral' } as const;
 
@@ -28,11 +31,13 @@ export function DraftsPanel({ drafts, isAdmin, onChanged, onUnavailable }: Props
   const [note, setNote] = useState('');
   /** Meta status of drafts approved in this session, keyed by draft name. */
   const [outcome, setOutcome] = useState<Record<string, string>>({});
+  /** Draft open in the full review (same summary and preview as the last wizard step). */
+  const [reviewing, setReviewing] = useState<string | null>(null);
 
   const open = drafts.filter((d) => OPEN_DRAFT_STATUSES.includes(d.status));
   const handled = drafts.filter((d) => !OPEN_DRAFT_STATUSES.includes(d.status));
 
-  const approve = async (d: TemplateDraft) => {
+  const approve = async (d: TemplateDraft): Promise<boolean> => {
     setBusy(d.name);
     const res = await approveTemplateDraft(d.name);
     if (res.success) {
@@ -43,6 +48,7 @@ export function DraftsPanel({ drafts, isAdmin, onChanged, onUnavailable }: Props
     else toast.error(res.submit_error || errorText(res));
     setBusy('');
     onChanged();
+    return res.success;
   };
 
   const reject = async () => {
@@ -54,9 +60,12 @@ export function DraftsPanel({ drafts, isAdmin, onChanged, onUnavailable }: Props
       toast.success('Draft rejected');
       setToReject(null);
       setNote('');
+      setReviewing(null);
       onChanged();
     } else toast.error(errorText(res));
   };
+
+  const previewOf = (d: TemplateDraft) => draftToPreviewModel(fromDraftPayload(d));
 
   const card = (d: TemplateDraft) => {
     const info = draftStatusInfo(d.status);
@@ -81,23 +90,54 @@ export function DraftsPanel({ drafts, isAdmin, onChanged, onUnavailable }: Props
           {submitted && (
             <p className="flex items-center gap-2 text-xs text-steel">Now at WhatsApp: <StatusBadge status={submitted} /></p>
           )}
-          {isOpen && isAdmin && (
-            <div className="flex gap-2 pt-1">
-              <Button size="sm" disabled={busy === d.name} onClick={() => approve(d)}>
-                {busy === d.name && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
-                {d.status === 'Failed' ? 'Try again' : 'Approve and submit'}
-              </Button>
-              <Button size="sm" variant="outline" disabled={busy === d.name} onClick={() => { setToReject(d); setNote(''); }}>
-                Reject
-              </Button>
-            </div>
-          )}
+          <Button size="sm" variant={isOpen && isAdmin ? 'default' : 'outline'} onClick={() => setReviewing(d.name)}>
+            {isOpen && isAdmin ? 'Review' : 'View'}
+          </Button>
           {isOpen && !isAdmin && <p className="text-xs text-steel">An admin needs to approve this before it goes to WhatsApp.</p>}
         </div>
-        <TemplatePreview input={payloadToPreviewInput(d.payload)} />
+        <TemplatePreview model={previewOf(d)} />
       </li>
     );
   };
+
+  const rejectDialog = (
+    <Dialog open={!!toReject} onOpenChange={(o) => !o && setToReject(null)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Reject draft?</DialogTitle>
+          <DialogDescription>
+            {toReject?.template_name} will not be sent to WhatsApp. You can leave a note for the person who asked.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-1">
+          <Label htmlFor="wa-reject-note">Note (optional)</Label>
+          <Textarea id="wa-reject-note" value={note} onChange={(e) => setNote(e.target.value)} />
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setToReject(null)}>Cancel</Button>
+          <Button onClick={reject} disabled={!!busy}>Reject draft</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+
+  const current = drafts.find((d) => d.name === reviewing);
+  if (current) {
+    const isOpen = OPEN_DRAFT_STATUSES.includes(current.status);
+    const by = current.requested_via === 'Agent run' ? 'an agent' : current.requested_by || 'a teammate';
+    return (
+      <div className="space-y-6">
+        <Button variant="ghost" size="sm" onClick={() => setReviewing(null)}>
+          <ArrowLeft className="mr-1.5 h-4 w-4" /> Back to drafts
+        </Button>
+        <DraftReview draft={current} by={by} isOpen={isOpen} isAdmin={isAdmin} busy={busy === current.name}
+          submitted={outcome[current.name]}
+          onApprove={async () => { if (await approve(current)) setReviewing(null); }}
+          onReject={() => { setToReject(current); setNote(''); }} />
+        {rejectDialog}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -115,24 +155,60 @@ export function DraftsPanel({ drafts, isAdmin, onChanged, onUnavailable }: Props
         </div>
       )}
 
-      <Dialog open={!!toReject} onOpenChange={(o) => !o && setToReject(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Reject draft?</DialogTitle>
-            <DialogDescription>
-              {toReject?.template_name} will not be sent to WhatsApp. You can leave a note for the person who asked.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-1">
-            <Label htmlFor="wa-reject-note">Note (optional)</Label>
-            <Textarea id="wa-reject-note" value={note} onChange={(e) => setNote(e.target.value)} />
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setToReject(null)}>Cancel</Button>
-            <Button onClick={reject} disabled={!!busy}>Reject draft</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {rejectDialog}
+    </div>
+  );
+}
+
+interface ReviewProps {
+  draft: TemplateDraft;
+  by: string;
+  isOpen: boolean;
+  isAdmin: boolean;
+  busy: boolean;
+  submitted?: string;
+  onApprove: () => void;
+  onReject: () => void;
+}
+
+/** One draft in the same review layout as the last wizard step, with the admin decision below. */
+function DraftReview({ draft, by, isOpen, isAdmin, busy, submitted, onApprove, onReject }: ReviewProps) {
+  const wizardDraft = useMemo(() => fromDraftPayload(draft), [draft]);
+  const info = draftStatusInfo(draft.status);
+  const kindLabel = draft.category === 'UTILITY' ? 'Utility' : 'Marketing';
+  return (
+    <div className="space-y-6">
+      <div className="space-y-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="font-mono text-base font-semibold text-ink">{draft.template_name}</h2>
+          <Badge variant={TONE[info.tone]}>{info.label}</Badge>
+        </div>
+        <p className="text-xs text-steel">
+          Requested by {by}{draft.creation ? ` · ${timeAgo(draft.creation)}` : ''}
+        </p>
+        {draft.status === 'Failed' && draft.submit_error && (
+          <p role="alert" className="text-xs text-destructive">WhatsApp did not accept it: {draft.submit_error}</p>
+        )}
+        {draft.review_note && <p className="text-xs text-steel">Note: {draft.review_note}</p>}
+        {submitted && <p className="flex items-center gap-2 text-xs text-steel">Now at WhatsApp: <StatusBadge status={submitted} /></p>}
+      </div>
+      <ReviewStep
+        draft={wizardDraft}
+        kindLabel={kindLabel}
+        isEdit={false}
+        direct={false}
+        intro={isOpen && isAdmin ? 'Check the request. Approving sends it to WhatsApp for review.' : 'This is what was requested.'}
+      />
+      {isOpen && isAdmin && (
+        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-line pt-4">
+          <Button variant="outline" disabled={busy} onClick={onReject}>Reject</Button>
+          <Button disabled={busy} onClick={onApprove}>
+            {busy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden />}
+            {draft.status === 'Failed' ? 'Try again' : 'Approve & submit'}
+          </Button>
+        </div>
+      )}
+      {isOpen && !isAdmin && <p className="text-xs text-steel">An admin needs to approve this before it goes to WhatsApp.</p>}
     </div>
   );
 }

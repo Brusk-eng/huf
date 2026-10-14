@@ -3,6 +3,7 @@ import { Badge } from '@/components/ui/badge';
 import { TemplatePreview } from '../TemplatePreview';
 import type { TemplateWizardDraft } from '../template/draft';
 import { localeLabel } from '../template/locales';
+import { validateDraft } from '../template/rules';
 import { draftToPreviewModel } from './previewModel';
 import { sampleVariables, ttlLabel } from './draftActions';
 import { StepLayout } from './fields';
@@ -33,16 +34,19 @@ interface Props {
   isEdit: boolean;
   /** True when the final action sends the template to WhatsApp right away. */
   direct: boolean;
+  /** Replaces the default line under the heading, e.g. when an admin reviews a request. */
+  intro?: string;
 }
 
-export function ReviewStep({ draft, kindLabel, isEdit, direct }: Props) {
+export function ReviewStep({ draft, kindLabel, isEdit, direct, intro }: Props) {
   const samples = sampleVariables(draft);
+  const issues = Object.values(validateDraft(draft));
   return (
     <StepLayout aside={<TemplatePreview model={draftToPreviewModel(draft)} />}>
       <div className="space-y-1">
         <h2 className="text-lg font-semibold text-ink">Check and send</h2>
         <p className="text-sm text-steel">
-          {isEdit ? 'Review your changes. WhatsApp reviews them again.' : direct ? 'Review the template, then send it to WhatsApp.' : 'Review the template, then ask an admin to approve it.'}
+          {intro ?? (isEdit ? 'Review your changes. WhatsApp reviews them again.' : direct ? 'Review the template, then send it to WhatsApp.' : 'Review the template, then ask an admin to approve it.')}
         </p>
       </div>
 
@@ -75,7 +79,14 @@ export function ReviewStep({ draft, kindLabel, isEdit, direct }: Props) {
         {draft.category === 'UTILITY' && (
           <Row label="Expires after">{draft.ttl === null ? 'WhatsApp default' : ttlLabel(draft.ttl)}</Row>
         )}
-        <Row label="Checks"><Badge variant="pill-success" size="sm">Ready to send</Badge></Row>
+        <Row label="Checks">issues.length === 0 ? (
+            <Badge variant="pill-success" size="sm">Ready to send</Badge>
+          ) : (
+            <span className="space-y-0.5">
+              <Badge variant="pill-warning" size="sm">{issues.length === 1 ? '1 problem' : `${issues.length} problems`}</Badge>
+              <span className="block text-xs text-steel">{issues[0]}</span>
+            </span>
+          )</Row>
       </dl>
 
       <ul className="list-disc space-y-1 pl-4 text-xs text-steel">

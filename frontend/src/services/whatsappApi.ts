@@ -78,6 +78,11 @@ export interface WhatsAppTemplate {
   last_meta_update?: string | null;
 }
 
+export interface NamedSample {
+  name: string;
+  example: string;
+}
+
 export interface TemplateDetail {
   name: string;
   template_id: string;
@@ -89,8 +94,8 @@ export interface TemplateDetail {
   status: string;
   whatsapp_account?: string;
   components: {
-    header: { type: HeaderType; text: string; sample: string } | null;
-    body: { text: string; sample_values: string[] };
+    header: { type: WizardPayloadHeaderType; text: string; sample: string } | null;
+    body: { text: string; sample_values: string[]; named_samples?: NamedSample[] };
     footer: { text: string } | null;
     buttons: TemplateButton[];
   };
@@ -106,6 +111,10 @@ export interface TemplateDetail {
   /** Present once the server reports variable style and validity (wizard edit mode). */
   parameter_format?: 'POSITIONAL' | 'NAMED';
   ttl_seconds?: number | null;
+  /** Header format as WhatsApp stores it, e.g. TEXT, IMAGE, VIDEO, LOCATION. */
+  header_format?: string;
+  /** Named-variable examples ({name, example}); empty for numbered variables. */
+  named_samples?: NamedSample[];
   editable: boolean;
   editable_reason?: string;
   editable_message?: string;
@@ -123,7 +132,7 @@ export interface TemplateDraft {
   category: string;
   whatsapp_account?: string;
   status: DraftStatus | string;
-  payload: Partial<TemplatePayload>;
+  payload: Partial<WizardTemplatePayload>;
   requested_by?: string;
   requested_via?: 'User' | 'Agent run' | string;
   agent_run?: string;

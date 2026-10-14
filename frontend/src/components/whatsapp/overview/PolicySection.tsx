@@ -11,6 +11,8 @@ export interface PolicySectionProps {
 	policy: GatewayHealthStatus['policy'];
 	/** Link to the gateway's settings, where rules are edited. */
 	editHref?: string;
+	/** Start expanded (Settings); Overview keeps it collapsed. */
+	defaultOpen?: boolean;
 }
 
 const POLICY_TEXT: Record<string, string> = {
@@ -42,6 +44,7 @@ export function PolicySection({
 	fallbackTemplateApproved,
 	policy,
 	editHref,
+	defaultOpen = false,
 }: PolicySectionProps) {
 	const template = fallbackTemplate
 		? `${fallbackTemplate}${fallbackTemplateLanguage ? ` (${fallbackTemplateLanguage})` : ''}`
@@ -49,7 +52,7 @@ export function PolicySection({
 
 	return (
 		<Card>
-			<Collapsible>
+			<Collapsible defaultOpen={defaultOpen}>
 				<CollapsibleTrigger className="group flex w-full items-center justify-between px-6 py-4 text-left text-sm font-medium text-ink">
 					Reply rules
 					<ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" aria-hidden />

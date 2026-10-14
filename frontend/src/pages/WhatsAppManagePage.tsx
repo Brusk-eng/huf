@@ -51,11 +51,16 @@ export default function WhatsAppManagePage() {
   const gateways = summary?.gateways ?? [];
   const gateway = (gateways.find((g) => g.name === gatewayParam) ?? gateways[0])?.name;
 
-  const update = useCallback((patch: { tab?: TabName; gateway?: string }) => {
+  const update = useCallback((patch: { tab?: TabName; gateway?: string; send?: boolean }) => {
     setParams((prev) => {
       const next = new URLSearchParams(prev);
-      if (patch.tab) next.set('tab', patch.tab);
+      if (patch.tab) {
+        // One-shot view params belong to the tab they were set for.
+        for (const k of ['new', 'edit', 'send', 'event']) next.delete(k);
+        next.set('tab', patch.tab);
+      }
       if (patch.gateway) next.set('gateway', patch.gateway);
+      if (patch.send) next.set('send', '1');
       return next;
     }, { replace: true });
   }, [setParams]);
@@ -110,7 +115,7 @@ export default function WhatsAppManagePage() {
     const id = link?.hash.slice(1);
     if (!link || !id || link.pathname !== window.location.pathname || link.target === '_blank') return;
     if (SETTINGS_ANCHORS.has(id)) update({ tab: 'settings' });
-    else if (id === 'test-message') update({ tab: 'messages' });
+    else if (id === 'test-message') update({ tab: 'messages', send: true });
     else return;
     e.preventDefault();
     if (SETTINGS_ANCHORS.has(id)) setAnchor(id);
@@ -162,7 +167,7 @@ export default function WhatsAppManagePage() {
                       onCheck={onCheck}
                       onTurnOn={() => window.open(settingsHref, '_blank', 'noopener,noreferrer')}
                       settingsHref={settingsHref}
-                      failedEventHref={() => `?tab=messages${gatewayQuery}`}
+                      failedEventHref={(eventName) => `?tab=messages${gatewayQuery}&event=${encodeURIComponent(eventName)}`}
                     />
                   )}
                 </TabsContent>

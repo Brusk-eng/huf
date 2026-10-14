@@ -26,6 +26,11 @@ describe('PolicySection', () => {
 		expect(screen.queryByText(/Outside the 24-hour window/)).toBeNull();
 	});
 
+	it('starts expanded with defaultOpen', () => {
+		render(<PolicySection {...base} defaultOpen />);
+		expect(screen.getByText(/Outside the 24-hour window/)).toBeInTheDocument();
+	});
+
 	it('shows rules in plain words when opened', async () => {
 		const user = userEvent.setup();
 		render(<PolicySection {...base} />);

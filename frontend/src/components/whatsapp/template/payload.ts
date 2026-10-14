@@ -1,5 +1,6 @@
 import type {
   TemplateDetail,
+  TemplateDraft,
   WizardEditPayload,
   WizardPayloadButton,
   WizardPayloadHeaderType,
@@ -103,8 +104,10 @@ export function fromTemplateDetail(detail: TemplateDetail): TemplateWizardDraft 
   const variableType: VariableType = detail.parameter_format === 'NAMED' || named ? 'name' : 'number';
 
   const samples: Record<string, string> = {};
+  const named_samples = detail.named_samples?.length ? detail.named_samples : (body.named_samples ?? []);
   extractVariables(body.text, variableType).forEach((token, i) => {
-    samples[token] = body.sample_values[i] ?? '';
+    const named = variableType === 'name' ? named_samples.find((s) => s.name === token)?.example : undefined;
+    samples[token] = named ?? body.sample_values[i] ?? '';
   });
 
   const headerType = String(header?.type ?? '').toLowerCase();
@@ -143,4 +146,24 @@ export function fromTemplateDetail(detail: TemplateDetail): TemplateWizardDraft 
     ttl: category === 'UTILITY' ? (detail.ttl_seconds ?? null) : null,
     samples,
   };
+}
+
+/** The wizard state for a saved draft record, so a draft can be reviewed with the same summary and preview. */
+export function fromDraftPayload(record: Pick<TemplateDraft, 'payload' | 'template_name' | 'language_code' | 'category'>): TemplateWizardDraft {
+  const p = record.payload ?? {};
+  const detail = {
+    template_name: p.template_name ?? record.template_name,
+    language_code: p.language_code ?? record.language_code,
+    category: p.category ?? record.category,
+    parameter_format: p.parameter_format,
+    ttl_seconds: p.ttl_seconds ?? null,
+    named_samples: Object.entries(p.named_samples ?? {}).map(([name, example]) => ({ name, example })),
+    components: {
+      header: p.header_type ? { type: p.header_type, text: p.header ?? '', sample: p.sample ?? '' } : null,
+      body: { text: p.template ?? '', sample_values: (p.sample_values ?? '').split(',').filter(Boolean) },
+      footer: p.footer ? { text: p.footer } : null,
+      buttons: p.buttons ?? [],
+    },
+  };
+  return fromTemplateDetail(detail as unknown as TemplateDetail);
 }

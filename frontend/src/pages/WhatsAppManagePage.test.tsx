@@ -76,7 +76,7 @@ describe('WhatsAppManagePage', () => {
 		open('/');
 		await userEvent.click(await screen.findByRole('link', { name: 'Add app secret' }));
 		await waitFor(() => expect(screen.getByTestId('search')).toHaveTextContent('tab=settings'));
-		expect(await screen.findByText('Edit in gateway settings', { selector: 'a' })).toBeInTheDocument();
+		expect((await screen.findAllByText('Edit in gateway settings', { selector: 'a' })).length).toBeGreaterThan(0);
 		await waitFor(() => expect(Element.prototype.scrollIntoView).toHaveBeenCalled());
 	});
 
@@ -84,6 +84,25 @@ describe('WhatsAppManagePage', () => {
 		open('/');
 		await userEvent.click(await screen.findByRole('link', { name: 'Open WhatsApp' }));
 		await waitFor(() => expect(screen.getByTestId('search')).toHaveTextContent('tab=messages'));
+		expect(screen.getByTestId('search')).toHaveTextContent('send=1');
+	});
+
+	it('the failed-event link carries the event name to Messages', async () => {
+		api.getSetupStatus.mockImplementation(async (name?: string) =>
+			name
+				? { ok: true, data: { success: true, connector_available: true, accounts: [], gateway: gatewayFixture({ name, last_failed_event: { name: 'EV 1', at: '2026-10-14T10:00:00Z' } }) } }
+				: summary()
+		);
+		open('/?gateway=GW-1');
+		const link = await screen.findByRole('link', { name: 'View details' });
+		expect(link).toHaveAttribute('href', '?tab=messages&gateway=GW-1&event=EV%201');
+	});
+
+	it('switching tabs drops one-shot view params', async () => {
+		open('/?tab=templates&gateway=GW-1&new=1');
+		await screen.findByText('templates for GW-1');
+		await userEvent.click(screen.getByRole('tab', { name: 'Messages' }));
+		expect(screen.getByTestId('search')).not.toHaveTextContent('new=1');
 	});
 
 	it('Check now refetches status and runs the token check', async () => {

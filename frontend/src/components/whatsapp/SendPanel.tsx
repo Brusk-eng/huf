@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { ChevronDown, Loader2, Paperclip, Send } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -12,8 +12,30 @@ import {
 import { TemplateSend } from './TemplateSend';
 
 /** Collapsed by default: this tab is a log, not an inbox. */
-export function SendPanel({ gateway, onSent }: { gateway?: string; onSent: () => void }) {
+export function SendPanel({
+  gateway, onSent, openRequested = false, onOpenHandled,
+}: {
+  gateway?: string;
+  onSent: () => void;
+  /** Open the panel (for example from the `#test-message` checklist link). */
+  openRequested?: boolean;
+  /** Called once the request was applied, so the caller can clear it. */
+  onOpenHandled?: () => void;
+}) {
   const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const toRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!openRequested) return;
+    setOpen(true);
+    onOpenHandled?.();
+    const frame = requestAnimationFrame(() => {
+      rootRef.current?.scrollIntoView?.({ block: 'nearest' });
+      toRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [openRequested, onOpenHandled]);
   const [to, setTo] = useState('');
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -64,13 +86,13 @@ export function SendPanel({ gateway, onSent }: { gateway?: string; onSent: () =>
   };
 
   return (
-    <Collapsible open={open} onOpenChange={setOpen} className="rounded-sm border border-line">
+    <Collapsible ref={rootRef} open={open} onOpenChange={setOpen} className="rounded-sm border border-line">
       <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-xs font-medium text-ink">
         Send a message
         <ChevronDown className={`h-4 w-4 text-steel transition-transform ${open ? 'rotate-180' : ''}`} />
       </CollapsibleTrigger>
       <CollapsibleContent className="space-y-3 border-t border-line p-3">
-        <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder="+15551234567" className="max-w-xs font-mono" aria-label="Recipient number" />
+        <Input ref={toRef} value={to} onChange={(e) => setTo(e.target.value)} placeholder="+15551234567" className="max-w-xs font-mono" aria-label="Recipient number" />
         <div className="grid gap-3 lg:grid-cols-3">
           <div className="space-y-1">
             <p className="text-xs font-medium text-ink">Text</p>

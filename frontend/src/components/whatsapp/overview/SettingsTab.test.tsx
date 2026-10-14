@@ -21,12 +21,17 @@ const settings = (connectorAvailable: boolean) =>
 	);
 
 describe('SettingsTab', () => {
+	it('shows the reply rules expanded', () => {
+		settings(true);
+		expect(screen.getByText(/Outside the 24-hour window|Replies after 24 hours/)).toBeInTheDocument();
+	});
+
 	it('has anchor sections, account info and a Desk link', () => {
 		const { container } = settings(true);
 		for (const id of ['credentials', 'app-secret', 'enabled']) expect(container.querySelector(`#${id}`)).not.toBeNull();
 		expect(screen.getByText('Acct-1 (Active)')).toBeInTheDocument();
 		expect(screen.getByText('999')).toBeInTheDocument();
-		const link = screen.getByRole('link', { name: /Edit in gateway settings/ });
+		const link = screen.getAllByRole('link', { name: /Edit in gateway settings/ }).find((a) => a.getAttribute('target') === '_blank')!;
 		expect(link).toHaveAttribute('href', '/app/gateway/GW-1');
 		expect(link).toHaveAttribute('target', '_blank');
 		expect(screen.queryByText(/WhatsApp Business connector app/)).toBeNull();

@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { WhatsAppTemplate } from '@/services/whatsappApi';
 import {
   ALL_OPTION, buildPreviewModel, draftStatusInfo, fillVariables, filterTemplates, insertVariable, nextVariableNumber,
-  parseServerTime, payloadToPreviewInput, qualityInfo, rejectionCopy, rowToPreviewInput, statusInfo, statusToastText, timeAgo,
+  parseServerTime, qualityInfo, rejectionCopy, rowToPreviewInput, statusInfo, statusToastText, timeAgo,
 } from './templateModel';
 
 describe('variables', () => {
@@ -66,7 +66,6 @@ describe('preview model', () => {
     const input = rowToPreviewInput(row);
     expect(input.samples).toEqual(['Ann', 'Bob']);
     expect(input.buttons).toEqual([{ type: 'URL', text: 'Go' }]);
-    expect(payloadToPreviewInput({ template: 'Yo {{1}}', sample_values: 'Z' }).samples).toEqual(['Z']);
   });
 });
 

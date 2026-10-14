@@ -49,6 +49,26 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
   const [reloadKey, setReloadKey] = useState(0);
   const requestId = useRef(0);
 
+  // One-shot links: ?send=1 opens the send panel; ?event=<name> points at a gateway event in the log.
+  const sendRequested = params.get('send') === '1';
+  const eventName = params.get('event') ?? '';
+  const handledEvent = useRef('');
+  const clearParam = useCallback((key: string) => {
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete(key);
+      return next;
+    }, { replace: true });
+  }, [setParams]);
+  const clearSend = useCallback(() => clearParam('send'), [clearParam]);
+  const eventItem = eventName ? items.find((m) => m.event === eventName) : undefined;
+  useEffect(() => {
+    if (!eventItem || handledEvent.current === eventName) return;
+    handledEvent.current = eventName;
+    setSelected(eventItem);
+    document.querySelector(`[data-event="${CSS.escape(eventName)}"]`)?.scrollIntoView?.({ block: 'center' });
+  }, [eventItem, eventName]);
+
   // Text inputs stay local while typing and reach the URL (and the query) after a short pause.
   const [qInput, setQInput] = useState(filters.q);
   const [phoneInput, setPhoneInput] = useState(filters.phone);
@@ -108,7 +128,14 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
 
   return (
     <div className="space-y-3">
-      <SendPanel gateway={gateway} onSent={() => setReloadKey((k) => k + 1)} />
+      <SendPanel gateway={gateway} onSent={() => setReloadKey((k) => k + 1)} openRequested={sendRequested} onOpenHandled={clearSend} />
+
+      {eventName && !loading && !eventItem && (
+        <p role="status" className="flex flex-wrap items-center gap-2 rounded-sm border border-line bg-paper-deep px-3 py-2 text-xs text-steel">
+          Event not in the loaded messages{hasMore ? '. Load more to keep looking.' : '.'}
+          <Button variant="link" size="sm" className="h-auto p-0 text-xs" onClick={() => clearParam('event')}>Dismiss</Button>
+        </p>
+      )}
 
       {!bridgeAvailable && (
         <p role="status" className="rounded-sm border border-line bg-paper-deep px-3 py-2 text-xs text-steel">
@@ -164,7 +191,13 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                 const runPath = agentRunPath(m);
                 const title = agentTitle(m.agent);
                 return (
-                  <TableRow key={m.name} className="cursor-pointer" onClick={() => setSelected(m)}>
+                  <TableRow
+                    key={m.name}
+                    data-event={m.event ?? undefined}
+                    aria-current={eventName && m.event === eventName ? 'true' : undefined}
+                    className={`cursor-pointer ${eventName && m.event === eventName ? 'bg-paper-deep' : ''}`}
+                    onClick={() => setSelected(m)}
+                  >
                     <TableCell className="whitespace-nowrap font-mono text-xs text-steel">{m.creation}</TableCell>
                     <TableCell><Badge variant={m.direction === 'in' ? 'pill-neutral' : 'pill-success'}>{m.direction === 'in' ? 'In' : 'Out'}</Badge></TableCell>
                     <TableCell className="text-xs">

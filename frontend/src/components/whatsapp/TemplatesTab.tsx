@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { Loader2, Plus, RefreshCw, Search } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
@@ -13,7 +14,7 @@ import {
 import { usePermissions } from '@/contexts/PermissionsContext';
 import { useSocket } from '@/contexts/SocketContext';
 import {
-  deleteTemplate, errorText, isBridgeUnavailable, listTemplateDrafts, listTemplates, syncTemplates,
+  deleteTemplate, errorText, getTemplate, isBridgeUnavailable, listTemplateDrafts, listTemplates, syncTemplates,
   type TemplateDetail, type TemplateDraft, type WhatsAppTemplate,
 } from '@/services/whatsappApi';
 import { BridgeUnavailable, LoadError } from './BridgeUnavailable';
@@ -22,14 +23,14 @@ import { DraftsPanel } from './DraftsPanel';
 import { ManagerLink } from './ManagerLink';
 import { SendTemplateDialog } from './SendTemplateDialog';
 import { TemplateDetailPane } from './TemplateDetailPane';
-import { TemplateEditor } from './TemplateEditor';
+import { fromTemplateDetail } from './template/payload';
+import { TemplateWizard, type WizardResult } from './TemplateWizard';
 import {
   ALL_OPTION, OPEN_DRAFT_STATUSES, TEMPLATE_STATUSES, filterTemplates, statusInfo, statusToastText, type TemplateFilters,
 } from './templateModel';
 
 const STATUS_EVENT = 'whatsapp_template_status';
 
-type View = { kind: 'browse' } | { kind: 'create' } | { kind: 'edit'; detail: TemplateDetail };
 
 export function TemplatesTab({ gateway }: { gateway?: string }) {
   const { hufRole } = usePermissions();
@@ -43,7 +44,12 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
   const [error, setError] = useState('');
   const [unavailable, setUnavailable] = useState(false);
   const [syncing, setSyncing] = useState(false);
-  const [view, setView] = useState<View>({ kind: 'browse' });
+  // The wizard is addressed by the URL (?new=1 or ?edit=<name>) so it can be linked and survives a reload.
+  const [params, setParams] = useSearchParams();
+  const creating = params.get('new') === '1';
+  const editName = params.get('edit') ?? '';
+  const [editDetail, setEditDetail] = useState<TemplateDetail | null>(null);
+  const [editError, setEditError] = useState('');
   const [section, setSection] = useState('templates');
   const [selected, setSelected] = useState('');
   const [refreshKey, setRefreshKey] = useState(0);
@@ -105,6 +111,51 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
     };
   }, [socket, load, loadDrafts, rowsRef]);
 
+  const openWizard = useCallback((patch: { new?: string; edit?: string }) => {
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('new');
+      next.delete('edit');
+      for (const [k, v] of Object.entries(patch)) if (v) next.set(k, v);
+      return next;
+    });
+  }, [setParams]);
+  const closeWizard = useCallback(() => {
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('new');
+      next.delete('edit');
+      return next;
+    });
+  }, [setParams]);
+
+  // Fetch the template behind ?edit= (also gives the wizard its remaining edits).
+  const loadEdit = useCallback(async () => {
+    if (!editName) return;
+    setEditError('');
+    const res = await getTemplate(editName);
+    if (res.success) setEditDetail(res);
+    else if (isBridgeUnavailable(res)) setUnavailable(true);
+    else setEditError(errorText(res));
+  }, [editName]);
+  useEffect(() => {
+    if (editName && editDetail?.name !== editName) void loadEdit();
+  }, [editName, editDetail, loadEdit]);
+
+  const onWizardDone = (result: WizardResult) => {
+    closeWizard();
+    setEditDetail(null);
+    if (result.kind === 'draft') {
+      setSection('drafts');
+      void loadDrafts();
+    } else {
+      setSelected(result.name);
+      setSection('templates');
+      setRefreshKey((k) => k + 1);
+      void load();
+    }
+  };
+
   const sync = async () => {
     if (!gateway) return;
     setSyncing(true);
@@ -137,27 +188,29 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
 
   if (unavailable) return <BridgeUnavailable />;
 
-  if (view.kind !== 'browse') {
+  if (creating || editName) {
+    const initial = editDetail?.name === editName ? editDetail : null;
     return (
-      <TemplateEditor
-        mode={view.kind}
-        gateway={gateway}
-        detail={view.kind === 'edit' ? view.detail : undefined}
-        isAdmin={isAdmin}
-        onCancel={() => setView({ kind: 'browse' })}
-        onSaved={(result) => {
-          setView({ kind: 'browse' });
-          if (result.kind === 'draft') {
-            setSection('drafts');
-            void loadDrafts();
-          } else {
-            if (result.kind === 'submitted') setSelected(result.name);
-            setSection('templates');
-            setRefreshKey((k) => k + 1);
-            void load();
-          }
-        }}
-      />
+      <div className="space-y-4">
+        {creating ? (
+          <TemplateWizard gatewayName={gateway ?? ''} isAdmin={isAdmin} onDone={onWizardDone} onCancel={closeWizard} />
+        ) : initial ? (
+          <TemplateWizard
+            key={initial.name}
+            gatewayName={gateway ?? ''}
+            isAdmin={isAdmin}
+            initial={fromTemplateDetail(initial)}
+            docName={initial.name}
+            editsLeft={initial.edits_left}
+            onDone={onWizardDone}
+            onCancel={closeWizard}
+          />
+        ) : editError ? (
+          <LoadError message={editError} onRetry={loadEdit} />
+        ) : (
+          <div className="flex items-center gap-2 text-xs text-steel"><Loader2 className="h-4 w-4 animate-spin" /> Loading template...</div>
+        )}
+      </div>
     );
   }
 
@@ -178,7 +231,7 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
               {syncing ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
               Sync
             </Button>
-            <Button size="sm" onClick={() => setView({ kind: 'create' })}>
+            <Button size="sm" onClick={() => openWizard({ new: '1' })}>
               <Plus className="mr-1.5 h-4 w-4" /> {isAdmin ? 'New template' : 'Request template'}
             </Button>
           </div>
@@ -193,7 +246,7 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
             <div className="space-y-3 rounded-sm border border-line p-8 text-center">
               <p className="text-sm font-medium text-ink">No templates yet</p>
               <p className="text-xs text-steel">Create your first message template, or sync the ones you already have in WhatsApp.</p>
-              <Button size="sm" onClick={() => setView({ kind: 'create' })}>
+              <Button size="sm" onClick={() => openWizard({ new: '1' })}>
                 <Plus className="mr-1.5 h-4 w-4" /> {isAdmin ? 'New template' : 'Request template'}
               </Button>
             </div>
@@ -267,7 +320,7 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
                     row={current}
                     refreshKey={refreshKey}
                     onSend={setToSend}
-                    onEdit={(detail) => setView({ kind: 'edit', detail })}
+                    onEdit={(detail) => { setEditDetail(detail); openWizard({ edit: detail.name }); }}
                     onDelete={setToDelete}
                     onUnavailable={() => setUnavailable(true)}
                   />

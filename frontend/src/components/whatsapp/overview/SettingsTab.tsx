@@ -44,6 +44,7 @@ export function SettingsTab({ gateway, accounts, connectorAvailable, onCheckToke
 				fallbackTemplateApproved={gateway.fallback_template_approved}
 				policy={gateway.policy}
 				editHref={settingsHref}
+				defaultOpen
 			/>
 			<Card id="enabled" className="scroll-mt-4">
 				<CardHeader>

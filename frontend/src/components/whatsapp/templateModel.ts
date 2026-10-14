@@ -2,8 +2,6 @@ import {
   extractPlaceholders,
   type HeaderType,
   type TemplateButton,
-  type TemplatePayload,
-  type TemplateDetail,
   type WhatsAppTemplate,
 } from '@/services/whatsappApi';
 
@@ -139,19 +137,6 @@ export function buildPreviewModel(input: PreviewInput): PreviewModel {
   };
 }
 
-export function detailToPreviewInput(detail: TemplateDetail): PreviewInput {
-  const { header, body, footer, buttons } = detail.components;
-  return {
-    headerType: header?.type ?? '',
-    header: header?.text,
-    headerSample: header?.sample,
-    body: body.text,
-    samples: body.sample_values,
-    footer: footer?.text,
-    buttons,
-  };
-}
-
 const LIST_BUTTON_TYPES: Record<string, TemplateButton['type']> = {
   'Quick Reply': 'QUICK_REPLY',
   'Visit Website': 'URL',
@@ -211,19 +196,6 @@ export function timeAgo(value?: string | null, now: Date = new Date()): string {
   if (hours < 24) return `${hours} h ago`;
   const days = Math.round(hours / 24);
   return `${days} d ago`;
-}
-
-/** Preview input for a saved draft payload. */
-export function payloadToPreviewInput(payload: Partial<TemplatePayload>): PreviewInput {
-  return {
-    headerType: payload.header_type ?? '',
-    header: payload.header,
-    headerSample: payload.sample,
-    body: payload.template ?? '',
-    samples: (payload.sample_values ?? '').split(',').filter(Boolean),
-    footer: payload.footer,
-    buttons: payload.buttons,
-  };
 }
 
 export const OPEN_DRAFT_STATUSES = ['Draft', 'Pending Review', 'Failed'];
