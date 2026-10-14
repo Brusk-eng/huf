@@ -181,7 +181,7 @@ describe('buttons', () => {
     expect(withButtons([btn('PHONE_NUMBER', { phoneNumber: '5551234' })])['buttons.0.phoneNumber']).toMatch(/international/);
     expect(withButtons([btn('PHONE_NUMBER', { phoneNumber: '+1 (555) 123-4567' })])).toEqual({});
     expect(withButtons([btn('COPY_CODE')])['buttons.0.codeExample']).toMatch(/Add an example/);
-    expect(withButtons([btn('COPY_CODE', { codeExample: 'a'.repeat(16) })])['buttons.0.codeExample']).toMatch(/15/);
+    expect(withButtons([btn('COPY_CODE', { codeExample: 'a'.repeat(21) })])['buttons.0.codeExample']).toMatch(/20/);
     expect(withButtons([btn('COPY_CODE', { codeExample: 'no spaces' })])['buttons.0.codeExample']).toBeDefined();
   });
 });
@@ -191,7 +191,7 @@ describe('ttl', () => {
     expect(validateDraft(valid({ category: 'MARKETING', ttl: 3600 })).ttl).toMatch(/Utility/);
     expect(validateDraft(valid({ category: 'UTILITY', ttl: 3600 }))).toEqual({});
     expect(validateDraft(valid({ category: 'UTILITY', ttl: 29 })).ttl).toMatch(/between/);
-    expect(validateDraft(valid({ category: 'UTILITY', ttl: 30 * 86400 + 1 })).ttl).toMatch(/between/);
+    expect(validateDraft(valid({ category: 'UTILITY', ttl: 12 * 3600 + 1 })).ttl).toMatch(/between/);
     expect(validateDraft(valid({ category: 'UTILITY', ttl: null }))).toEqual({});
   });
 });

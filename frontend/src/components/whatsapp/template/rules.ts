@@ -16,9 +16,9 @@ export const WIZARD_LIMITS = {
   phoneButtons: 1,
   copyCodeButtons: 1,
   url: 2000,
-  copyCode: 15,
+  copyCode: 20,
   ttlMin: 30,
-  ttlMax: 30 * 24 * 60 * 60,
+  ttlMax: 12 * 60 * 60,
 } as const;
 
 /** {fieldPath: message}. Paths: name, language, header.text, header.mediaSample, body, footer, buttons, buttons.<i>.<field>, ttl, samples.<key>. */
@@ -214,7 +214,7 @@ export function validateDraft(draft: TemplateWizardDraft): FieldErrors {
   if (draft.ttl !== null) {
     if (draft.category !== 'UTILITY') errors.ttl = 'Message validity can only be set on Utility templates.';
     else if (!Number.isInteger(draft.ttl) || draft.ttl < WIZARD_LIMITS.ttlMin || draft.ttl > WIZARD_LIMITS.ttlMax) {
-      errors.ttl = 'Message validity must be between 30 seconds and 30 days.';
+      errors.ttl = 'Message validity must be between 30 seconds and 12 hours.';
     }
   }
   return errors;
