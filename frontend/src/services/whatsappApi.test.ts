@@ -174,6 +174,23 @@ describe('gateway-scoped calls', () => {
     }
   });
 
+  it('sends the wizard payload (named variables, video header, copy code, ttl) as JSON', async () => {
+    await createTemplate('GW-A', {
+      template_name: 'a_b',
+      category: 'UTILITY',
+      language_code: 'en_US',
+      template: 'Hi {{first_name}}, code below',
+      parameter_format: 'NAMED',
+      named_samples: { first_name: 'Ann' },
+      header_type: 'VIDEO',
+      sample: 'https://example.com/a.mp4',
+      buttons: [{ type: 'COPY_CODE', text: 'Copy code', example: 'SAVE20' }],
+      ttl_seconds: 3600,
+    });
+    const args = post.mock.calls[0][1] as { payload: string };
+    expect(JSON.parse(args.payload)).toMatchObject({ parameter_format: 'NAMED', ttl_seconds: 3600, header_type: 'VIDEO' });
+  });
+
   it('sends templates from a gateway and no longer passes an account', async () => {
     await sendTemplateMessage({ gateway_name: 'GW-B', to: '15551234567', template_name: 'welcome', body_params: ['Ann'] });
     const [method, args] = post.mock.calls[0] as [string, Record<string, unknown>];

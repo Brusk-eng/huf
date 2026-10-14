@@ -103,6 +103,9 @@ export interface TemplateDetail {
     last_event_at: string | null;
     last_meta_update: string | null;
   };
+  /** Present once the server reports variable style and validity (wizard edit mode). */
+  parameter_format?: 'POSITIONAL' | 'NAMED';
+  ttl_seconds?: number | null;
   editable: boolean;
   editable_reason?: string;
   editable_message?: string;
@@ -163,6 +166,39 @@ export interface TemplatePayload {
 
 export type EditTemplatePayload = Omit<TemplatePayload, 'template_name' | 'language_code' | 'header_type'> & {
   header_type?: HeaderType | '';
+};
+
+/** Wizard payload (three-step flow). Extends the flat payload with named variables, video/location headers, copy-code buttons and TTL. */
+export type WizardPayloadHeaderType = HeaderType | 'VIDEO' | 'LOCATION';
+export interface WizardPayloadButton {
+  type: TemplateButtonType | 'COPY_CODE';
+  text: string;
+  url?: string;
+  /** URL buttons: example full link. COPY_CODE: example code. */
+  example?: string;
+  phone_number?: string;
+}
+export interface WizardTemplatePayload {
+  template_name: string;
+  category: TemplateCategory;
+  language_code: string;
+  template: string;
+  parameter_format: 'POSITIONAL' | 'NAMED';
+  /** POSITIONAL: body samples in order, comma-joined. */
+  sample_values?: string;
+  /** NAMED: body sample per variable name. */
+  named_samples?: Record<string, string>;
+  header_type?: WizardPayloadHeaderType;
+  header?: string;
+  /** Text header variable example, or media sample (link / uploaded path). */
+  sample?: string;
+  footer?: string;
+  buttons?: WizardPayloadButton[];
+  /** Utility only: message validity in seconds. */
+  ttl_seconds?: number;
+}
+export type WizardEditPayload = Omit<WizardTemplatePayload, 'template_name' | 'language_code' | 'header_type'> & {
+  header_type?: WizardPayloadHeaderType | '';
 };
 
 export type HeaderParam = string | { type: 'image' | 'document' | 'video'; link: string; filename?: string };
@@ -403,7 +439,7 @@ export const listTemplates = (gatewayName: string, status?: string) =>
 
 export const getTemplate = (name: string) => invoke<TemplateDetail>('get_template', { name }, 'get');
 
-export const editTemplate = (name: string, payload: EditTemplatePayload) =>
+export const editTemplate = (name: string, payload: EditTemplatePayload | WizardEditPayload) =>
   invoke<{ name: string; status?: string; edits_left?: number | null }>(
     'edit_template',
     { name, payload: JSON.stringify(payload) },
@@ -413,7 +449,7 @@ export const editTemplate = (name: string, payload: EditTemplatePayload) =>
 export const listTemplateDrafts = (gatewayName: string, status?: string) =>
   invoke<{ drafts: TemplateDraft[] }>('list_template_drafts', { gateway_name: gatewayName, status }, 'get');
 
-export const createTemplateDraft = (gatewayName: string, payload: TemplatePayload) =>
+export const createTemplateDraft = (gatewayName: string, payload: TemplatePayload | WizardTemplatePayload) =>
   invoke<{ name: string; status: string; draft: TemplateDraft }>(
     'create_template_draft',
     { gateway_name: gatewayName, payload: JSON.stringify(payload) },
@@ -430,7 +466,7 @@ export const approveTemplateDraft = (name: string, note?: string) =>
 export const rejectTemplateDraft = (name: string, note?: string) =>
   invoke<{ name: string; status: string }>('reject_template_draft', { name, note }, 'post');
 
-export const createTemplate = (gatewayName: string, payload: TemplatePayload) =>
+export const createTemplate = (gatewayName: string, payload: TemplatePayload | WizardTemplatePayload) =>
   invoke<{ name: string; status?: string; id?: string }>(
     'create_template',
     { gateway_name: gatewayName, payload: JSON.stringify(payload) },
