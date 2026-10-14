@@ -257,6 +257,12 @@ doc_events = {
         "on_trash": ["huf.ai.agent_hooks.run_hooked_agents", "huf.ai.automation_hooks.run_hooked_automations"],
         "after_delete": ["huf.ai.agent_hooks.run_hooked_agents", "huf.ai.automation_hooks.run_hooked_automations"],
     },
+    "WhatsApp Templates": {
+        "before_validate": "huf.ai.gateway_adapters.whatsapp_template_guard.guard_template_write",
+        "validate": "huf.ai.gateway_adapters.whatsapp_template_guard.guard_template_write",
+        "before_save": "huf.ai.gateway_adapters.whatsapp_template_guard.guard_template_write",
+        "on_trash": "huf.ai.gateway_adapters.whatsapp_template_guard.guard_template_write",
+    },
     "User": {
         "on_update": "huf.huf.doctype.huf_user_role.huf_user_role.sync_from_frappe_user",
     },
