@@ -26,12 +26,16 @@ export const CHECK_LABELS = {
 } as const;
 
 export const REASON_FALLBACK: Record<string, string> = {
-	token_invalid: 'Blocked: the access token is invalid or expired.',
+	access_token_missing: 'Blocked: add the access token from Meta.',
+	phone_number_id_missing: 'Blocked: add the phone number ID from Meta.',
+	verify_token_missing: "Add the verify token so Meta can confirm this gateway's callback URL.",
 	app_secret_missing: 'Add the app secret so we can confirm messages really come from Meta.',
-	never_received:
+	account_phone_mismatch: 'This number belongs to a different WhatsApp account than the one linked.',
+	delivery_failures: 'Some replies are failing to send.',
+	recent_error: 'The last message ran into an error.',
+	fallback_template_unavailable: 'Replies after 24 hours will fail until the fallback template is approved.',
+	no_events_yet:
 		"Meta hasn't sent us anything yet. Check the callback URL and that the messages field is subscribed.",
-	wrong_number: 'This number belongs to a different WhatsApp account than the one linked.',
-	unrouted: 'Messages arrived for a number no gateway uses.',
 };
 
 export function degradedFallback(failed: number): string {

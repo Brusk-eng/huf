@@ -68,12 +68,12 @@ describe('HealthBanner', () => {
 	it('blocked: destructive alert with a single next-step link', () => {
 		view(gw({
 			health: 'blocked',
-			reasons: [{ code: 'token_invalid', severity: 'error', message: '' }],
+			reasons: [{ code: 'access_token_missing', severity: 'error', message: '' }],
 			next_step: { code: 'token', label: 'Update token', action_url: 'https://developers.facebook.com/apps' },
 		}));
 		const alert = screen.getByRole('alert');
 		expect(alert).toHaveClass('bg-destructive-tint');
-		expect(alert).toHaveTextContent('Blocked: the access token is invalid or expired.');
+		expect(alert).toHaveTextContent('Blocked: add the access token from Meta.');
 		const link = screen.getByRole('link', { name: /Update token/ });
 		expect(link).toHaveAttribute('href', 'https://developers.facebook.com/apps');
 		expect(link).toHaveAttribute('target', '_blank');

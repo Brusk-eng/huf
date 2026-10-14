@@ -1,91 +1,195 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
 import { PageFrame } from '@/layouts/PageFrame';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { errorText, getSetupStatus, isBridgeUnavailable, type SetupStatus } from '@/services/whatsappApi';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  checkToken,
+  getSetupStatus,
+  type GatewayHealthStatus,
+  type SetupStatusResponse,
+  type TokenCheckSummary,
+} from '@/services/whatsappHealthApi';
 import { BridgeUnavailable, LoadError } from '@/components/whatsapp/BridgeUnavailable';
-import { SetupTab } from '@/components/whatsapp/SetupTab';
 import { TemplatesTab } from '@/components/whatsapp/TemplatesTab';
 import { MessageLogTab } from '@/components/whatsapp/MessageLogTab';
-import { Badge } from '@/components/ui/badge';
+import { GatewaySwitcher } from '@/components/whatsapp/overview/GatewaySwitcher';
+import { OverviewTab } from '@/components/whatsapp/overview/OverviewTab';
+import { SettingsTab } from '@/components/whatsapp/overview/SettingsTab';
+
+const TABS = ['overview', 'messages', 'templates', 'settings'] as const;
+type TabName = (typeof TABS)[number];
+
+/** In-app checklist anchors: Settings sections, or the Messages tab for the test message. */
+const SETTINGS_ANCHORS = new Set(['credentials', 'app-secret', 'enabled']);
+
+const asTab = (v: string | null): TabName => (TABS.find((t) => t === v) ?? 'overview');
 
 export default function WhatsAppManagePage() {
   const [params, setParams] = useSearchParams();
-  const tab = params.get('tab') === 'templates' || params.get('tab') === 'setup' ? params.get('tab')! : 'messages';
+  const tab = asTab(params.get('tab'));
   const gatewayParam = params.get('gateway') || undefined;
-  const [status, setStatus] = useState<SetupStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [unavailable, setUnavailable] = useState(false);
-  const [selectedGateway, setSelectedGateway] = useState<string | undefined>(gatewayParam);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError('');
+  const [summary, setSummary] = useState<SetupStatusResponse | null>(null);
+  const [summaryError, setSummaryError] = useState('');
+  const [detail, setDetail] = useState<SetupStatusResponse | null>(null);
+  const [detailError, setDetailError] = useState('');
+  const [tokenCheck, setTokenCheck] = useState<{ gateway: string; result: TokenCheckSummary } | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [anchor, setAnchor] = useState<string | null>(null);
+  const detailRequest = useRef(0);
+
+  const loadSummary = useCallback(async () => {
+    setSummaryError('');
     const res = await getSetupStatus();
-    if (res.success) {
-      setStatus(res);
-      setUnavailable(!res.bridge_available);
-    } else if (isBridgeUnavailable(res)) setUnavailable(true);
-    else setError(errorText(res));
-    setLoading(false);
+    if (res.ok) setSummary(res.data);
+    else setSummaryError(res.error);
+  }, []);
+  useEffect(() => { void loadSummary(); }, [loadSummary]);
+
+  const gateways = summary?.gateways ?? [];
+  const gateway = (gateways.find((g) => g.name === gatewayParam) ?? gateways[0])?.name;
+
+  const update = useCallback((patch: { tab?: TabName; gateway?: string }) => {
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (patch.tab) next.set('tab', patch.tab);
+      if (patch.gateway) next.set('gateway', patch.gateway);
+      return next;
+    }, { replace: true });
+  }, [setParams]);
+
+  // Keep the resolved gateway in the URL so reloads and shared links land on the same one.
+  useEffect(() => {
+    if (gateway && gateway !== gatewayParam) update({ gateway });
+  }, [gateway, gatewayParam, update]);
+
+  const loadDetail = useCallback(async (name: string) => {
+    const id = ++detailRequest.current;
+    setDetailError('');
+    const res = await getSetupStatus(name);
+    if (id !== detailRequest.current) return;
+    if (res.ok && res.data.gateway) setDetail(res.data);
+    else setDetailError(res.ok ? 'Could not load this gateway.' : res.error);
+  }, []);
+  useEffect(() => {
+    setDetail(null);
+    if (gateway) void loadDetail(gateway);
+  }, [gateway, loadDetail]);
+
+  const runTokenCheck = useCallback(async (name: string): Promise<TokenCheckSummary> => {
+    const res = await checkToken(name);
+    if (!res.ok) throw new Error(res.error);
+    const result = res.data as TokenCheckSummary;
+    setTokenCheck({ gateway: name, result });
+    return result;
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  const onCheck = async () => {
+    if (!gateway) return;
+    setChecking(true);
+    await loadDetail(gateway);
+    try {
+      await runTokenCheck(gateway);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not check the token.');
+    }
+    setChecking(false);
+  };
 
-  // Every tab acts for exactly one gateway: nothing is listed or sent across WhatsApp accounts.
-  const gateway = (status?.gateways.find((g) => g.name === selectedGateway) ?? status?.gateways[0])?.name;
+  const health: GatewayHealthStatus | null = detail?.gateway
+    ? { ...detail.gateway, token_check: tokenCheck?.gateway === gateway ? tokenCheck.result : detail.gateway.token_check }
+    : null;
+  const settingsHref = gateway ? `/app/gateway/${encodeURIComponent(gateway)}` : '';
+  const connectorAvailable = summary?.connector_available ?? true;
 
-  const current = status?.gateways.find((g) => g.name === gateway);
+  // Checklist and next-step links like "#credentials" jump to the matching tab and section.
+  const onAnchorClick = (e: MouseEvent) => {
+    const link = (e.target as HTMLElement).closest('a');
+    const id = link?.hash.slice(1);
+    if (!link || !id || link.pathname !== window.location.pathname || link.target === '_blank') return;
+    if (SETTINGS_ANCHORS.has(id)) update({ tab: 'settings' });
+    else if (id === 'test-message') update({ tab: 'messages' });
+    else return;
+    e.preventDefault();
+    if (SETTINGS_ANCHORS.has(id)) setAnchor(id);
+  };
+  useEffect(() => {
+    if (!anchor || tab !== 'settings' || !health) return;
+    const frame = requestAnimationFrame(() => {
+      document.getElementById(anchor)?.scrollIntoView?.({ block: 'start' });
+      setAnchor(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [anchor, tab, health]);
+
+  const loadingSummary = !summary && !summaryError;
+  const gatewayQuery = gateway ? `&gateway=${encodeURIComponent(gateway)}` : '';
 
   return (
     <PageFrame
       title="Manage WhatsApp"
       actions={
-        status && status.gateways.length > 0 ? (
-          <Select value={gateway} onValueChange={setSelectedGateway}>
-            <SelectTrigger className="w-56" aria-label="WhatsApp gateway"><SelectValue placeholder="Choose a gateway" /></SelectTrigger>
-            <SelectContent>
-              {status.gateways.map((g) => <SelectItem key={g.name} value={g.name}>{g.name}</SelectItem>)}
-            </SelectContent>
-          </Select>
-        ) : undefined
+        summary ? <GatewaySwitcher gateways={gateways} value={gateway} onChange={(g) => update({ gateway: g })} /> : undefined
       }
     >
-      <div className="space-y-3 p-4">
-        {loading ? (
-          <div className="flex items-center gap-2 text-xs text-steel"><Loader2 className="h-4 w-4 animate-spin" /> Loading...</div>
-        ) : error ? (
-          <LoadError message={error} onRetry={load} />
+      <div className="space-y-3 p-4" onClickCapture={onAnchorClick}>
+        {summaryError ? (
+          <LoadError message={summaryError} onRetry={loadSummary} />
+        ) : loadingSummary ? (
+          <Skeleton className="h-40" />
         ) : (
-          <>
-            {current && (
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-steel">
-                <Badge variant={current.enabled ? 'pill-success' : 'pill-neutral'}>{current.enabled ? 'Enabled' : 'Disabled'}</Badge>
-                <span className="font-mono">{current.phone_number_id || 'No phone number set'}</span>
-                <span>Replies outside the 24-hour window: {current.fallback_template ? `sent as template ${current.fallback_template}` : 'no fallback template, so they fail'}</span>
-              </div>
+          <Tabs value={tab} onValueChange={(v) => update({ tab: asTab(v) })}>
+            <TabsList className="w-full justify-start overflow-x-auto sm:w-auto">
+              <TabsTrigger value="overview">Overview</TabsTrigger>
+              <TabsTrigger value="messages">Messages</TabsTrigger>
+              <TabsTrigger value="templates">Templates</TabsTrigger>
+              <TabsTrigger value="settings">Settings</TabsTrigger>
+            </TabsList>
+            {!gateway ? (
+              <p className="pt-4 text-xs text-steel">Add a WhatsApp gateway to see its health, messages and templates.</p>
+            ) : (
+              <>
+                <TabsContent value="overview" className="pt-3">
+                  {detailError ? (
+                    <LoadError message={detailError} onRetry={() => loadDetail(gateway)} />
+                  ) : (
+                    <OverviewTab
+                      gateway={health}
+                      loading={!health}
+                      checking={checking}
+                      onCheck={onCheck}
+                      onTurnOn={() => window.open(settingsHref, '_blank', 'noopener,noreferrer')}
+                      settingsHref={settingsHref}
+                      failedEventHref={() => `?tab=messages${gatewayQuery}`}
+                    />
+                  )}
+                </TabsContent>
+                <TabsContent value="messages" className="pt-3">
+                  <MessageLogTab gateway={gateway} bridgeAvailable={connectorAvailable} />
+                </TabsContent>
+                <TabsContent value="templates" className="pt-3">
+                  {connectorAvailable ? <TemplatesTab gateway={gateway} /> : <BridgeUnavailable />}
+                </TabsContent>
+                <TabsContent value="settings" className="pt-3">
+                  {detailError ? (
+                    <LoadError message={detailError} onRetry={() => loadDetail(gateway)} />
+                  ) : health ? (
+                    <SettingsTab
+                      gateway={health}
+                      accounts={detail?.accounts ?? []}
+                      connectorAvailable={connectorAvailable}
+                      onCheckToken={() => runTokenCheck(gateway)}
+                      settingsHref={settingsHref}
+                    />
+                  ) : (
+                    <Skeleton className="h-64" />
+                  )}
+                </TabsContent>
+              </>
             )}
-            <Tabs value={tab} onValueChange={(v) => setParams((prev) => { const next = new URLSearchParams(); if (prev.get('gateway')) next.set('gateway', prev.get('gateway')!); next.set('tab', v); return next; }, { replace: true })}>
-              <TabsList>
-                <TabsTrigger value="messages">Messages</TabsTrigger>
-                <TabsTrigger value="templates">Templates</TabsTrigger>
-                <TabsTrigger value="setup">Setup</TabsTrigger>
-              </TabsList>
-              <TabsContent value="messages" className="pt-3">
-                <MessageLogTab gateway={gateway} bridgeAvailable={!unavailable} />
-              </TabsContent>
-              <TabsContent value="templates" className="pt-3">
-                {unavailable ? <BridgeUnavailable /> : <TemplatesTab gateway={gateway} />}
-              </TabsContent>
-              <TabsContent value="setup" className="pt-3">
-                {status ? <SetupTab status={status} /> : null}
-                {unavailable && <div className="mt-6"><BridgeUnavailable /></div>}
-              </TabsContent>
-            </Tabs>
-          </>
+          </Tabs>
         )}
       </div>
     </PageFrame>

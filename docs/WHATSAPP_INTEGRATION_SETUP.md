@@ -98,6 +98,18 @@ Huf never guesses an account for a gateway. Every gateway-side action (inbound m
 
 ---
 
+## Overview and Settings
+
+Open Manage WhatsApp and pick a gateway at the top right. The page has four tabs, and the tab and gateway are kept in the URL (`?tab=`, `?gateway=`) so links and reloads land in the same place.
+
+- **Overview** (default): a health banner (working, needs attention, blocked, not set up, turned off) with a "Check now" button that refreshes the status and checks the access token with Meta, the setup checklist, the callback URL and verify token details, and the last 24 hours of activity.
+- **Messages** and **Templates**: the message log and template management. They need the optional WhatsApp Business connector app; without it these two tabs say so and everything else keeps working.
+- **Settings**: credentials status and the token check, reply rules (fallback template and who can message), the linked WhatsApp account, and an "Edit in gateway settings" link to the Gateway form.
+
+Checklist steps that point at credentials, the app secret or the on/off switch jump to the matching Settings section.
+
+---
+
 ## 3. Setup steps
 
 ### 3.1 Integration Settings (credentials)
