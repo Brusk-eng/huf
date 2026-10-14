@@ -5,6 +5,8 @@ import { Input } from './ui/input';
 import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import { buildBranchOptionLabels, findUpstreamNodeIds } from '@/lib/flowBranchTargets';
+import { isInvalidJsonString } from '@/lib/flowHttpJson';
 import { Label } from './ui/label';
 import { Combobox } from './ui/combobox';
 import { Checkbox } from './ui/checkbox';
@@ -695,6 +697,10 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                 const otherNodes = (activeFlow?.nodes || []).filter((n) => n.id !== selectedNodeId);
                 const currentValue = value || '';
                 const isMissing = currentValue && !otherNodes.some((n) => n.id === currentValue);
+                // Upstream targets stay selectable (a deliberate loop is legitimate in a
+                // loop node) but are marked, so a cycle is never offered silently.
+                const upstreamIds = findUpstreamNodeIds(activeFlow?.edges || [], selectedNodeId);
+                const optionLabels = buildBranchOptionLabels(otherNodes, upstreamIds);
                 return (
                   <Select value={currentValue} onValueChange={onChange}>
                     <SelectTrigger id={id}>
@@ -708,7 +714,7 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                       )}
                       {otherNodes.map((n) => (
                         <SelectItem key={n.id} value={n.id}>
-                          {n.data.label || n.id}
+                          {optionLabels.get(n.id)}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -1200,6 +1206,11 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                         }}
                         placeholder='{"Authorization": "Bearer {{token}}"}'
                       />
+                      {isInvalidJsonString(config.headers) && (
+                        <p className="text-[10px] text-destructive mt-1">
+                          Not valid JSON — saved as plain text.
+                        </p>
+                      )}
                     </div>
                     <div>
                       <Label htmlFor="http-body" size="sm">Body</Label>
@@ -1218,6 +1229,11 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                         }}
                         placeholder='{"key": "{{context.value}}"}'
                       />
+                      {isInvalidJsonString(config.body) && (
+                        <p className="text-[10px] text-destructive mt-1">
+                          Not valid JSON — saved as plain text.
+                        </p>
+                      )}
                     </div>
                     <div>
                       <Label htmlFor="http-timeout" size="sm">Timeout (seconds)</Label>
@@ -1269,8 +1285,9 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                           </Button>
                         </div>
                         <div>
-                          <Label size="sm">Source field</Label>
+                          <Label htmlFor={`transform-${i}-source`} size="sm">Source field</Label>
                           <Input
+                            id={`transform-${i}-source`}
                             value={t.source_field || ''}
                             onChange={(e) => {
                               const updated = [...transformations];
@@ -1282,8 +1299,9 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                           />
                         </div>
                         <div>
-                          <Label size="sm">Target field</Label>
+                          <Label htmlFor={`transform-${i}-target`} size="sm">Target field</Label>
                           <Input
+                            id={`transform-${i}-target`}
                             value={t.target_field || ''}
                             onChange={(e) => {
                               const updated = [...transformations];
@@ -1295,7 +1313,7 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                           />
                         </div>
                         <div>
-                          <Label size="sm">Operation</Label>
+                          <Label htmlFor={`transform-${i}-operation`} size="sm">Operation</Label>
                           <Select
                             value={t.operation || 'copy'}
                             onValueChange={(v) => {
@@ -1304,7 +1322,7 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
                               handleUpdateActionConfig('transformations', updated);
                             }}
                           >
-                            <SelectTrigger size="sm">
+                            <SelectTrigger id={`transform-${i}-operation`} size="sm">
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
