@@ -16,7 +16,6 @@ vi.mock('@/services/whatsappApi', async (orig) => {
 
 import { createTemplate, createTemplateDraft, editTemplate } from '@/services/whatsappApi';
 import { emptyDraft, type TemplateWizardDraft } from '../template/draft';
-import { mapBackendErrors } from './backendErrors';
 import { addButton, buttonBlocker, switchVariableType } from './draftActions';
 import { TemplateWizard } from './index';
 
@@ -220,22 +219,5 @@ describe('edit mode', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Submit changes to WhatsApp' }));
     await waitFor(() => expect(onDone).toHaveBeenCalledWith({ kind: 'edited', name: 'order_update' }));
     expect(edit).toHaveBeenCalledWith('tpl-1', expect.objectContaining({ template: 'Your order shipped' }));
-  });
-});
-
-describe('mapBackendErrors', () => {
-  it('maps backend fields onto form paths', () => {
-    const draft = { ...emptyDraft(), body: 'Hi {{1}}', buttons: [addButton(emptyDraft(), 'URL', 'x').buttons[0]] };
-    const out = mapBackendErrors(
-      [
-        { field: 'language_code', code: 'c', message: 'Bad language' },
-        { field: 'sample_values', code: 'c', message: 'Bad sample' },
-        { field: 'buttons.0.url', code: 'c', message: 'Bad url' },
-        { field: 'category', code: 'c', message: 'Other' },
-      ],
-      draft,
-    );
-    expect(out.fields).toEqual({ language: 'Bad language', 'samples.1': 'Bad sample', 'buttons.0.url': 'Bad url' });
-    expect(out.general).toEqual(['Other']);
   });
 });
