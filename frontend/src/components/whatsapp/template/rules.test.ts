@@ -202,4 +202,8 @@ describe('stepOfField', () => {
     expect(stepOfField('language')).toBe('setup');
     expect(stepOfField('buttons.0.text')).toBe('content');
   });
+
+  it('puts category on the type step', () => {
+    expect(stepOfField('category')).toBe('type');
+  });
 });

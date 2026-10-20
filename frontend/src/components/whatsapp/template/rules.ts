@@ -229,6 +229,7 @@ export const WIZARD_STEPS = ['type', 'setup', 'content'] as const;
 export type WizardStep = (typeof WIZARD_STEPS)[number];
 
 export function stepOfField(path: string): WizardStep {
+  if (path === 'category') return 'type';
   if (path === 'name' || path === 'language') return 'setup';
   return 'content';
 }

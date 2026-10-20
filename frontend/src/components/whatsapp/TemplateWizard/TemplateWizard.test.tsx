@@ -14,7 +14,7 @@ vi.mock('@/services/whatsappApi', async (orig) => {
   };
 });
 
-import { createTemplate, createTemplateDraft, editTemplate } from '@/services/whatsappApi';
+import { createTemplate, createTemplateDraft, editTemplate, errorText } from '@/services/whatsappApi';
 import { emptyDraft, type TemplateWizardDraft } from '../template/draft';
 import { addButton, buttonBlocker, switchVariableType } from './draftActions';
 import { TemplateWizard } from './index';
@@ -202,6 +202,35 @@ describe('final step', () => {
     expect(await screen.findByText('Network down')).toBeInTheDocument();
     expect(screen.getByRole('region', { name: 'Check and send' })).toBeInTheDocument();
   });
+
+  it('maps a top-level invalid_name code onto the name field and the setup step', async () => {
+    create.mockResolvedValue({ success: false, error: 'invalid_name', message: 'Name rejected by WhatsApp.' });
+    setup();
+    await toReview();
+    fireEvent.click(screen.getByRole('button', { name: 'Submit to WhatsApp' }));
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Write it' })).toBeInTheDocument());
+    expect(within(screen.getByRole('region', { name: 'Write it' })).getByText('Name rejected by WhatsApp.')).toBeInTheDocument();
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('sends a category error to the type step in create mode', async () => {
+    create.mockResolvedValue({ success: false, error: 'invalid_category', message: 'Category rejected by WhatsApp.' });
+    setup();
+    await toReview();
+    fireEvent.click(screen.getByRole('button', { name: 'Submit to WhatsApp' }));
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Pick a type' })).toBeInTheDocument());
+    expect(screen.getByText('Category rejected by WhatsApp.')).toBeInTheDocument();
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unmapped error as the general notice on the review step', async () => {
+    create.mockResolvedValue({ success: false, error: 'something_unknown', message: 'Unexpected problem.' });
+    setup();
+    await toReview();
+    fireEvent.click(screen.getByRole('button', { name: 'Submit to WhatsApp' }));
+    expect(await screen.findByText(errorText({ success: false, error: 'something_unknown', message: 'Unexpected problem.' }))).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Check and send' })).toBeInTheDocument();
+  });
 });
 
 describe('edit mode', () => {
@@ -219,5 +248,15 @@ describe('edit mode', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Submit changes to WhatsApp' }));
     await waitFor(() => expect(onDone).toHaveBeenCalledWith({ kind: 'edited', name: 'order_update' }));
     expect(edit).toHaveBeenCalledWith('tpl-1', expect.objectContaining({ template: 'Your order shipped' }));
+  });
+
+  it('keeps a category error on the write step, since edit mode has no type step', async () => {
+    edit.mockResolvedValue({ success: false, error: 'invalid_category', message: 'Category rejected by WhatsApp.' });
+    setup({ initial, docName: 'tpl-1', editsLeft: 2 });
+    next();
+    fireEvent.click(screen.getByRole('button', { name: 'Submit changes to WhatsApp' }));
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Write it' })).toBeInTheDocument());
+    expect(screen.getByText('Category rejected by WhatsApp.')).toBeInTheDocument();
+    expect(onDone).not.toHaveBeenCalled();
   });
 });

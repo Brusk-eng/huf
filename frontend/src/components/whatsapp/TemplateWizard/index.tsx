@@ -15,9 +15,9 @@ import { TemplatePreview } from '../TemplatePreview';
 import { kindById, type TemplateKind } from '../template/catalogue';
 import { emptyDraft, type TemplateWizardDraft, type WizardButton, type WizardHeader } from '../template/draft';
 import { toCreatePayload, toEditPayload } from '../template/payload';
-import { validateDraft } from '../template/rules';
+import { stepOfField, validateDraft } from '../template/rules';
 import { addButton, moveButton, switchVariableType } from './draftActions';
-import { mapBackendErrors } from './backendErrors';
+import { backendFieldErrors, mapBackendErrors } from './backendErrors';
 import { StepLayout, type FieldApi } from './fields';
 import { draftToPreviewModel } from './previewModel';
 import { ReviewStep } from './ReviewStep';
@@ -147,16 +147,26 @@ export function TemplateWizard(props: TemplateWizardProps) {
     showFailure(res);
   };
 
-  const showFailure = (res: WhatsAppError) => {
-    if (res.errors?.length) {
-      const mapped = mapBackendErrors(res.errors, draft);
-      setServerFields(mapped.fields);
-      setNotices(mapped.general);
-      if (Object.keys(mapped.fields).length > 0) setStep(WRITE);
-      else if (mapped.general.length === 0) setNotices([errorText(res)]);
-    } else {
+  const showFailure = (res: WhatsAppError & { field?: string }) => {
+    const errs = backendFieldErrors(res);
+    if (errs.length === 0) {
+      setServerFields({});
       setNotices([errorText(res)]);
+      return;
     }
+    const mapped = mapBackendErrors(errs, draft);
+    const [first] = Object.keys(mapped.fields);
+    const fields: Record<string, string> = {};
+    const general = [...mapped.general];
+    for (const [path, message] of Object.entries(mapped.fields)) {
+      // Category has no input on the write step, so its message is shown as a notice.
+      if (path === 'category') general.push(message);
+      else fields[path] = message;
+    }
+    setServerFields(fields);
+    setNotices(general);
+    // Jump to the step of the first mapped error. Edit mode has no type step.
+    if (first !== undefined) setStep(!isEdit && stepOfField(first) === 'type' ? 0 : WRITE);
   };
 
   const model = useMemo(() => draftToPreviewModel(draft), [draft]);
@@ -173,7 +183,7 @@ export function TemplateWizard(props: TemplateWizardProps) {
         <Stepper current={step} lockedBefore={isEdit ? WRITE : 0} onGo={setStep} />
 
         <div ref={regionRef} role="region" aria-label={STEP_TITLES[step]} tabIndex={-1} className="space-y-6 outline-none">
-          {step > 0 && notices.length > 0 && (
+          {notices.length > 0 && (
             <Alert variant="destructive" role="alert">
               <AlertDescription>{notices.join(' ')}</AlertDescription>
             </Alert>
