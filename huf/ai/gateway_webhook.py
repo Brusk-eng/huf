@@ -276,6 +276,34 @@ def _set_gateway_error(gateway_name: str, text: str, *, touch_event: bool = Fals
 		pass
 
 
+_WEBHOOK_SIGNAL_THROTTLE_SECONDS = 60
+
+
+def _record_webhook_signal(gateway, field: str) -> None:
+	"""Stamp ``last_signature_failure_at`` / ``last_verify_ok_at`` on the Gateway, at most once a minute.
+
+	Stores only a timestamp (no headers, body, token or secret). The throttle reads the value of
+	the already-loaded document, so unauthenticated traffic costs at most one write per gateway
+	per minute per field. Best effort: never raises and never changes the response.
+	"""
+	try:
+		now = frappe.utils.now_datetime()
+		last = gateway.get(field)
+		if last:
+			last = frappe.utils.get_datetime(last)
+			if 0 <= (now - last).total_seconds() < _WEBHOOK_SIGNAL_THROTTLE_SECONDS:
+				return
+		frappe.db.set_value("Gateway", gateway.name, field, now, update_modified=False)
+		gateway.set(field, now)
+		frappe.db.commit()  # GET requests are not committed by the framework
+	except Exception:
+		pass
+
+
+def _is_whatsapp(gateway) -> bool:
+	return str(getattr(gateway, "provider", "") or "") == "WhatsApp"
+
+
 def _record_failed_status(gateway_name: str, status: dict) -> None:
 	"""A failed outbound delivery must be visible even when nothing is forwarded (direct mode)."""
 	try:
@@ -587,8 +615,12 @@ def handle_gateway_webhook() -> dict | None:
 		try:
 			challenge = adapter.verify_url(request) or ""
 		except frappe.PermissionError:
+			if _is_whatsapp(gateway):
+				_record_webhook_signal(gateway, "last_signature_failure_at")
 			frappe.local.response.http_status_code = 403
 			return {"success": False, "error": "Webhook verification failed"}
+		if _is_whatsapp(gateway):
+			_record_webhook_signal(gateway, "last_verify_ok_at")
 		_text_response(challenge)
 		return None
 	batched = _supports_batch_parse(adapter)
@@ -597,6 +629,8 @@ def handle_gateway_webhook() -> dict | None:
 	if not adapter.verify_inbound(request):
 		if batched:
 			_ingest_rate_gate()  # forged/unsigned traffic still consumes the budget
+		if _is_whatsapp(gateway):
+			_record_webhook_signal(gateway, "last_signature_failure_at")
 		frappe.local.response.http_status_code = 401
 		return {"success": False, "error": "Provider verification failed"}
 	if batched:

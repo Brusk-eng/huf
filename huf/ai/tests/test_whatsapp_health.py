@@ -216,6 +216,78 @@ class TestReads(unittest.TestCase):
 		self.assertFalse(out["replied_ever"])
 
 
+class TestSignatureFailure(unittest.TestCase):
+	SIG = NOW - timedelta(minutes=10)
+
+	def test_signature_failed_blocks_and_replaces_no_events_yet(self):
+		r = wh.evaluate(
+			facts(last_event_at=None, events_ever=0, replied_ever=False, signature_failure_at=self.SIG), NOW
+		)
+		self.assertEqual(r["health"], "blocked")
+		self.assertIn("signature_failed", codes(r))
+		self.assertNotIn("no_events_yet", codes(r))
+		self.assertEqual(r["next_step"]["code"], "fix_app_secret")
+		sig = [x for x in r["reasons"] if x["code"] == "signature_failed"][0]
+		self.assertEqual(sig["severity"], "error")
+		self.assertEqual(
+			sig["message"], "Meta is calling us, but the signature check failed. Check the app secret."
+		)
+
+	def test_good_event_after_failure_clears_it(self):
+		r = wh.evaluate(facts(signature_failure_at=NOW - timedelta(hours=3)), NOW)  # event 1h ago
+		self.assertNotIn("signature_failed", codes(r))
+		self.assertEqual(r["health"], "healthy")
+
+	def test_failure_after_last_event_blocks_a_healthy_gateway(self):
+		r = wh.evaluate(facts(signature_failure_at=NOW - timedelta(minutes=5)), NOW)
+		self.assertEqual(r["health"], "blocked")
+		self.assertEqual(r["next_step"]["code"], "fix_app_secret")
+
+	def test_old_failure_expires(self):
+		r = wh.evaluate(
+			facts(last_event_at=NOW - timedelta(days=3), signature_failure_at=NOW - timedelta(hours=30)), NOW
+		)
+		self.assertNotIn("signature_failed", codes(r))
+
+	def test_missing_secret_reports_only_app_secret_missing(self):
+		r = wh.evaluate(facts(app_secret_present=False, signature_failure_at=self.SIG), NOW)
+		self.assertNotIn("signature_failed", codes(r))
+		self.assertEqual(r["next_step"]["code"], "add_app_secret")
+
+	def test_webhook_step_done_when_verify_ok_only(self):
+		r = wh.evaluate(
+			facts(last_event_at=None, events_ever=0, replied_ever=False, verify_ok_at=NOW - timedelta(hours=2)),
+			NOW,
+		)
+		s = states(r)
+		self.assertEqual((s["webhook"], s["subscribed"]), ("done", "todo"))
+		none = wh.evaluate(facts(last_event_at=None, events_ever=0, replied_ever=False), NOW)
+		self.assertEqual(states(none)["webhook"], "todo")
+
+	def test_build_health_payload_and_no_secret(self):
+		gw = {
+			"name": "GW",
+			"is_enabled": 1,
+			"integration_settings": "IS",
+			"last_event_at": None,
+			"last_signature_failure_at": self.SIG,
+			"last_verify_ok_at": NOW - timedelta(hours=1),
+		}
+		presence = {"access_token": True, "phone_number_id": True, "webhook_verify_token": True, "app_secret": True}
+		with patch.object(wh, "read_events", return_value={
+			"events_24h": {"received": 0, "failed": 0, "unrouted": 0, "rejected": 0},
+			"events_ever": 0, "replied_ever": False, "last_failed_event": None,
+		}), patch.object(wh, "read_unrouted_phone_ids", return_value=[]), patch.object(
+			wh, "read_fallback_template", return_value={"approved": None, "status": ""}
+		):
+			out = wh.build_health(gw, presence, connector_available=False, mismatch=False, app_id="123456", now=NOW)
+		self.assertEqual(out["health"], "blocked")
+		self.assertEqual(out["last_signature_failure_at"], str(self.SIG))
+		self.assertEqual(out["last_verify_ok_at"], str(NOW - timedelta(hours=1)))
+		self.assertEqual(states(out)["webhook"], "done")
+		self.assertNotIn("sekrit", json.dumps(out, default=str))
+
+
 class TestScopedSetupStatus(unittest.TestCase):
 	GATEWAYS = {
 		"GW-A": {"name": "GW-A", "is_enabled": 1, "integration_settings": "IS-A", "phone_number_id": "111"},

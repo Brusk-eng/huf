@@ -17,8 +17,14 @@ is an in-app anchor for the Settings tab (``#credentials``, ``#app-secret``, ``#
 Inferences (Meta offers no read API here, so the checklist is inferred from what Huf has seen):
 
 * ``meta_app``: done when an app id is known or an access token exists (a token implies an app).
-* ``webhook``: done when ``Gateway.last_event_at`` is set or any Gateway Event exists (Meta only
-  calls a callback URL that is configured and verified).
+* ``webhook``: done when ``Gateway.last_verify_ok_at`` is set (Meta's GET verification passed),
+  ``Gateway.last_event_at`` is set, or any Gateway Event exists.
+* ``signature_failed`` (error): the webhook recorded a failed POST signature or GET verify token
+  (``last_signature_failure_at``, a bare timestamp written at most once a minute) within the last
+  24 hours and no valid event has arrived since. Trade-off: the callers are unauthenticated, so
+  anyone who knows the callback URL can make a gateway read "blocked" by sending a bad signature;
+  this is bounded (one write a minute, expires after 24 hours, cleared by the next valid event)
+  and is preferred over hiding a wrong App Secret behind "Meta never called us".
 * ``subscribed``: done when at least one Gateway Event exists (events are created only for inbound
   messages, so the ``messages`` field must be subscribed).
 * ``test_message``: done when any event ever got a reply with ``reply_status`` sent/delivered/read.
@@ -45,6 +51,7 @@ _BAD_TEMPLATE_STATES = frozenset({"REJECTED", "PAUSED", "DISABLED"})
 _REPLIED = ("sent", "delivered", "read")
 _SECRET_RE = re.compile(r"(?i)((?:access_)?token=)[^&\s\"'<>]+|EAA[A-Za-z0-9]{12,}")
 _MAX_EVENTS = 5000
+_AFTER_APP_SECRET = frozenset({"configure_webhook", "subscribe_messages", "send_test_message"})
 
 # next-step priority, then (code, label, action anchor)
 _STEPS = (
@@ -103,7 +110,7 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 
 	``facts`` keys: enabled, has_integration, access_token_present, phone_number_id_present,
 	verify_token_present, app_secret_present, app_id_present, account_phone_mismatch,
-	last_event_at, last_error, events_ever (int), replied_ever (bool), events_24h (dict),
+	last_event_at, signature_failure_at, verify_ok_at, last_error, events_ever (int), replied_ever (bool), events_24h (dict),
 	fallback_template (str), fallback_template_approved (bool|None), fallback_template_status.
 	"""
 	now = now or frappe.utils.now_datetime()
@@ -120,6 +127,11 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	failed = int((facts.get("events_24h") or {}).get("failed") or 0)
 	replied = bool(facts.get("replied_ever"))
 	never_seen = not last_event_at and events_ever == 0
+	sig_at = facts.get("signature_failure_at")
+	verify_ok_at = facts.get("verify_ok_at")
+	sig_failed = bool(
+		secret and sig_at and (now - sig_at) <= WINDOW and (not last_event_at or last_event_at < sig_at)
+	)
 
 	reasons: list[dict[str, str]] = []
 	if not token:
@@ -162,7 +174,15 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 					f"The fallback template was {word} by Meta, so replies outside the 24-hour window will fail.",
 				)
 			)
-	if never_seen:
+	if sig_failed:
+		reasons.append(
+			_reason(
+				"signature_failed",
+				"error",
+				"Meta is calling us, but the signature check failed. Check the app secret.",
+			)
+		)
+	if never_seen and not sig_failed:
 		reasons.append(
 			_reason(
 				"no_events_yet",
@@ -191,7 +211,7 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	steps_state = {
 		"meta_app": "done" if (app_id or token) else "todo",
 		"credentials": "blocked" if mismatch else ("done" if credentials_ok else "todo"),
-		"webhook": "done" if (last_event_at or events_ever) else ("blocked" if not verify else "todo"),
+		"webhook": "done" if (verify_ok_at or last_event_at or events_ever) else ("blocked" if not verify else "todo"),
 		"subscribed": "done" if events_ever else ("blocked" if not verify else "todo"),
 		"app_secret": "done" if secret else "todo",
 		"enabled": "done" if enabled else "todo",
@@ -219,6 +239,8 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 			if steps_state[key] != "done":
 				next_step = {"code": code, "label": label, "action_url": url}
 				break
+	if sig_failed and not mismatch and (next_step is None or next_step["code"] in _AFTER_APP_SECRET):
+		next_step = {"code": "fix_app_secret", "label": "Check the app secret", "action_url": "#app-secret"}
 	if health == "not_set_up" and not errors and never_seen and credentials_ok and secret and enabled:
 		next_step = {"code": "send_test_message", "label": "Send a test message to this number", "action_url": "#test-message"}
 	return {"health": health, "reasons": reasons, "next_step": next_step, "checklist": checklist}
@@ -335,6 +357,15 @@ def read_fallback_template(
 	return out
 
 
+def _gateway_stamp(gateway: dict[str, Any], field: str) -> datetime | None:
+	"""A Gateway timestamp from the payload dict, else straight from the DB (never raises)."""
+	try:
+		value = gateway[field] if field in gateway else frappe.db.get_value("Gateway", gateway["name"], field)
+		return frappe.utils.get_datetime(value) if value else None
+	except Exception:
+		return None
+
+
 def build_health(
 	gateway: dict[str, Any],
 	presence: dict[str, bool],
@@ -353,6 +384,9 @@ def build_health(
 	tpl = read_fallback_template(gateway.get("whatsapp_account"), template, language, connector_available)
 	own_phone = (gateway.get("phone_number_id") or "").strip()
 	last_event_at = gateway.get("last_event_at")
+	# not in every caller's field list: read the two webhook timestamps when the dict lacks them
+	sig_at = _gateway_stamp(gateway, "last_signature_failure_at")
+	verify_ok_at = _gateway_stamp(gateway, "last_verify_ok_at")
 	last_error = redact(gateway.get("last_error") or "")
 	phone_present = bool(presence.get("phone_number_id") or own_phone)
 	facts = {
@@ -365,6 +399,8 @@ def build_health(
 		"app_id_present": bool(app_id),
 		"account_phone_mismatch": mismatch,
 		"last_event_at": last_event_at,
+		"signature_failure_at": sig_at,
+		"verify_ok_at": verify_ok_at,
 		"last_error": last_error,
 		"events_ever": events["events_ever"],
 		"replied_ever": events["replied_ever"],
@@ -379,6 +415,8 @@ def build_health(
 			"fallback_template_language": language,
 			"fallback_template_approved": tpl["approved"],
 			"last_event_at": _iso(last_event_at),
+			"last_signature_failure_at": _iso(sig_at),
+			"last_verify_ok_at": _iso(verify_ok_at),
 			"last_error": last_error,
 			"access_token_present": bool(presence.get("access_token")),
 			"app_id_present": bool(app_id),

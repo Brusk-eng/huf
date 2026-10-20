@@ -43,6 +43,7 @@ class Gateway(Document):
 
         # WhatsApp: derive the indexed phone_number_id and enforce number uniqueness / account linking
         self._validate_whatsapp()
+        self._validate_fallback_template()
 
         # ST-04.4: Validate required credentials are set
         if self.is_enabled and self.provider:
@@ -107,6 +108,48 @@ class Gateway(Document):
                     "WhatsApp Account {0} uses phone number ID {1}, but this gateway's integration uses {2}. "
                     "Link the account that belongs to this number."
                 ).format(account, account_phone or _("(none)"), self.phone_number_id)
+            )
+
+    def _validate_fallback_template(self):
+        """The fallback template is sent with no parameters, so it must have no variables.
+
+        Checked only when frappe_whatsapp is installed, an account is linked and the template row
+        is already known; otherwise it cannot be verified here (health warns about it instead).
+        """
+        if self.provider != "WhatsApp":
+            return
+        template = (self.get("fallback_template") or "").strip()
+        account = (self.get("whatsapp_account") or "").strip()
+        if not template or not account:
+            return
+        from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+        from huf.ai.gateway_adapters.whatsapp_templates import variables
+
+        if not bridge.is_available():
+            return
+        try:
+            language = (self.get("fallback_template_language") or "").strip() or None
+            docname = bridge._template_docname(account, template, language)
+            row = bridge._template_row(docname)
+        except Exception:
+            return  # not found yet / ambiguous language: nothing to verify
+        if not row or row.get("whatsapp_account") != account:
+            return
+        texts = [row.get("template"), row.get("header")] + [
+            b.get("website_url") for b in row.get("buttons") or []
+        ]
+        media_header = str(row.get("header_format") or row.get("header_type") or "").upper() in {
+            "IMAGE",
+            "VIDEO",
+            "DOCUMENT",
+            "LOCATION",
+        }
+        if media_header or any(variables(t or "") for t in texts):
+            frappe.throw(
+                _(
+                    "The fallback template can't have variables (it is sent without values). "
+                    "Pick a template with plain text."
+                )
             )
 
     def _validate_required_credentials(self):

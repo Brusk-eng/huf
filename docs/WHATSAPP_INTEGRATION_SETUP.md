@@ -198,6 +198,15 @@ Call `huf.ai.whatsapp_management.get_setup_status` (System Manager or Huf Admin)
 
 A healthy gateway has an empty `failing_checks` list. Send a test message from Meta or from a WhatsApp phone to the business number. Confirm a Gateway Event and an agent run appear.
 
+### 3.5 Troubleshooting
+
+| What you see | Meaning | Fix |
+|---|---|---|
+| Health reason `signature_failed` ("Meta is calling us, but the signature check failed. Check the app secret."), next step `fix_app_secret` | Meta reached the callback URL, but the `X-Hub-Signature-256` check failed (or the GET verify token did not match). Almost always a wrong or stale App Secret. | Copy the App Secret again from the Meta app (App settings, Basic) into the Integration Settings credential `app_secret`. The error clears when the next valid event arrives, or after 24 hours. |
+| Health reason `no_events_yet` ("Meta hasn't sent us anything yet") | Meta has not called the callback URL, or the `messages` field is not subscribed. | Check the callback URL and the subscription in Meta. If Meta's "Verify and save" succeeded, the checklist step "webhook" is already done. |
+
+How the signature signal works: when a WhatsApp webhook call fails the signature (POST) or the verify-token check (GET), Huf stores one timestamp on the Gateway (`last_signature_failure_at`) and nothing else: no headers, body, token or secret. A successful GET verification stores `last_verify_ok_at`. Each is written at most once a minute per gateway, so unauthenticated traffic cannot cause a write storm. The failure counts only for 24 hours and only while no valid event has arrived after it. Trade-off: because the callback is unauthenticated, anyone who knows the URL can make the gateway show "blocked" by sending a bad signature; it clears with the next valid message and never affects message handling.
+
 ---
 
 ## Multiple WhatsApp gateways
@@ -338,6 +347,12 @@ Bridge mode: plain body-only sends go through an Outgoing `WhatsApp Message`, wh
 Not available: `VIDEO` headers, `AUTHENTICATION` templates, carousel, flow, catalog and multi-product buttons, copy-code and other button types, and editing a template after it is created.
 
 ---
+
+**Fallback template rules.** The fallback template is always sent without parameter values, so saving a Gateway is refused when the template (found for the linked WhatsApp Account) has any variable in its body, header or URL button, or a media header: "The fallback template can't have variables (it is sent without values). Pick a template with plain text." The check is skipped when `frappe_whatsapp` is not installed, no account is linked, or the template has not been synced yet (Health then warns with `fallback_template_unavailable` if Meta rejected or paused it).
+
+**Do not use `frappe_whatsapp`'s "Fetch templates" button in Desk.** It overwrites Huf's mirrored template rows by template name only and bypasses Huf's guard. Use Huf's Sync instead.
+
+**Warning:** templates imported before Huf managed them can still be edited in Desk, and that edit is a lossy re-push to Meta (rich parts are dropped), unless Huf has synced them first. Run Huf's Sync before anyone edits an older template in Desk.
 
 ### 4.5 Template states, drafts and editing
 
