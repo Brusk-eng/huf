@@ -345,8 +345,8 @@ class TestBridge(unittest.TestCase):
 	def test_list_templates(self):
 		with avail(False):
 			self.assertEqual(wb.list_templates(), [])
-		with avail(), patch.object(wb, "_attach_state"), patch.object(frappe, "get_list", return_value=[{"name": "t"}]) as gl:
-			self.assertEqual(wb.list_templates("ACC", "APPROVED"), [{"name": "t"}])
+		with avail(), patch.object(wb, "_attach_state"), patch.object(wb, "_get_extra", return_value=None), patch.object(frappe, "get_list", return_value=[{"name": "t"}]) as gl:
+			self.assertEqual(wb.list_templates("ACC", "APPROVED"), [{"name": "t", "header_format": ""}])
 			self.assertEqual(gl.call_args.kwargs["filters"], {"whatsapp_account": "ACC", "status": "APPROVED"})
 
 	def test_create_template(self):

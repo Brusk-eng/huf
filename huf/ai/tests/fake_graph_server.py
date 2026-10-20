@@ -717,13 +717,13 @@ class FakeGraphServer:
 	def _tpl_buttons(f: str, c: dict) -> None:
 		buttons = c.get("buttons")
 		_need(isinstance(buttons, list) and 1 <= len(buttons) <= 10, f"{f}.buttons must hold 1-10 buttons")
-		counts = {"URL": 0, "PHONE_NUMBER": 0, "QUICK_REPLY": 0, "COPY_CODE": 0}
+		counts = {"URL": 0, "PHONE_NUMBER": 0, "QUICK_REPLY": 0, "COPY_CODE": 0, "FLOW": 0}
 		kinds: list[str] = []
 		for i, b in enumerate(buttons):
 			bf = f"{f}.buttons[{i}]"
 			_need(isinstance(b, dict), f"{bf} must be an object")
 			btype = b.get("type")
-			_need(btype in counts, f"{bf}.type must be QUICK_REPLY, URL, PHONE_NUMBER or COPY_CODE")
+			_need(btype in counts, f"{bf}.type must be QUICK_REPLY, URL, PHONE_NUMBER, COPY_CODE or FLOW")
 			counts[btype] += 1
 			kinds.append(btype)
 			if btype == "COPY_CODE":
@@ -731,6 +731,10 @@ class FakeGraphServer:
 					f"{bf} needs an example code (max 20 characters) and no text")
 				continue
 			_need(_is_str(b.get("text"), max_len=25), f"{bf}.text is required (max 25 characters)")
+			if btype == "FLOW":
+				_need(_is_str(b.get("flow_id")) or _is_str(b.get("flow_name")), f"{bf} needs a flow_id")
+				_need(set(b) <= {"type", "text", "flow_id", "flow_name", "flow_json", "flow_action", "navigate_screen"}, f"Unexpected field in {bf}")
+				continue
 			if btype == "URL":
 				url = b.get("url")
 				_need(_is_str(url, max_len=2000) and _is_http(_VAR_RE.sub("", url)), f"{bf}.url must be an http(s) URL (max 2000 characters)")
@@ -847,7 +851,12 @@ class FakeGraphServer:
 		return data
 
 	def _post_upload_session(self, rec: dict):
+		# Documented shape (developers.facebook.com/docs/graph-api/guides/upload): file_name, file_length and
+		# file_type are QUERY parameters; messaging_product is not part of the upload API.
 		data = self._form(rec)
+		_need("messaging_product" not in data, "messaging_product is not a parameter of the upload API")
+		for key in ("file_length", "file_type", "file_name"):
+			_need(key in rec["query"], f"{key} must be sent as a query parameter")
 		length, ftype = data.get("file_length"), data.get("file_type")
 		_need(str(length).isdigit() and int(length) > 0, "file_length is required and must be a positive integer")
 		_need(ftype in _UPLOAD_TYPES, f"file_type must be one of {sorted(_UPLOAD_TYPES)}")

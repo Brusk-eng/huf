@@ -15,9 +15,12 @@ or no name is given: there is no default-account guess on gateway paths.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib
 import json
+import mimetypes
+import os
 import re
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -932,6 +935,9 @@ def list_templates(account_name: str | None = None, status: str | None = None) -
 		limit_page_length=500,
 	)
 	_attach_state(rows)
+	for row in rows:
+		extra = _get_extra(row.get("whatsapp_account"), row["name"]) or {}
+		row["header_format"] = str(extra.get("header_format") or row.get("header_type") or "").upper()
 	return rows
 
 
@@ -1107,6 +1113,13 @@ def _read_header_sample(
 	return content, mime
 
 
+def _upload_file_name(sample: str, mime: str) -> str:
+	"""``file_name`` query param of the upload session (documented as required)."""
+	base = os.path.basename(urlparse(sample).path) if wt.is_http_url(sample) else os.path.basename(sample)
+	base = re.sub(r"[^A-Za-z0-9._-]", "_", base)[:100]
+	return base or "sample" + (mimetypes.guess_extension(mime) or "")
+
+
 def upload_header_handle(
 	acct: dict[str, Any],
 	header_type: str,
@@ -1128,7 +1141,7 @@ def upload_header_handle(
 	try:
 		opened = http_post(
 			f"{base}/{acct['app_id']}/uploads",
-			data={"file_length": len(content), "file_type": mime, "messaging_product": "whatsapp"},
+			params={"file_length": len(content), "file_type": mime, "file_name": _upload_file_name(sample, mime)},
 			headers={"Authorization": f"Bearer {acct['token']}"},
 			timeout=_HTTP_TIMEOUT,
 		)
@@ -1183,6 +1196,16 @@ def _meta_extras(components: Any, parameter_format: Any = None, ttl: Any = None)
 		"header_format": header_format,
 		"ttl_seconds": ttl if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl != 0 else None,
 	}
+
+
+_LOCAL_HEADER_TYPES = ("TEXT", "IMAGE", "DOCUMENT")  # the WhatsApp Templates.header_type options
+
+
+def _local_header_type(fmt: Any) -> str:
+	"""header_type for the local row: Meta's format when the doctype can hold it, else '' (VIDEO / LOCATION are
+	never mislabelled; the true format lives in the Template Extra's ``header_format``)."""
+	fmt = str(fmt or "").upper()
+	return fmt if fmt in _LOCAL_HEADER_TYPES else ""
 
 
 def _button_rows(spec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1242,6 +1265,7 @@ def create_template(
 	payload: dict[str, Any],
 	http_post: Callable[..., Any] | None = None,
 	http_get: Callable[..., Any] | None = None,
+	commit: bool = False,
 ) -> dict[str, Any]:
 	"""Create a template on Meta (``POST /{waba}/message_templates``) and mirror it locally. Permission-checked (A8).
 
@@ -1289,7 +1313,7 @@ def create_template(
 			"whatsapp_account": account_name,
 			"template": spec["body"],
 			"sample_values": ",".join(spec["sample_values"]),
-			"header_type": spec["header_type"] or "",
+			"header_type": _local_header_type(spec["header_type"]),
 			"footer": spec["footer"] or "",
 		}
 	)
@@ -1348,6 +1372,8 @@ def create_template(
 		docname=docname, template_id=tid, account=account_name, status=status, category=meta_category,
 		components=meta["components"], source="create",
 	)
+	if commit:  # Meta accepted it: make the mirror durable before the caller records anything else
+		frappe.db.commit()
 	return result
 
 
@@ -1420,15 +1446,15 @@ def _local_template(account_name: str, name: str, language: str) -> str | None:
 def _parse_meta_components(components: Any) -> dict[str, Any]:
 	"""Meta ``components`` -> WhatsApp Templates fields (``header_type``, ``header``, ``footer``,
 	``template``, ``sample_values``) plus ``buttons`` child-row dicts. Absent parts stay empty."""
-	out: dict[str, Any] = {"header_type": "", "header": "", "footer": "", "template": "", "sample_values": "", "buttons": []}
+	out: dict[str, Any] = {"header_type": "", "header": "", "footer": "", "template": "", "sample_values": "", "buttons": [], "header_format": ""}
 	for comp in components if isinstance(components, list) else []:
 		if not isinstance(comp, dict):
 			continue
 		ctype = str(comp.get("type") or "").upper()
 		if ctype == "HEADER":
 			fmt = str(comp.get("format") or "").upper()
-			if fmt in ("TEXT", "IMAGE", "DOCUMENT"):
-				out["header_type"] = fmt
+			out["header_type"] = _local_header_type(fmt)
+			out["header_format"] = fmt
 			if fmt == "TEXT":
 				out["header"] = comp.get("text") or ""
 		elif ctype == "FOOTER":
@@ -1452,6 +1478,8 @@ def _parse_meta_components(components: Any) -> dict[str, Any]:
 						if len(row["example_url"]) > _DATA_COLUMN_LEN:
 							# Meta sample link (often a long signed CDN URL): not needed to send, so dropped
 							row.pop("example_url")
+				elif btn.get("type") == "COPY_CODE":
+					row["example_url"] = str(btn.get("example") or "")[:_DATA_COLUMN_LEN]
 				elif btn.get("type") == "PHONE_NUMBER":
 					row["phone_number"] = btn.get("phone_number")
 				out["buttons"].append(row)
@@ -1675,6 +1703,8 @@ TEMPLATE_STATUSES = (
 # Webhook events that are not statuses (FLAGGED, REINSTATED, LOCKED, ARCHIVED, UNARCHIVED) only set ``last_event``.
 _QUALITY_WORDS = {"GREEN": "GREEN", "HIGH": "GREEN", "YELLOW": "YELLOW", "MEDIUM": "YELLOW", "RED": "RED", "LOW": "RED"}
 _DRAFT_OPEN = ("Draft", "Pending Review", "Failed")
+_SUBMITTING = "Submitting"  # committed before the Graph POST; not a desk Select option (set with db.set_value)
+_SUBMITTING_STALE_SECONDS = 120  # a draft stuck in Submitting longer than this lost its worker: approve may retry
 
 
 def manager_url(business_id: str | None = None) -> str:
@@ -2048,8 +2078,7 @@ def _current_payload(row: dict[str, Any], extra: dict[str, Any] | None = None) -
 	return payload
 
 
-def _existing_header_handle(extra: dict[str, Any], state: dict[str, Any]) -> str:
-	"""The Meta upload handle of the template's current media header, '' when unknown."""
+def _stored_header_value(extra: dict[str, Any], state: dict[str, Any]) -> str:
 	comps = extra.get("components_json") or _loads(state.get("components"), []) or []
 	for comp in comps if isinstance(comps, list) else []:
 		if isinstance(comp, dict) and str(comp.get("type")).upper() == "HEADER":
@@ -2057,6 +2086,96 @@ def _existing_header_handle(extra: dict[str, Any], state: dict[str, Any]) -> str
 			if handles:
 				return str(handles[0])
 	return ""
+
+
+def _existing_header_handle(extra: dict[str, Any], state: dict[str, Any]) -> str:
+	"""The Meta upload handle of the template's current media header; '' when unknown or when the stored value
+	is a URL (an imported template carries Meta's sample CDN URL, which is never a valid ``header_handle``)."""
+	value = _stored_header_value(extra, state)
+	return "" if wt.is_http_url(value) else value
+
+
+def _existing_header_sample_url(extra: dict[str, Any], state: dict[str, Any]) -> str:
+	"""The sample URL stored where a handle is expected (imported media headers), '' otherwise."""
+	value = _stored_header_value(extra, state)
+	return value if wt.is_http_url(value) else ""
+
+
+_ROUNDTRIP_SECTIONS = ("HEADER", "BODY", "FOOTER", "BUTTONS")
+_SECTION_RANK = {"HEADER": 0, "BODY": 1, "FOOTER": 3, "BUTTONS": 4}
+_SECTION_KEYS = {
+	"HEADER": ("header", "header_type", "sample", "header_handle"),
+	"BODY": ("body", "template", "sample_values", "named_samples"),
+	"FOOTER": ("footer",),
+	"BUTTONS": ("buttons",),
+}
+
+
+def _unroundtrippable_buttons(components: Any) -> list[str]:
+	"""Button types in Meta ``components`` that Huf cannot rebuild exactly (FLOW, MPM, CATALOG, ..., a COPY_CODE
+	without its example, a dynamic URL button without its example)."""
+	bad: list[str] = []
+	for comp in components if isinstance(components, list) else []:
+		if not isinstance(comp, dict) or str(comp.get("type")).upper() != "BUTTONS":
+			continue
+		for btn in comp.get("buttons") or []:
+			btype = str((btn or {}).get("type") or "").upper()
+			if btype not in wt.DOCTYPE_BUTTON_TYPE:
+				bad.append(btype or "UNKNOWN")
+			elif btype == "COPY_CODE" and not btn.get("example"):
+				bad.append(btype)
+			elif btype == "URL" and "{{" in str(btn.get("url") or "") and not btn.get("example"):
+				bad.append("URL")
+	return bad
+
+
+def _unroundtrippable_local_buttons(docname: str) -> list[str]:
+	"""Same check against the local button rows (fallback when no Template Extra holds Meta's components)."""
+	reverse = {v: k for k, v in wt.DOCTYPE_BUTTON_TYPE.items()}
+	rows = frappe.get_all(
+		"WhatsApp Button", filters={"parent": docname, "parenttype": "WhatsApp Templates"},
+		fields=["button_type", "url_type", "website_url", "example_url"], order_by="idx asc",
+	)
+	bad: list[str] = []
+	for r in rows:
+		btype = reverse.get(r.get("button_type"))
+		if not btype:
+			bad.append(str(r.get("button_type") or "UNKNOWN"))
+		elif btype == "COPY_CODE" and not r.get("example_url"):
+			bad.append(btype)
+		elif btype == "URL" and ("{{" in str(r.get("website_url") or "") or r.get("url_type") == "Dynamic") and not r.get("example_url"):
+			bad.append("URL")
+	return bad
+
+
+def _merge_components(base: list[dict[str, Any]], built: list[dict[str, Any]], changed: set[str]) -> list[dict[str, Any]]:
+	"""Meta's own ``base`` components with only the ``changed`` sections replaced by the ``built`` ones."""
+	built_by = {str(c.get("type")).upper(): c for c in built if isinstance(c, dict)}
+	out: list[dict[str, Any]] = []
+	seen: set[str] = set()
+	for comp in base:
+		ctype = str(comp.get("type")).upper() if isinstance(comp, dict) else ""
+		if ctype in changed and ctype in _ROUNDTRIP_SECTIONS:
+			if ctype in built_by:
+				out.append(built_by[ctype])
+				seen.add(ctype)
+			continue
+		out.append(copy.deepcopy(comp))
+		seen.add(ctype)
+	for ctype in _ROUNDTRIP_SECTIONS:
+		if ctype in changed and ctype in built_by and ctype not in seen:
+			out.append(built_by[ctype])
+	out.sort(key=lambda c: _SECTION_RANK.get(str(c.get("type")).upper() if isinstance(c, dict) else "", 2))
+	return out
+
+
+def _components_sig(components: Any, ignore_media_example: bool) -> str:
+	comps = copy.deepcopy(components if isinstance(components, list) else [])
+	for comp in comps:
+		if ignore_media_example and isinstance(comp, dict) and str(comp.get("type")).upper() == "HEADER":
+			if str(comp.get("format") or "").upper() in wt.MEDIA_HEADER_TYPES:
+				comp.pop("example", None)
+	return json.dumps(comps, sort_keys=True, default=str)
 
 
 def get_template(name: str) -> dict[str, Any]:
@@ -2176,7 +2295,23 @@ def edit_template(
 		return _err("no_account")
 
 	extra = _get_extra(row.get("whatsapp_account"), name) or {}
+	base_components = extra.get("components_json")
+	base_components = base_components if isinstance(base_components, list) and base_components else None
+	buttons_edited = "buttons" in payload
+	if base_components is None:
+		unsafe = _unroundtrippable_local_buttons(name)
+	else:
+		unsafe = _unroundtrippable_buttons(base_components) if buttons_edited else []
+	if unsafe:
+		return _err(
+			"edit_would_drop_buttons",
+			message="This template has buttons Huf cannot re-send exactly (" + ", ".join(sorted(set(unsafe)))
+			+ "); editing it here would remove them. Edit it in WhatsApp Manager.",
+			button_types=sorted(set(unsafe)),
+		)
 	merged = _current_payload(row, extra)
+	if base_components is not None and not buttons_edited:
+		merged["buttons"] = []  # Meta's own BUTTONS are kept as they are; the local rows are not re-validated
 	declared = payload.get("parameter_format")
 	if declared not in (None, "") and str(declared).upper() != merged["parameter_format"]:
 		return _err("immutable_field", field="parameter_format", message="The variable format (numbered or named) cannot be changed after creation.")
@@ -2214,11 +2349,19 @@ def edit_template(
 		and not new_media_requested
 		and "header" not in payload
 	)
+	reuploaded = False
 	if media_unchanged:
 		handle = _existing_header_handle(extra, state)
-		if not handle:
-			return _err("media_header_edit_unsupported", message="The current media header cannot be re-sent; provide a new sample file.")
-		merged["header_handle"] = handle
+		if handle:
+			merged["header_handle"] = handle
+		else:
+			url = _existing_header_sample_url(extra, state)
+			if not url:
+				return _err("media_header_edit_unsupported", message="The current media header cannot be re-sent; provide a new sample file.")
+			# imported header: only Meta's sample URL is known, which is not a handle: fetch and upload it again
+			merged["sample"] = url
+			media_unchanged = False
+			reuploaded = True
 	elif merged_header in wt.MEDIA_HEADER_TYPES and not (merged.get("sample") or merged.get("header_handle")):
 		return _err(
 			"media_header_edit_unsupported",
@@ -2230,31 +2373,51 @@ def edit_template(
 	if spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged and not spec["header_handle"]:
 		problem = _check_sample_reference(spec["header_sample"])
 		if problem:
+			if reuploaded:
+				return _err("media_header_edit_unsupported", message="The current media header cannot be re-sent and its sample could not be fetched; provide a new sample file.")
 			return wt.validation_error([problem])
 		try:
 			spec["header_handle"] = upload_header_handle(acct, spec["header_type"], spec["header_sample"], http_post, http_get)
 		except BridgeError as exc:
+			if reuploaded:
+				return _err("media_header_edit_unsupported", message="The current media header cannot be re-sent and its sample could not be fetched; provide a new sample file.", detail=exc.payload.get("message"))
 			return exc.payload
 	meta = wt.build_meta_payload(spec)
-	components = meta["components"]
+	built = meta["components"]
+	if base_components is not None:
+		changed = {sec for sec, keys in _SECTION_KEYS.items() if any(k in payload for k in keys)}
+		if reuploaded:
+			changed.add("HEADER")
+		components = _merge_components(base_components, built, changed)
+	else:
+		components = built
 
 	local_buttons = frappe.get_all(
 		"WhatsApp Button", filters={"parent": name, "parenttype": "WhatsApp Templates"},
 		fields=["button_type", "button_label", "website_url", "phone_number"], order_by="idx asc",
 	)
 	current_ttl = _extra_ttl(extra)
+	same_header_sample = current_header != "TEXT" or (spec["header_sample"] or "") == (row.get("sample") or "")
 	same_header_text = (spec["header_text"] or "") == ((row.get("header") or "") if current_header == "TEXT" else "")
+	if base_components is not None:
+		# Meta's own components are the truth: any difference (incl. a NAMED header variable / sample) is a change
+		content_same = _components_sig(components, True) == _components_sig(base_components, True)
+	else:
+		content_same = (
+			spec["body"] == (row.get("template") or "")
+			and ",".join(spec["sample_values"]) == (row.get("sample_values") or "")
+			and (spec["header_type"] or "") == current_header
+			and same_header_text
+			and same_header_sample
+			and (spec["footer"] or "") == (row.get("footer") or "")
+			and _button_sig(wt.button_rows(spec)) == _button_sig(local_buttons)
+			and (spec["named_samples"] or []) == list(extra.get("named_samples") or spec["named_samples"] or [])
+		)
 	if (
 		category == str(row.get("category") or "").upper()
 		and (spec["ttl_seconds"] or None) == (current_ttl or None)
-		and spec["body"] == (row.get("template") or "")
-		and ",".join(spec["sample_values"]) == (row.get("sample_values") or "")
-		and (spec["header_type"] or "") == current_header
-		and not (spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged)
-		and same_header_text
-		and (spec["footer"] or "") == (row.get("footer") or "")
-		and _button_sig(wt.button_rows(spec)) == _button_sig(local_buttons)
-		and (spec["named_samples"] or []) == list(extra.get("named_samples") or spec["named_samples"] or [])
+		and content_same
+		and not (spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged and not reuploaded)
 	):
 		return _err("no_changes", message="Nothing changed; no edit was sent to Meta.")
 
@@ -2279,7 +2442,7 @@ def edit_template(
 	changes: dict[str, Any] = {
 		"template": spec["body"],
 		"sample_values": ",".join(spec["sample_values"]),
-		"header_type": spec["header_type"] or "",
+		"header_type": _local_header_type(spec["header_type"]),
 		"footer": spec["footer"] or "",
 		"category": category,
 		"status": "PENDING",
@@ -2292,13 +2455,15 @@ def edit_template(
 		changes["sample"] = ""
 	elif spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged:
 		changes["header"] = ""
-		changes["sample"] = spec["header_sample"]
+		if not reuploaded:  # a re-fetched Meta CDN URL is not a sample the user chose
+			changes["sample"] = spec["header_sample"]
 	elif spec["header_type"] == "LOCATION":
 		changes["header"] = ""
 		changes["sample"] = ""
 	with _guard().huf_template_write():
 		frappe.db.set_value("WhatsApp Templates", name, changes)
-		_write_buttons(name, _button_rows(spec))
+		if buttons_edited or base_components is None:  # otherwise the local rows (even ones Huf cannot rebuild) stay
+			_write_buttons(name, _button_rows(spec))
 		try:
 			_guard().upsert_extra(row.get("whatsapp_account"), name, **_extra_values(spec, row["id"], components))
 		except Exception:
@@ -2403,9 +2568,18 @@ def approve_draft(name: str, note: str = "") -> dict[str, Any]:
 	doc = _locked_draft(name)
 	if not doc:
 		return _err("not_found")
-	if doc.status not in _DRAFT_OPEN:
+	stale_submitting = False
+	if doc.status == _SUBMITTING:
+		age = (frappe.utils.now_datetime() - frappe.utils.get_datetime(doc.modified)).total_seconds()
+		stale_submitting = age > _SUBMITTING_STALE_SECONDS
+	if doc.status not in _DRAFT_OPEN and not stale_submitting:
 		return _err("already_processed", status=doc.status, message=f"This draft is {doc.status}.")
 	payload = _loads(doc.payload, {}) or {}
+	if is_available() and doc.whatsapp_account:
+		# Close the duplicate-submit window: other approvers now see Submitting, not an open draft
+		frappe.db.set_value(DRAFT_DOCTYPE, doc.name, "status", _SUBMITTING, update_modified=False)
+		frappe.db.commit()
+		doc.status = _SUBMITTING
 	doc.reviewed_by = frappe.session.user
 	doc.reviewed_at = frappe.utils.now_datetime()
 	doc.review_note = note or ""
@@ -2415,11 +2589,13 @@ def approve_draft(name: str, note: str = "") -> dict[str, Any]:
 	else:
 		# the draft's own account only: no default-account guess at approval time
 		try:
-			result = create_template(account, payload) if account else _err("no_account")
+			result = create_template(account, payload, commit=True) if account else _err("no_account")
 		except frappe.PermissionError:
 			raise
 		except Exception as exc:
 			result = _err("create_failed", message=_redact(exc))
+		if not result.get("success") and account and _is_duplicate_error(result):
+			result = _recover_duplicate(account, payload) or result
 	if result.get("success"):
 		doc.status = "Approved & Submitted"
 		doc.submitted_template = result.get("name")
@@ -2430,6 +2606,8 @@ def approve_draft(name: str, note: str = "") -> dict[str, Any]:
 		detail = result.get("message") or "; ".join(str(e.get("message")) for e in result.get("errors") or [])
 		doc.submit_error = _redact(detail or result.get("error"))[:1000]
 	doc.save(ignore_permissions=True)
+	if doc.status == "Approved & Submitted":
+		frappe.db.commit()  # the draft now points at the template Meta accepted
 	out = {
 		"success": bool(result.get("success")),
 		"name": doc.name,
@@ -2440,6 +2618,31 @@ def approve_draft(name: str, note: str = "") -> dict[str, Any]:
 	if not out["success"]:
 		out["error"] = result.get("error")
 	return out
+
+
+def _is_duplicate_error(result: dict[str, Any]) -> bool:
+	text = str(result.get("message") or "").lower()
+	return result.get("error") == "create_failed" and ("already exist" in text or "2388024" in text)
+
+
+def _recover_duplicate(account: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+	"""Meta says the name+language already exists on this account (an earlier submit was accepted but never
+	recorded): import it with a sync and report success with the local template; None when it cannot be found."""
+	try:
+		checked = validate_create_payload(payload)
+		if checked.get("error"):
+			return None
+		synced = sync_templates(account)
+		if not synced.get("success"):
+			return None
+		docname = _local_template(account, checked["name"], checked["language_code"])
+		if not docname:
+			return None
+		status = frappe.db.get_value("WhatsApp Templates", docname, "status")
+		frappe.db.commit()
+		return {"success": True, "name": docname, "status": status, "recovered_duplicate": True}
+	except Exception:
+		return None
 
 
 def reject_draft(name: str, note: str = "") -> dict[str, Any]:

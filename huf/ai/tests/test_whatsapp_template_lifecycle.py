@@ -246,16 +246,54 @@ class TestDrafts(LifecycleCase):
 
 	def test_meta_refusal_marks_draft_failed(self):
 		self._need_bridge()
-		self.server.add_template("lc_promo", "en_US")  # Meta already has it
 		made = mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload()))
-		out = mgmt.approve_template_draft(name=made["name"])
+		refusal = {"success": False, "error": "create_failed", "message": "(100) Invalid parameter"}
+		with patch.object(bridge, "create_template", return_value=refusal):
+			out = mgmt.approve_template_draft(name=made["name"])
 		self.assertFalse(out["success"])
 		self.assertEqual(out["status"], "Failed")
-		self.assertIn("already exists", out["submit_error"])
-		self.server.violations.clear()  # expected refusal
-		self.assertEqual(frappe.db.exists("WhatsApp Templates", "lc_promo-en_US"), None)
+		self.assertIn("Invalid parameter", out["submit_error"])
 		retry = mgmt.reject_template_draft(name=made["name"], note="give up")  # failed drafts can still be closed
 		self.assertEqual(retry["status"], "Rejected")
+
+	def test_draft_is_submitting_and_committed_before_the_graph_post(self):
+		self._need_bridge()
+		made = mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload()))
+		seen = {}
+		original = bridge.create_template
+		before = frappe.db.commit.call_count
+
+		def spy(*a, **kw):
+			seen["status"] = frappe.db.get_value(DRAFT, made["name"], "status")
+			seen["committed"] = frappe.db.commit.call_count - before
+			return original(*a, **kw)
+
+		with patch.object(bridge, "create_template", side_effect=spy):
+			out = mgmt.approve_template_draft(name=made["name"])
+		self.assertTrue(out["success"], out)
+		self.assertEqual(seen, {"status": "Submitting", "committed": 1})
+		self.assertGreaterEqual(frappe.db.commit.call_count - before, 3)  # + right after Meta accepted, + draft status
+
+	def test_second_approval_after_a_crash_adopts_the_meta_template(self):
+		"""Meta accepted the submit but the worker died before the draft was recorded: approving again must
+		not Fail on Meta's 'already exists' but adopt the template and mark the draft submitted."""
+		self._need_bridge()
+		made = mgmt.create_template_draft(**self._acct(), payload=json.dumps(_payload()))
+		first = mgmt.approve_template_draft(name=made["name"])
+		self.assertTrue(first["success"], first)
+		# simulate the crash: draft left in Submitting (stale), local mirror lost
+		frappe.db.set_value(DRAFT, made["name"], {"status": "Submitting", "submitted_template": ""})
+		frappe.db.sql("update `tabWhatsApp Template Draft` set modified = %s where name = %s", (frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=-10), made["name"]))
+		frappe.db.delete("WhatsApp Templates", {"name": "lc_promo-en_US"})
+		again = mgmt.approve_template_draft(name=made["name"])
+		self.server.violations.clear()  # the duplicate POST is the expected refusal
+		self.assertTrue(again["success"], again)
+		self.assertEqual(again["status"], "Approved & Submitted")
+		self.assertEqual(again["submitted_template"], "lc_promo-en_US")
+		self.assertTrue(frappe.db.exists("WhatsApp Templates", "lc_promo-en_US"))
+		# a fresh Submitting draft (another approver mid-flight) is not submitted twice
+		frappe.db.set_value(DRAFT, made["name"], "status", "Submitting")
+		self.assertEqual(mgmt.approve_template_draft(name=made["name"])["error"], "already_processed")
 
 	def test_agent_create_template_only_drafts(self):
 		self._need_bridge()
@@ -415,6 +453,129 @@ class TestEditTemplate(LifecycleCase):
 		self.assertEqual(len(json.loads(st.edit_log)), 1)
 		self.assertEqual(self._statuses()[-1]["status"], "PENDING")
 		self.assertEqual(self.server.templates[("lc_full", "en_US")]["status"], "PENDING")
+
+	def _extra(self, docname):
+		from huf.ai.gateway_adapters import whatsapp_template_guard as guard
+
+		return guard.get_extra(self.account.name, docname)
+
+	def _seed_and_sync(self, name, components, status="REJECTED", **extra):
+		self._need_bridge()
+		self.server.add_template(name, "en_US", "UTILITY", status, components=components, **extra)
+		synced = mgmt.sync_templates(account=self.account.name)
+		self.assertTrue(synced["success"], synced)
+		self.assertEqual(synced["skipped"], 0, synced)
+		return f"{name}-en_US"
+
+	def test_body_only_edit_keeps_buttons_huf_cannot_rebuild(self):
+		flow = {"type": "FLOW", "text": "Open form", "flow_id": "123456", "flow_action": "navigate", "navigate_screen": "S1"}
+		docname = self._seed_and_sync("lc_flow", [
+			{"type": "BODY", "text": "Hi {{1}}, fill the form", "example": {"body_text": [["Ann"]]}},
+			{"type": "BUTTONS", "buttons": [flow]},
+		])
+		out = mgmt.edit_template(name=docname, payload=json.dumps({"body": "Hello {{1}}, please fill the form", "sample_values": "Ann"}))
+		self.assertTrue(out["success"], out)
+		sent = json.loads(self._edit_posts()[-1]["raw"])["components"]
+		self.assertEqual(sent[0]["text"], "Hello {{1}}, please fill the form")
+		self.assertEqual(sent[-1], {"type": "BUTTONS", "buttons": [flow]})
+		# the local FLOW row is not wiped either
+		self.assertEqual(frappe.db.count("WhatsApp Button", {"parent": docname}), 1)
+
+	def test_editing_buttons_of_a_flow_template_is_refused(self):
+		flow = {"type": "FLOW", "text": "Open form", "flow_id": "123456"}
+		docname = self._seed_and_sync("lc_flow2", [{"type": "BODY", "text": "Fill the form"}, {"type": "BUTTONS", "buttons": [flow]}])
+		out = mgmt.edit_template(name=docname, payload=json.dumps({"buttons": [{"type": "QUICK_REPLY", "text": "Hi"}]}))
+		self.assertEqual(out["error"], "edit_would_drop_buttons")
+		self.assertEqual(out["button_types"], ["FLOW"])
+		self.assertEqual(self._edit_posts(), [])
+
+	def test_without_extra_an_edit_that_would_drop_buttons_is_refused(self):
+		from huf.ai.gateway_adapters import whatsapp_template_guard as guard
+
+		flow = {"type": "FLOW", "text": "Open form", "flow_id": "123456"}
+		docname = self._seed_and_sync("lc_flow3", [{"type": "BODY", "text": "Fill the form"}, {"type": "BUTTONS", "buttons": [flow]}])
+		guard.delete_extra(self.account.name, docname)
+		out = mgmt.edit_template(name=docname, payload=json.dumps({"body": "Please fill the form"}))
+		self.assertEqual(out["error"], "edit_would_drop_buttons")
+		self.assertEqual(self._edit_posts(), [])
+
+	def test_imported_dynamic_url_and_copy_code_buttons_survive_a_body_edit(self):
+		buttons = [
+			{"type": "URL", "text": "Track", "url": "https://example.com/t/{{1}}", "example": ["https://example.com/t/abc"]},
+			{"type": "COPY_CODE", "example": "SAVE20"},
+		]
+		docname = self._seed_and_sync("lc_cta", [{"type": "BODY", "text": "Your offer"}, {"type": "BUTTONS", "buttons": buttons}])
+		out = mgmt.edit_template(name=docname, payload=json.dumps({"body": "Your new offer"}))
+		self.assertTrue(out["success"], out)
+		self.assertEqual(json.loads(self._edit_posts()[-1]["raw"])["components"][-1]["buttons"], buttons)
+
+	def test_imported_media_header_edit_reuploads_the_cdn_url(self):
+		url = self.server.add_file("cdn/hero.png", "image/png", fgc.PNG)
+		docname = self._seed_and_sync("lc_cdn", [
+			{"type": "HEADER", "format": "IMAGE", "example": {"header_handle": [url]}},
+			{"type": "BODY", "text": "Big news"},
+		])
+		out = mgmt.edit_template(name=docname, payload=json.dumps({"body": "Bigger news"}))
+		self.assertTrue(out["success"], out)
+		self.assertEqual(len(self.server.requests_to("POST", "/uploads")), 1)
+		header = json.loads(self._edit_posts()[-1]["raw"])["components"][0]
+		self.assertEqual(header["format"], "IMAGE")
+		self.assertTrue(header["example"]["header_handle"][0].startswith("4:"))
+		self.assertNotIn("http", header["example"]["header_handle"][0])
+
+	def test_imported_media_header_that_cannot_be_fetched_is_refused(self):
+		docname = self._seed_and_sync("lc_cdn2", [
+			{"type": "HEADER", "format": "IMAGE", "example": {"header_handle": [f"{self.server.url}/files/cdn/gone.png"]}},
+			{"type": "BODY", "text": "Big news"},
+		])
+		out = mgmt.edit_template(name=docname, payload=json.dumps({"body": "Bigger news"}))
+		self.assertEqual(out["error"], "media_header_edit_unsupported")
+		self.assertEqual(self._edit_posts(), [])
+		self.server.violations.clear()
+
+	def test_named_header_sample_change_is_a_real_edit(self):
+		self._need_bridge()
+		made = self._make_template(
+			template_name="lc_nh", body="Hi {{name}}, welcome", parameter_format="NAMED", named_samples={"name": "Ann"},
+			sample_values=None, header_type="TEXT", header="Order {{order}}", sample="A100", footer=None, buttons=None,
+		)
+		self.assertTrue(made["success"], made)
+		self.server.approve("lc_nh")
+		mgmt.sync_templates(account=self.account.name)
+		same = mgmt.edit_template(name=made["name"], payload=json.dumps({"sample": "A100"}))
+		self.assertEqual(same.get("error"), "no_changes", same)
+		changed = mgmt.edit_template(name=made["name"], payload=json.dumps({"sample": "B200"}))
+		self.assertTrue(changed["success"], changed)
+		header = json.loads(self._edit_posts()[-1]["raw"])["components"][0]
+		self.assertEqual(header["example"]["header_text_named_params"][0]["example"], "B200")
+
+	def test_imported_video_and_location_headers_are_not_mislabelled(self):
+		url = self.server.add_file("cdn/clip.mp4", "video/mp4", b"\x00\x00\x00\x18ftypmp42")
+		v = self._seed_and_sync("lc_vid", [{"type": "HEADER", "format": "VIDEO", "example": {"header_handle": [url]}}, {"type": "BODY", "text": "Watch"}], status="APPROVED")
+		loc = self._seed_and_sync("lc_loc", [{"type": "HEADER", "format": "LOCATION"}, {"type": "BODY", "text": "Visit us"}], status="APPROVED")
+		for docname, fmt in ((v, "VIDEO"), (loc, "LOCATION")):
+			row = frappe.db.get_value("WhatsApp Templates", docname, ["header_type", "header"])
+			self.assertEqual((row[0] or "", row[1] or ""), ("", ""))
+			self.assertEqual(self._extra(docname)["header_format"], fmt)
+			self.assertEqual(mgmt.get_template(name=docname)["header_format"], fmt)
+			self.assertEqual(mgmt.get_template(name=docname)["components"]["header"]["type"], fmt)
+		listed = {t["name"]: t for t in mgmt.list_templates(account=self.account.name)["templates"]}
+		self.assertEqual((listed[v]["header_format"], listed[loc]["header_format"]), ("VIDEO", "LOCATION"))
+		# a second sync does not flip them back and forth
+		again = mgmt.sync_templates(account=self.account.name)
+		self.assertEqual(again["updated"], 0, again)
+
+	def test_upload_session_uses_documented_query_params(self):
+		sample = self.server.add_file("samples/doc.png", "image/png", fgc.PNG)
+		self._need_bridge()
+		made = self._make_template(template_name="lc_up", header_type="IMAGE", sample=sample, header=None, body="Hi there", sample_values=None, footer=None, buttons=None)
+		self.assertTrue(made["success"], made)
+		(opened,) = self.server.requests_to("POST", "/uploads")
+		self.assertEqual(set(opened["query"]), {"file_length", "file_type", "file_name"})
+		self.assertEqual(opened["query"]["file_name"], "doc.png")
+		self.assertEqual(opened["raw"], b"")
+		self.assertNotIn(b"messaging_product", opened["raw"])
+		self.assertNotIn("messaging_product", opened["query"])
 
 	def test_category_and_ttl_are_passed_through(self):
 		docname = self._created("lc_cat")

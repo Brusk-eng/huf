@@ -751,7 +751,7 @@ class TestTemplateWizard(FakeGraphCase):
 		self.assertEqual(header["format"], "VIDEO")
 		handle = header["example"]["header_handle"][0]
 		self.assertTrue(handle.startswith("4:"))
-		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "VIDEO")
+		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "")  # doctype has no VIDEO
 		self.assertEqual(self._extra(created["name"])["header_format"], "VIDEO")
 		self.assertEqual(mgmt.get_template(name=created["name"])["header_format"], "VIDEO")
 		self._approve("fg_video")
@@ -768,7 +768,7 @@ class TestTemplateWizard(FakeGraphCase):
 		self.assertTrue(edited["success"], edited)
 		self.assertEqual(len(self.server.requests_to("POST", "/uploads")), 1)
 		self.assertEqual(self.server.requests_to("POST", f"/{created['id']}")[-1]["body"]["components"][0]["example"]["header_handle"], [handle])
-		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "VIDEO")
+		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "")
 		# a replacement sample is uploaded again; a header switch without a sample is refused
 		self._set_status("fg_video", "REJECTED")
 		newer = self.server.add_file("samples/clip2.mp4", "video/mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom2")
@@ -783,7 +783,8 @@ class TestTemplateWizard(FakeGraphCase):
 		created = self._create(template_name="fg_loc", header_type="LOCATION")
 		self.assertTrue(created["success"], created)
 		self.assertEqual(self._meta_post()["components"][0], {"type": "HEADER", "format": "LOCATION"})
-		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "LOCATION")
+		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "header_type"), "")
+		self.assertEqual(self._extra(created["name"])["header_format"], "LOCATION")
 		self._approve("fg_loc")
 		self.assertEqual(self._send("fg_loc", body_params=["Ann"])["errors"][0]["code"], "required")
 		loc = {"type": "location", "latitude": 12.97, "longitude": 77.59, "name": "HQ", "address": "1 Main St"}
