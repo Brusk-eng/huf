@@ -41,7 +41,7 @@ def _payload(messages=None, statuses=None):
 
 
 class TestWhatsAppIngress(unittest.TestCase):
-	def _call(self, payload=None, *, secret="s3cret", method="POST", query=None, body=None, ingest=None, record=None, forward=None, account_matches=True, gateway_rows=(), gateway_account="Acct", waba_accounts=None, bridge_available=True):
+	def _call(self, payload=None, *, secret="s3cret", method="POST", query=None, body=None, ingest=None, record=None, forward=None, account_matches=True, gateway_rows=(), gateway_account="Acct", waba_accounts=None, bridge_available=True, rate_limited=None, content_length=None):
 		adapter = WhatsAppGatewayAdapter(CREDS, gateway_context={"gateway_name": "WA"})
 		raw = body if body is not None else json.dumps(payload or {}).encode()
 		sig = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
@@ -50,8 +50,11 @@ class TestWhatsAppIngress(unittest.TestCase):
 		self.mock_frappe = MagicMock()
 		self.mock_frappe.PermissionError = frappe.PermissionError
 		self.mock_frappe.QueryDeadlockError = frappe.QueryDeadlockError
-		self.mock_frappe.request = SimpleNamespace(args={"gateway_name": "WA"})
+		self.mock_frappe.request = SimpleNamespace(args={"gateway_name": "WA"}, content_length=content_length)
+		self.mock_frappe.RateLimitExceededError = frappe.RateLimitExceededError
 		self.mock_frappe.local = SimpleNamespace(response=response)
+		self.response_headers = {}
+		self.mock_frappe.local.response_headers = self.response_headers
 		self.mock_frappe.get_doc.return_value = SimpleNamespace(
 			name="WA", provider="WhatsApp", is_enabled=1, whatsapp_account=gateway_account
 		)
@@ -65,7 +68,11 @@ class TestWhatsAppIngress(unittest.TestCase):
 		with patch("huf.ai.gateway_webhook.frappe", self.mock_frappe), patch(
 			"huf.ai.gateway_webhook.get_gateway_adapter", return_value=adapter
 		), patch("huf.ai.gateway_webhook._inbound_request", return_value=request), patch(
-			"huf.ai.gateway_webhook._ingest_rate_gate", self.gate
+			*(
+				("huf.ai.gateway_webhook._ingest_rate_gate", self.gate)
+				if rate_limited is None
+				else ("huf.ai.gateway_webhook._ingest_rate_limited", rate_limited)
+			)
 		), patch("huf.ai.gateway_service.ingest_gateway_event", self.ingest), patch(
 			f"{BRIDGE}.forward_status", self.forward
 		), patch(f"{BRIDGE}.record_incoming", self.record), patch(
@@ -301,6 +308,61 @@ class TestWhatsAppIngress(unittest.TestCase):
 			gateway_rows=rows,
 		)
 		self.mock_frappe.db.set_value.assert_not_called()
+
+	def test_batch_of_150_messages_is_capped_at_100(self):
+		result = self._call(_payload([_msg(f"wamid.{i}") for i in range(150)]))
+		self.assertTrue(result["success"])
+		self.assertEqual(self.ingest.call_count, 100)
+		self.assertEqual(result["ingested"], 100)
+		self.assertEqual([c.args[1] for c in self.ingest.call_args_list], [f"wamid.{i}" for i in range(100)])
+		self.assertIn("first 100", result["note"])
+		self.gate.assert_called_once()  # the batch counts as one request against the budget
+
+	def test_burst_of_signed_posts_hits_the_rate_limit_with_retry_after(self):
+		hits = []
+
+		def limited():
+			hits.append(1)
+			if len(hits) > 100:
+				raise frappe.RateLimitExceededError
+
+		for i in range(100):
+			self.assertTrue(self._call(_payload([_msg(f"wamid.b{i}")]), rate_limited=limited)["success"])
+		with self.assertRaises(frappe.RateLimitExceededError):
+			self._call(_payload([_msg("wamid.over")]), rate_limited=limited)
+		self.assertEqual(self.response_headers.get("Retry-After"), "60")
+		self.ingest.assert_not_called()
+
+	def test_status_only_burst_never_consumes_the_rate_budget(self):
+		limited = MagicMock(side_effect=frappe.RateLimitExceededError)
+		for _ in range(150):
+			self.assertTrue(self._call(_payload(statuses=[{"id": "w", "status": "read"}]), rate_limited=limited)["success"])
+		limited.assert_not_called()
+
+	def test_oversized_text_reaches_the_event_capped_and_marked_truncated(self):
+		from huf.ai import gateway_service
+
+		result = self._call(_payload([_msg("wamid.big", "x" * 50_000)]))
+		self.assertTrue(result["success"])
+		context = self.ingest.call_args.args[2]
+		capped = gateway_service._cap_message_text(context["message_text"])
+		self.assertEqual(len(capped), gateway_service.MESSAGE_TEXT_MAX_CHARS + len("\n[truncated]"))
+		self.assertTrue(capped.endswith("\n[truncated]"))
+		self.assertTrue(capped.startswith("x" * 100))
+
+	def test_body_over_the_cap_is_413_on_the_whatsapp_route(self):
+		body = b"x" * (4 * 1024 * 1024)
+		result = self._call(body=body)
+		self.assertEqual(result, {"success": False, "error": "Payload too large"})
+		self.assertEqual(self.response.http_status_code, 413)
+		self.ingest.assert_not_called()
+		self.gate.assert_not_called()
+
+	def test_declared_content_length_over_the_cap_is_413_before_reading_the_body(self):
+		result = self._call(_payload([_msg("wamid.1")]), content_length=4 * 1024 * 1024)
+		self.assertEqual(self.response.http_status_code, 413)
+		self.assertFalse(result["success"])
+		self.ingest.assert_not_called()
 
 	def test_malformed_signed_json_is_400(self):
 		result = self._call(body=b"not json")
