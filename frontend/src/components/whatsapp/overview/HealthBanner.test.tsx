@@ -125,4 +125,15 @@ describe('HealthBanner', () => {
 		view(null, { loading: true });
 		expect(screen.getByLabelText('Loading health')).toHaveAttribute('aria-busy', 'true');
 	});
+
+	it('a rejected token reads Token rejected in red and Credentials follows the blocked step', () => {
+		view(gw({
+			checklist: [{ code: 'credentials', state: 'blocked' }],
+			token_check: { valid: false, token_type: null, expires_at: null, missing_scopes: [], waba_ids: [], phone: null, webhook_subscribed: null, checked_at: null, source: null },
+		}));
+		expect(screen.getByText('Token rejected')).toBeInTheDocument();
+		expect(screen.queryByText('Token valid')).toBeNull();
+		expect(screen.getByText('Token rejected').className).toMatch(/destructive/);
+		expect(screen.getByText('Credentials').className).toMatch(/destructive/);
+	});
 });

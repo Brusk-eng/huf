@@ -21,6 +21,7 @@ export const CHECK_LABELS = {
 	enabled: 'Enabled',
 	credentials: 'Credentials',
 	token: 'Token valid',
+	tokenRejected: 'Token rejected',
 	receiving: 'Receiving',
 	delivering: 'Delivering',
 } as const;
