@@ -51,12 +51,12 @@ class TestGatewayPairingTools(IntegrationTestCase):
 
         gw_doc = frappe.get_doc("Gateway", gw_name)
         code = _create_pairing_request(gw_doc, sender_id="user_12345")
-        self.assertTrue(code.startswith("PAIR-"))
+        self.assertRegex(code, r"^PAIR-[A-Z2-9]{8}$")
 
         pending = list_pairing_requests(gw_name)
         self.assertTrue(any(p["pairing_code"] == code for p in pending))
 
-        approval = approve_pairing_code(code, notes="Approved during automated test")
+        approval = approve_pairing_code(code, notes="Approved during automated test", gateway_name=gw_name)
         self.assertTrue(approval["success"])
         self.assertEqual(approval["state"], "Approved")
 

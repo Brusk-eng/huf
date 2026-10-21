@@ -463,6 +463,11 @@ class TestApproveGatewayPairing(unittest.TestCase):
     the orphaned `gateway_pairing_tools.approve_pairing_code` and the
     Desk-only `approve_gateway_access_entry` (kept as a thin alias below)."""
 
+    def _admin(self, value):
+        patcher = patch("huf.ai.gateway_service._is_gateway_admin", return_value=value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @patch("huf.ai.gateway_service.now_datetime", return_value=datetime(2026, 7, 26, 0, 0, 0))
     @patch("huf.ai.gateway_service.frappe")
     def test_approve_by_pairing_code_clears_expires_at(self, mock_frappe, mock_now):
@@ -472,12 +477,13 @@ class TestApproveGatewayPairing(unittest.TestCase):
         entry = access_entry(expires_at=None)
         # frappe.get_all returns frappe._dict rows, and _find_pending_entry_by_code
         # reads row.pairing_code by attribute -- a plain dict here would raise.
-        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9K"})]
+        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9KXM4Q"})]
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.session.user = "admin@example.com"
 
-        result = gateway_service.approve_gateway_pairing("pair-7a9k")
+        result = gateway_service.approve_gateway_pairing("pair-7a9kxm4q", gateway="GW")
 
         assert result["state"] == "Approved"
         assert result["name"] == entry.name
@@ -499,6 +505,7 @@ class TestApproveGatewayPairing(unittest.TestCase):
         mock_frappe.db.exists.return_value = True
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.session.user = "admin@example.com"
 
         result = gateway_service.approve_gateway_pairing("ACCESS-LEGACY")
@@ -511,6 +518,7 @@ class TestApproveGatewayPairing(unittest.TestCase):
         mock_frappe.get_all.return_value = []
         mock_frappe.db.exists.return_value = False
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.ValidationError = ValueError
         mock_frappe.throw.side_effect = ValueError("No pending pairing request found")
 
@@ -522,14 +530,15 @@ class TestApproveGatewayPairing(unittest.TestCase):
         entry = access_entry(expires_at=datetime(2020, 1, 1))
         # frappe.get_all returns frappe._dict rows, and _find_pending_entry_by_code
         # reads row.pairing_code by attribute -- a plain dict here would raise.
-        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9K"})]
+        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9KXM4Q"})]
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.ValidationError = ValueError
         mock_frappe.throw.side_effect = ValueError("This pairing request is not active.")
 
         with self.assertRaises(ValueError):
-            gateway_service.approve_gateway_pairing("PAIR-7A9K")
+            gateway_service.approve_gateway_pairing("PAIR-7A9KXM4Q", gateway="GW")
         entry.db_set.assert_not_called()
 
     @patch("huf.ai.gateway_service.frappe")
@@ -537,24 +546,26 @@ class TestApproveGatewayPairing(unittest.TestCase):
         entry = access_entry(state="Approved")
         # frappe.get_all returns frappe._dict rows, and _find_pending_entry_by_code
         # reads row.pairing_code by attribute -- a plain dict here would raise.
-        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9K"})]
+        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9KXM4Q"})]
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.ValidationError = ValueError
         mock_frappe.throw.side_effect = ValueError("This pairing request is not active.")
 
         with self.assertRaises(ValueError):
-            gateway_service.approve_gateway_pairing("PAIR-7A9K")
+            gateway_service.approve_gateway_pairing("PAIR-7A9KXM4Q", gateway="GW")
         entry.db_set.assert_not_called()
 
     @patch("huf.ai.gateway_service.frappe")
     def test_approval_denied_without_write_permission(self, mock_frappe):
-        mock_frappe.has_permission.return_value = False
+        mock_frappe.has_permission.return_value = True  # doctype write alone is not enough
+        self._admin(False)
         mock_frappe.PermissionError = PermissionError
         mock_frappe.throw.side_effect = PermissionError("Not permitted")
 
         with self.assertRaises(PermissionError):
-            gateway_service.approve_gateway_pairing("PAIR-7A9K")
+            gateway_service.approve_gateway_pairing("PAIR-7A9KXM4Q", gateway="GW")
 
 
 class TestApproveGatewayAccessEntryAlias(unittest.TestCase):
@@ -569,6 +580,8 @@ class TestApproveGatewayAccessEntryAlias(unittest.TestCase):
         mock_frappe.db.exists.return_value = True
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        patch('huf.ai.gateway_service._is_gateway_admin', return_value=True).start()
+        self.addCleanup(patch.stopall)
         mock_frappe.session.user = "admin@example.com"
 
         result = gateway_service.approve_gateway_access_entry("ACCESS-001")
@@ -968,7 +981,7 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
         ).insert(ignore_permissions=True)
         self._gateway_names.append(name)
 
-    def _make_entry(self, gateway_name: str, *, state="Pending", expires_at=None, pairing_code="PAIR-TEST") -> str:
+    def _make_entry(self, gateway_name: str, *, state="Pending", expires_at=None, pairing_code="PAIR-TESTTEST") -> str:
         doc = frappe.get_doc(
             {
                 "doctype": "Gateway Access Entry",
@@ -988,10 +1001,10 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
         gw = "Test Approve By Code"
         self._make_gateway(gw)
         entry_name = self._make_entry(
-            gw, expires_at=add_to_date(now_datetime(), minutes=60), pairing_code="PAIR-CAFE"
+            gw, expires_at=add_to_date(now_datetime(), minutes=60), pairing_code="PAIR-CAFEBEEF"
         )
 
-        result = gateway_service.approve_gateway_pairing("pair-cafe")
+        result = gateway_service.approve_gateway_pairing("pair-cafebeef", gateway=gw)
 
         assert result["state"] == "Approved"
         entry = frappe.get_doc("Gateway Access Entry", entry_name)
@@ -1002,7 +1015,7 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
     def test_approve_by_legacy_entry_name_still_works(self):
         gw = "Test Approve By Name"
         self._make_gateway(gw)
-        entry_name = self._make_entry(gw, pairing_code="PAIR-BEEF")
+        entry_name = self._make_entry(gw, pairing_code="PAIR-BEEFCAFE")
 
         result = gateway_service.approve_gateway_access_entry(entry_name)
 
@@ -1013,20 +1026,20 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
         gw = "Test Expired Entry"
         self._make_gateway(gw)
         entry_name = self._make_entry(
-            gw, expires_at=add_to_date(now_datetime(), minutes=-5), pairing_code="PAIR-DEAD"
+            gw, expires_at=add_to_date(now_datetime(), minutes=-5), pairing_code="PAIR-DEADBEEF"
         )
 
         with self.assertRaises(frappe.ValidationError):
-            gateway_service.approve_gateway_pairing("PAIR-DEAD")
+            gateway_service.approve_gateway_pairing("PAIR-DEADBEEF", gateway=gw)
         assert frappe.db.get_value("Gateway Access Entry", entry_name, "state") == "Pending"
 
     def test_already_approved_entry_is_rejected(self):
         gw = "Test Already Approved"
         self._make_gateway(gw)
-        self._make_entry(gw, state="Approved", pairing_code="PAIR-DONE")
+        self._make_entry(gw, state="Approved", pairing_code="PAIR-DONEDONE")
 
         with self.assertRaises(frappe.ValidationError):
-            gateway_service.approve_gateway_pairing("PAIR-DONE")
+            gateway_service.approve_gateway_pairing("PAIR-DONEDONE")
 
     def test_unknown_code_is_rejected(self):
         with self.assertRaises(frappe.ValidationError):

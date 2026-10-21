@@ -442,6 +442,129 @@ def _route_target(target_type: str | None, agent: str | None, flow: str | None) 
     return None
 
 
+# ---------------------------------------------------------------------------
+# Admission, pairing, opt-out and per-sender limits (T2)
+# ---------------------------------------------------------------------------
+
+# 31 unambiguous characters: A-Z without I, L, O and 2-9 (no 0/1).
+PAIRING_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+PAIRING_CODE_LENGTH = 8
+PAIRING_PREFIX = "PAIR-"
+PAIRING_RESEND_COOLDOWN_MINUTES = 10
+PAIRING_APPROVAL_MAX_FAILURES_PER_MINUTE = 5
+PENDING_ENTRY_RETENTION_DAYS = 7
+
+# Access entry states that stop a sender from being admitted or re-paired.
+ENTRY_STATE_BLOCKED = "Blocked"
+ENTRY_STATE_REVOKED = "Revoked"
+ENTRY_STATE_OPTED_OUT = "Opted out"
+ENTRY_STATE_EXPIRED = "Expired"
+_RESTORABLE_STATES = ("Approved", ENTRY_STATE_REVOKED, ENTRY_STATE_BLOCKED)
+_LIVE_ENTRY_STATES = ("Approved", "Pending", ENTRY_STATE_OPTED_OUT, ENTRY_STATE_REVOKED, ENTRY_STATE_BLOCKED)
+
+# Providers that run STOP/START handling and the per-sender inbound limit.
+# Other providers keep their previous behaviour byte-for-byte.
+CONSENT_PROVIDERS = ("WhatsApp",)
+DEFAULT_OPT_OUT_KEYWORDS = "STOP\nUNSUBSCRIBE\nCANCEL\nEND\nQUIT"
+DEFAULT_OPT_IN_KEYWORDS = "START\nUNSTOP\nSUBSCRIBE"
+DEFAULT_OPT_OUT_REPLY = (
+    "You have been unsubscribed and will not receive further messages. Reply START to resubscribe."
+)
+DEFAULT_OPT_IN_REPLY = "You have been resubscribed. Reply STOP at any time to unsubscribe."
+DEFAULT_INBOUND_SENDER_LIMIT = 20
+INBOUND_SENDER_WINDOW_SECONDS = 600
+
+_GATEWAY_ADMIN_ROLES = ("System Manager", "Huf Admin")
+
+
+# -- small cache counter helpers ------------------------------------------------
+
+
+def _counter_key(*parts: Any) -> str:
+    return "huf:gw:" + ":".join(str(p) for p in parts)
+
+
+def _bump_counter(key: str, ttl_seconds: int) -> int:
+    """Atomically increment a fixed-window counter and return the new value."""
+    cache = frappe.cache()
+    redis_key = cache.make_key(key)
+    count = int(cache.incrby(redis_key, 1))
+    cache.expire(redis_key, ttl_seconds)
+    return count
+
+
+def _read_counter(key: str) -> int:
+    cache = frappe.cache()
+    try:
+        return int(cache.get(cache.make_key(key)) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# -- authority ------------------------------------------------------------------
+
+
+def _is_gateway_admin() -> bool:
+    """Admin role, or the Huf ``system.integrations.manage`` capability."""
+    if set(frappe.get_roles() or []).intersection(_GATEWAY_ADMIN_ROLES):
+        return True
+    try:
+        from huf.permissions import has_capability
+
+        return bool(has_capability(frappe.session.user, "system.integrations.manage"))
+    except Exception:
+        return False
+
+
+def _require_gateway_admin() -> None:
+    if not _is_gateway_admin():
+        frappe.throw(_("Gateway administrator permission is required."), frappe.PermissionError)
+
+
+# -- pairing codes --------------------------------------------------------------
+
+
+def _generate_pairing_code() -> str:
+    suffix = "".join(secrets.choice(PAIRING_ALPHABET) for _i in range(PAIRING_CODE_LENGTH))
+    return f"{PAIRING_PREFIX}{suffix}"
+
+
+def normalize_pairing_code(value: Any) -> str:
+    """Return the canonical ``PAIR-XXXXXXXX`` form, or ``""`` if ``value`` is not a code.
+
+    Accepts any case, surrounding whitespace, and the dash being omitted
+    (``pair-abcd2345``, ``PAIRABCD2345``, bare ``ABCD2345``).
+    """
+    text = re.sub(r"\s+", "", str(value or "")).upper()
+    if text.startswith("PAIR"):
+        text = text[4:].lstrip("-")
+    if len(text) != PAIRING_CODE_LENGTH or any(ch not in PAIRING_ALPHABET for ch in text):
+        return ""
+    return f"{PAIRING_PREFIX}{text}"
+
+
+def _code_in_use(gateway_name: str, code: str) -> bool:
+    return bool(
+        frappe.get_all(
+            "Gateway Access Entry",
+            filters={"gateway": gateway_name, "state": "Pending", "pairing_code": code},
+            pluck="name",
+            limit_page_length=1,
+        )
+    )
+
+
+def _new_unique_pairing_code(gateway_name: str) -> str:
+    for _attempt in range(10):
+        code = _generate_pairing_code()
+        if not _code_in_use(gateway_name, code):
+            return code
+    frappe.throw(_("Could not allocate a unique pairing code. Try again."))
+
+
+# -- access entries -------------------------------------------------------------
+
+
 def _has_access_entry(gateway, entry_type: str, external_id: str) -> bool:
     if not external_id:
         return False
@@ -459,13 +582,271 @@ def _has_access_entry(gateway, entry_type: str, external_id: str) -> bool:
     return bool(entries)
 
 
+def _sender_negative_state(gateway, sender_id: str) -> str | None:
+    """Return ``Opted out``, ``Blocked`` or ``Revoked`` if the sender is in that state.
+
+    Opted out and Blocked always win. Revoked loses to a currently valid
+    Approved entry (an admin explicitly re-approved the sender).
+    """
+    if not sender_id:
+        return None
+    external_id = _normalize_sender_for_provider(gateway.provider, "Sender", sender_id)
+    states = set(
+        frappe.get_all(
+            "Gateway Access Entry",
+            filters={
+                "gateway": gateway.name,
+                "entry_type": "Sender",
+                "provider": gateway.provider,
+                "external_id": external_id,
+                "state": ["in", [ENTRY_STATE_OPTED_OUT, ENTRY_STATE_BLOCKED, ENTRY_STATE_REVOKED]],
+            },
+            pluck="state",
+            limit_page_length=0,
+        )
+        or []
+    )
+    if ENTRY_STATE_OPTED_OUT in states:
+        return ENTRY_STATE_OPTED_OUT
+    if ENTRY_STATE_BLOCKED in states:
+        return ENTRY_STATE_BLOCKED
+    if ENTRY_STATE_REVOKED in states and not _has_access_entry(gateway, "Sender", sender_id):
+        return ENTRY_STATE_REVOKED
+    return None
+
+
+def is_opted_out(gateway, sender: str) -> bool:
+    """True if ``sender`` opted out (STOP) on ``gateway``.
+
+    Outbound proactive/template sends MUST call this and refuse when True.
+    ``gateway`` may be a Gateway doc or its name. The opt-out confirmation
+    itself is sent inside ``_consent_send_scope`` which makes this return False
+    for that one sender so the confirmation is not blocked by its own gate.
+    """
+    if not sender:
+        return False
+    if isinstance(gateway, str):
+        provider = frappe.db.get_value("Gateway", gateway, "provider")
+        gateway_name = gateway
+    else:
+        provider = gateway.provider
+        gateway_name = gateway.name
+    external_id = _normalize_sender_for_provider(provider, "Sender", sender)
+    if getattr(frappe.local, "huf_consent_send_scope", None) == (gateway_name, external_id):
+        return False
+    return bool(
+        frappe.get_all(
+            "Gateway Access Entry",
+            filters={
+                "gateway": gateway_name,
+                "entry_type": "Sender",
+                "external_id": external_id,
+                "state": ENTRY_STATE_OPTED_OUT,
+            },
+            pluck="name",
+            limit_page_length=1,
+        )
+    )
+
+
+class _consent_send_scope:
+    """Context manager letting the opt-out/in confirmation bypass ``is_opted_out``."""
+
+    def __init__(self, gateway, sender_id: str):
+        self._token = (gateway.name, _normalize_sender_for_provider(gateway.provider, "Sender", sender_id))
+        self._previous = None
+
+    def __enter__(self):
+        self._previous = getattr(frappe.local, "huf_consent_send_scope", None)
+        frappe.local.huf_consent_send_scope = self._token
+        return self
+
+    def __exit__(self, *exc):
+        frappe.local.huf_consent_send_scope = self._previous
+        return False
+
+
+def _send_plain_reply(gateway, sender_id: str, conversation_id: str | None, text: str) -> None:
+    """Best-effort text reply through the gateway adapter (never raises)."""
+    try:
+        from huf.ai.gateway_adapters.types import GatewayReply
+        from huf.ai.gateway_webhook import get_gateway_adapter
+
+        with _consent_send_scope(gateway, sender_id):
+            get_gateway_adapter(gateway).send_reply(
+                GatewayReply(conversation_id=conversation_id or sender_id, text=text)
+            )
+    except _whatsapp_send_errors(gateway.provider) as exc:
+        frappe.logger("huf").warning(f"Consent reply not delivered: {_whatsapp_error_text(exc)}")
+    except Exception as exc:
+        frappe.logger("huf").warning(f"Failed to send consent reply: {_redact_error_text(str(exc))}")
+
+
+# -- opt-out / opt-in -----------------------------------------------------------
+
+
+def _normalize_consent_text(text: Any) -> str:
+    """Lowercase, drop punctuation/symbols/emoji, collapse whitespace."""
+    import unicodedata
+
+    out = []
+    for ch in str(text or "").casefold():
+        if ch in ("︎", "️", "‍"):
+            continue
+        category = unicodedata.category(ch)
+        out.append(ch if category[0] in ("L", "N", "M") else " ")
+    return " ".join("".join(out).split())
+
+
+def _keyword_set(gateway, fieldname: str, default: str) -> set[str]:
+    raw = getattr(gateway, fieldname, None)
+    if raw is None or not str(raw).strip():
+        raw = default
+    keywords = set()
+    for part in re.split(r"[\n,]", str(raw)):
+        normalized = _normalize_consent_text(part)
+        if normalized:
+            keywords.add(normalized)
+    return keywords
+
+
+def _text_matches_keywords(gateway, text: Any, fieldname: str, default: str) -> bool:
+    normalized = _normalize_consent_text(text)
+    return bool(normalized) and normalized in _keyword_set(gateway, fieldname, default)
+
+
+def _live_sender_entry(gateway, sender_id: str) -> dict | None:
+    external_id = _normalize_sender_for_provider(gateway.provider, "Sender", sender_id)
+    rows = frappe.get_all(
+        "Gateway Access Entry",
+        filters={
+            "gateway": gateway.name,
+            "entry_type": "Sender",
+            "provider": gateway.provider,
+            "external_id": external_id,
+            "state": ["in", list(_LIVE_ENTRY_STATES)],
+        },
+        fields=["name", "state", "previous_state"],
+        order_by="modified desc",
+        limit_page_length=0,
+    )
+    for row in rows or []:
+        return row
+    return None
+
+
+def _record_opt_out(gateway, sender_id: str, display_name: str | None = None) -> None:
+    external_id = _normalize_sender_for_provider(gateway.provider, "Sender", sender_id)
+    row = _live_sender_entry(gateway, sender_id)
+    if row:
+        frappe.db.set_value(
+            "Gateway Access Entry",
+            row["name"],
+            {"state": ENTRY_STATE_OPTED_OUT, "previous_state": row["state"]},
+        )
+        return
+    frappe.get_doc(
+        {
+            "doctype": "Gateway Access Entry",
+            "gateway": gateway.name,
+            "entry_type": "Sender",
+            "provider": gateway.provider,
+            "external_id": external_id,
+            "state": ENTRY_STATE_OPTED_OUT,
+            "previous_state": "",
+            "display_label": (display_name or "").strip() or f"Sender {external_id}",
+        }
+    ).insert(ignore_permissions=True)
+
+
+def _record_opt_in(gateway, sender_id: str) -> None:
+    row = _live_sender_entry(gateway, sender_id)
+    if not row or row["state"] != ENTRY_STATE_OPTED_OUT:
+        return
+    previous = row.get("previous_state")
+    restored = previous if previous in _RESTORABLE_STATES else ENTRY_STATE_EXPIRED
+    frappe.db.set_value(
+        "Gateway Access Entry", row["name"], {"state": restored, "previous_state": ""}
+    )
+
+
+def _reject_event(event, reason: str) -> dict:
+    event.db_set({"status": "Rejected", "error_message": reason})
+    return {"event_name": event.name, "status": "Rejected"}
+
+
+def _handle_consent_event(event, gateway, context: dict[str, Any]) -> dict | None:
+    """STOP/START handling, before admission. Returns a result dict when handled."""
+    if gateway.provider not in CONSENT_PROVIDERS or context.get("is_room"):
+        return None
+    sender_id = str(context.get("sender_id") or "")
+    if not sender_id:
+        return None
+    text = context.get("message_text")
+    state = _sender_negative_state(gateway, sender_id)
+    conversation_id = str(context.get("conversation_id") or "") or sender_id
+
+    if state == ENTRY_STATE_OPTED_OUT:
+        if _text_matches_keywords(gateway, text, "opt_in_keywords", DEFAULT_OPT_IN_KEYWORDS):
+            _record_opt_in(gateway, sender_id)
+            _send_plain_reply(gateway, sender_id, conversation_id, DEFAULT_OPT_IN_REPLY)
+            return _reject_event(event, "Sender opted back in (START); no agent run")
+        return _reject_event(event, "Sender has opted out")
+
+    if state in (ENTRY_STATE_BLOCKED, ENTRY_STATE_REVOKED):
+        return None  # admission rejects these silently
+
+    if _text_matches_keywords(gateway, text, "opt_out_keywords", DEFAULT_OPT_OUT_KEYWORDS):
+        _record_opt_out(gateway, sender_id, str(context.get("display_name") or "") or None)
+        reply = getattr(gateway, "opt_out_reply_text", None) or DEFAULT_OPT_OUT_REPLY
+        _send_plain_reply(gateway, sender_id, conversation_id, reply)
+        return _reject_event(event, "Sender opted out (STOP); no agent run")
+    return None
+
+
+# -- per-sender inbound limit ---------------------------------------------------
+
+
+def _sender_rate_limit_reason(gateway, context: dict[str, Any]) -> str:
+    """Return a rejection reason when the sender exceeded the per-10-minute limit."""
+    if gateway.provider not in CONSENT_PROVIDERS:
+        return ""
+    sender_id = str(context.get("sender_id") or "")
+    limit = getattr(gateway, "inbound_sender_limit", None)
+    limit = DEFAULT_INBOUND_SENDER_LIMIT if limit is None else int(limit)
+    if not sender_id or limit <= 0:
+        return ""
+    bucket = int(time.time() // INBOUND_SENDER_WINDOW_SECONDS)
+    count = _bump_counter(_counter_key("sender", gateway.name, sender_id, bucket), INBOUND_SENDER_WINDOW_SECONDS * 2)
+    if count > limit:
+        return f"sender_rate_limited: more than {limit} messages in 10 minutes from this sender"
+    return ""
+
+
+def _process_time_block_reason(gateway, event) -> str:
+    """Re-check, at run time, that the sender is still allowed (revoked/blocked/opted out after queueing)."""
+    sender_id = str(getattr(event, "sender_id", "") or "")
+    state = _sender_negative_state(gateway, sender_id) if sender_id else None
+    if state:
+        return f"Sender is no longer admitted ({state})"
+    return ""
+
+
+# -- pairing --------------------------------------------------------------------
+
+
 def _create_pairing_request(
     gateway, sender_id: str, conversation_id: str | None = None, display_name: str | None = None
 ) -> str:
-    """Create a live pairing request with a short pairing code (PAIR-XXXX)."""
+    """Issue (or return) a live pairing request code (``PAIR-XXXXXXXX``).
+
+    Returns ``""`` when no new code was issued because one was sent to this
+    sender within the resend cooldown.
+    """
     if not sender_id:
         return ""
     sender_id = _normalize_sender_for_provider(gateway.provider, "Sender", sender_id)
+    now = now_datetime()
     existing = frappe.get_all(
         "Gateway Access Entry",
         filters={
@@ -475,15 +856,36 @@ def _create_pairing_request(
             "external_id": str(sender_id),
             "state": "Pending",
         },
-        fields=["name", "pairing_code"],
+        fields=["name", "pairing_code", "expires_at"],
+        limit_page_length=0,
+    )
+    for row in existing or []:
+        if row.get("expires_at") and row.get("expires_at") < now:
+            frappe.db.set_value("Gateway Access Entry", row["name"], "state", ENTRY_STATE_EXPIRED)
+            continue
+        return row.get("pairing_code") or ""
+
+    recent = frappe.get_all(
+        "Gateway Access Entry",
+        filters={
+            "gateway": gateway.name,
+            "entry_type": "Sender",
+            "provider": gateway.provider,
+            "external_id": str(sender_id),
+            "pairing_sent_at": [">", add_to_date(now, minutes=-PAIRING_RESEND_COOLDOWN_MINUTES)],
+        },
+        pluck="name",
         limit_page_length=1,
     )
-    if existing:
-        return existing[0].get("pairing_code") or ""
+    if recent:
+        return ""  # cooldown: at most one pairing message per sender per window
 
-    code_suffix = secrets.token_hex(2).upper()
-    pairing_code = f"PAIR-{code_suffix}"
-
+    pairing_code = _new_unique_pairing_code(gateway.name)
+    # pairing_reply_enabled defaults to 1 (on) but doesn't exist on Gateway
+    # docs created before this field was added; getattr keeps those enabled
+    # rather than silently going quiet.
+    reply_enabled = bool(getattr(gateway, "pairing_reply_enabled", 1))
+    ttl_minutes = int(gateway.pairing_ttl_minutes or 60)
     doc = frappe.get_doc(
         {
             "doctype": "Gateway Access Entry",
@@ -493,15 +895,13 @@ def _create_pairing_request(
             "external_id": str(sender_id),
             "pairing_code": pairing_code,
             "state": "Pending",
-            "expires_at": add_to_date(now_datetime(), minutes=int(gateway.pairing_ttl_minutes or 60)),
+            "expires_at": add_to_date(now, minutes=ttl_minutes),
+            "pairing_sent_at": now if (reply_enabled and getattr(gateway, "integration_settings", None)) else None,
             "display_label": display_name.strip() if display_name and display_name.strip() else f"Sender {sender_id}",
         }
     ).insert(ignore_permissions=True)
 
-    # pairing_reply_enabled defaults to 1 (on) but doesn't exist on Gateway
-    # docs created before this field was added; getattr keeps those enabled
-    # rather than silently going quiet.
-    if getattr(gateway, "pairing_reply_enabled", 1):
+    if reply_enabled:
         try:
             if gateway.integration_settings:
                 from huf.ai.gateway_adapters.types import GatewayReply
@@ -526,7 +926,8 @@ def _create_pairing_request(
                 reply_msg = (
                     f"🔒 Access approval required.\n\n"
                     f"Your pairing code is: `{pairing_code}`\n\n"
-                    f"Please share this code with the bot administrator to get approved."
+                    f"Please share this code with the bot administrator to get approved. "
+                    f"It expires in {ttl_minutes} minutes."
                 )
                 adapter.send_reply(GatewayReply(conversation_id=target_conv, text=reply_msg))
         except _whatsapp_send_errors(gateway.provider) as exc:
@@ -558,12 +959,18 @@ def _admission(gateway, context: dict[str, Any]) -> tuple[bool, str]:
     if not is_room:
         policy = gateway.direct_policy or "Allow list"
         if policy == "Pairing":
+            # Revoked/Blocked/Opted-out senders are never re-paired and get no reply.
+            blocked = _sender_negative_state(gateway, sender_id)
+            if blocked:
+                return False, f"Sender is blocked ({blocked})"
             if _has_access_entry(gateway, "Sender", sender_id):
                 return True, ""
             display_name = str(context.get("display_name") or "") or None
             code = _create_pairing_request(
                 gateway, sender_id, conversation_id=conversation_id, display_name=display_name
             )
+            if not code:
+                return False, "Sender pairing approval is required (pairing code was sent recently)"
             return False, f"Sender pairing approval is required. Pairing code: {code}"
         return (policy == "Allow list" and _has_access_entry(gateway, "Sender", sender_id), "Sender is not approved for this gateway")
 
@@ -575,48 +982,57 @@ def _admission(gateway, context: dict[str, Any]) -> tuple[bool, str]:
     return room_ok and sender_ok, "Room or sender is not approved for this gateway"
 
 
-def _find_pending_entry_by_code(pairing_code: str) -> str | None:
-    """Constant-time-compare a candidate code against every Pending entry's
-    stored code, rather than an indexed equality filter, per the rate-limiting
-    plan for this brute-forceable endpoint (see approve_gateway_pairing)."""
+def _find_pending_entry_by_code(pairing_code: str, gateway: str) -> str | None:
+    """Constant-time-compare a candidate code against the Pending entries of ONE gateway."""
     pending = frappe.get_all(
         "Gateway Access Entry",
-        filters={"state": "Pending"},
+        filters={"state": "Pending", "gateway": gateway},
         fields=["name", "pairing_code"],
     )
+    matched = None
     for row in pending:
+        # Compare every row (no early exit) so timing does not reveal position.
         if row.pairing_code and secrets.compare_digest(row.pairing_code, pairing_code):
-            return row.name
-    return None
+            matched = row.name
+    return matched
+
+
+def _approval_failure_key() -> str:
+    return _counter_key("pairing_fail", frappe.session.user, int(time.time() // 60))
 
 
 @frappe.whitelist(methods=["POST"])
 @rate_limit(limit=20, seconds=60)
-def approve_gateway_pairing(code_or_entry_name: str, notes: str | None = None) -> dict:
-    """Approve a pending Gateway Access Entry by its PAIR-XXXX code or doc name.
+def approve_gateway_pairing(code_or_entry_name: str, notes: str | None = None, gateway: str | None = None) -> dict:
+    """Approve a pending Gateway Access Entry by its ``PAIR-XXXXXXXX`` code or doc name.
 
-    This is the canonical approval path, consolidating the previously
-    unreachable ``gateway_pairing_tools.approve_pairing_code`` and the
-    Desk-only, doc-name-only ``approve_gateway_access_entry`` into one
-    whitelisted function reachable both ways. Looks up by ``pairing_code``
-    first (case-normalized, constant-time compared since a pairing code is
-    guessable and this endpoint is otherwise unauthenticated-by-code), then
-    falls back to matching by document name for backward compatibility with
-    existing entry_name-based callers.
+    Admin-only (System Manager / Huf Admin / ``system.integrations.manage``).
+    A code is looked up only among the Pending entries of ``gateway`` (required
+    when approving by code), compared in constant time. More than 5 wrong
+    attempts per admin per minute are refused.
     """
-    if not frappe.has_permission("Gateway Access Entry", "write"):
-        frappe.throw(_("Not permitted"), frappe.PermissionError)
-    if not code_or_entry_name or not code_or_entry_name.strip():
+    _require_gateway_admin()
+    if not code_or_entry_name or not str(code_or_entry_name).strip():
         frappe.throw(_("A pairing code or entry name is required."))
 
-    code_clean = code_or_entry_name.strip().upper()
-    entry_name = _find_pending_entry_by_code(code_clean)
-    if not entry_name:
-        raw_name = code_or_entry_name.strip()
-        if frappe.db.exists("Gateway Access Entry", raw_name):
-            entry_name = raw_name
+    failure_key = _approval_failure_key()
+    if _read_counter(failure_key) >= PAIRING_APPROVAL_MAX_FAILURES_PER_MINUTE:
+        frappe.throw(_("Too many failed pairing attempts. Wait a minute and try again."), frappe.TooManyRequestsError)
+
+    raw = str(code_or_entry_name).strip()
+    code = normalize_pairing_code(raw)
+    entry_name = None
+    if code:
+        if not gateway:
+            frappe.throw(_("A gateway is required to approve by pairing code."))
+        entry_name = _find_pending_entry_by_code(code, gateway)
+    if not entry_name and frappe.db.exists("Gateway Access Entry", raw):
+        entry_name = raw
+        if gateway and frappe.db.get_value("Gateway Access Entry", raw, "gateway") != gateway:
+            entry_name = None
 
     if not entry_name:
+        _bump_counter(failure_key, 120)
         frappe.throw(_("No pending pairing request found matching '{0}'.").format(code_or_entry_name))
 
     entry = frappe.get_doc("Gateway Access Entry", entry_name)
@@ -644,7 +1060,7 @@ def approve_gateway_pairing(code_or_entry_name: str, notes: str | None = None) -
         gw_doc = frappe.get_doc("Gateway", entry.gateway)
         if gw_doc.integration_settings:
             adapter = get_gateway_adapter(gw_doc)
-            
+
             target_conv = entry.external_id
             target_thread = None
             recent_events = frappe.get_all(
@@ -663,7 +1079,7 @@ def approve_gateway_pairing(code_or_entry_name: str, notes: str | None = None) -
                 "You can now interact directly with this assistant."
             )
             adapter.send_reply(GatewayReply(
-                conversation_id=target_conv, 
+                conversation_id=target_conv,
                 text=welcome_text,
                 thread_id=target_thread or None,
                 reply_to_provider_message_id=target_thread or None,
@@ -723,12 +1139,40 @@ def list_gateway_access_entries(gateway: str | None = None, state: str = "Pendin
 
 @frappe.whitelist(methods=["POST"])
 def revoke_gateway_access_entry(entry_name: str) -> dict:
-    """Revoke an entry, pending or previously approved, denying it going forward."""
+    """Revoke an entry, pending or previously approved, denying it going forward.
+
+    A revoked sender is blocked: it never gets a new pairing request or run.
+    """
     if not frappe.has_permission("Gateway Access Entry", "write"):
         frappe.throw(_("Not permitted"), frappe.PermissionError)
     entry = frappe.get_doc("Gateway Access Entry", entry_name)
     entry.db_set({"state": "Revoked", "revoked_at": now_datetime()})
     return {"name": entry.name, "state": "Revoked"}
+
+
+def cleanup_stale_access_entries() -> dict:
+    """Daily job: mark expired Pending entries Expired, delete Expired ones after 7 days."""
+    now = now_datetime()
+    expired = frappe.get_all(
+        "Gateway Access Entry",
+        filters={"state": "Pending", "expires_at": ["<", now]},
+        pluck="name",
+        limit_page_length=0,
+    )
+    for name in expired:
+        frappe.db.set_value("Gateway Access Entry", name, "state", ENTRY_STATE_EXPIRED)
+    stale = frappe.get_all(
+        "Gateway Access Entry",
+        filters={
+            "state": ENTRY_STATE_EXPIRED,
+            "modified": ["<", add_to_date(now, days=-PENDING_ENTRY_RETENTION_DAYS)],
+        },
+        pluck="name",
+        limit_page_length=0,
+    )
+    for name in stale:
+        frappe.delete_doc("Gateway Access Entry", name, ignore_permissions=True, force=True)
+    return {"expired": len(expired), "deleted": len(stale)}
 
 
 def resolve_gateway_route(gateway_name: str, context: dict[str, Any]) -> dict:
@@ -812,10 +1256,16 @@ def ingest_gateway_event(
     if not gateway.is_enabled:
         event.db_set({"status": "Rejected", "error_message": "Gateway is disabled"})
         return {"event_name": event.name, "status": "Rejected"}
+    consent = _handle_consent_event(event, gateway, context)
+    if consent is not None:
+        return consent
     admitted, reason = _admission(gateway, context)
     if not admitted:
         event.db_set({"status": "Rejected", "error_message": reason})
         return {"event_name": event.name, "status": "Rejected"}
+    limited = _sender_rate_limit_reason(gateway, context)
+    if limited:
+        return _reject_event(event, limited)
 
     route = resolve_gateway_route(gateway_name, context)
     if route["status"] != "Queued":
@@ -851,6 +1301,10 @@ def process_gateway_event(event_name: str) -> dict:
     if not gateway.is_enabled or not gateway.execution_user:
         event.db_set({"status": "Rejected", "error_message": "Gateway is disabled or has no Run as user"})
         return {"event_name": event.name, "status": "Rejected"}
+
+    blocked_reason = _process_time_block_reason(gateway, event)
+    if blocked_reason:
+        return _reject_event(event, blocked_reason)
 
     if event.target_type == "Agent":
         # GW-08: this pre-gate authorizes the run as the Gateway's configured

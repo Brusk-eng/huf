@@ -44,6 +44,7 @@ class Gateway(Document):
         # WhatsApp: derive the indexed phone_number_id and enforce number uniqueness / account linking
         self._validate_whatsapp()
         self._validate_fallback_template()
+        self._validate_consent_settings()
 
         # ST-04.4: Validate required credentials are set
         if self.is_enabled and self.provider:
@@ -263,4 +264,19 @@ class Gateway(Document):
                 _("Gateway {0}: execution_user '{1}' does not have access to agent '{2}'.").format(
                     self.name, self.execution_user, self.default_agent
                 )
+            )
+
+    def _validate_consent_settings(self):
+        limit = self.get("inbound_sender_limit")
+        if limit is not None and int(limit) < 0:
+            frappe.throw(_("Inbound messages per sender must be 0 (off) or more."))
+
+        from huf.ai.gateway_service import _keyword_set
+
+        opt_out = _keyword_set(self, "opt_out_keywords", "")
+        opt_in = _keyword_set(self, "opt_in_keywords", "")
+        overlap = opt_out & opt_in
+        if overlap:
+            frappe.throw(
+                _("A keyword cannot be both an opt-out and an opt-in keyword: {0}").format(", ".join(sorted(overlap)))
             )

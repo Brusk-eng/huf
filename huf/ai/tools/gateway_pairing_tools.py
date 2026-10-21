@@ -7,12 +7,11 @@ and approve channel gateway pairings directly via chat or API.
 from __future__ import annotations
 
 import json
-import secrets
 from typing import Any
 
 import frappe
 from frappe import _
-from frappe.utils import add_to_date, now_datetime
+from frappe.utils import now_datetime
 
 from huf.ai.gateway_adapters.provider_ids import provider_to_service_id
 
@@ -168,7 +167,9 @@ def setup_gateway(
 
 
 def list_pairing_requests(gateway_name: str | None = None) -> list[dict[str, Any]]:
-	"""List pending DM/Room pairing access requests.
+	"""List active (unexpired) pending DM/Room pairing access requests.
+
+	Admin-only: pairing codes are approval credentials.
 
 	Args:
 		gateway_name: Optional gateway filter name
@@ -176,6 +177,9 @@ def list_pairing_requests(gateway_name: str | None = None) -> list[dict[str, Any
 	Returns:
 		List of pending pairing request dictionaries
 	"""
+	from huf.ai.gateway_service import _require_gateway_admin
+
+	_require_gateway_admin()
 	filters: dict[str, Any] = {"state": "Pending"}
 	if gateway_name:
 		filters["gateway"] = gateway_name
@@ -198,8 +202,11 @@ def list_pairing_requests(gateway_name: str | None = None) -> list[dict[str, Any
 		order_by="creation desc",
 	)
 
+	now = now_datetime()
 	results = []
 	for entry in entries:
+		if entry.get("expires_at") and entry["expires_at"] < now:
+			continue
 		results.append(
 			{
 				"entry_id": entry["name"],
@@ -216,12 +223,18 @@ def list_pairing_requests(gateway_name: str | None = None) -> list[dict[str, Any
 	return results
 
 
-def approve_pairing_code(pairing_code_or_id: str, notes: str | None = None) -> dict[str, Any]:
-	"""Approve a pending pairing request using its 8-character pairing code or entry ID.
+def approve_pairing_code(
+	pairing_code_or_id: str, notes: str | None = None, gateway_name: str | None = None
+) -> dict[str, Any]:
+	"""Approve a pending pairing request using its pairing code or entry ID.
+
+	Thin wrapper over ``gateway_service.approve_gateway_pairing`` (the single
+	canonical approval path): admin-only, gateway-scoped, brute-force limited.
 
 	Args:
-		pairing_code_or_id: The pairing code (e.g. "PAIR-7A9K") or entry ID
+		pairing_code_or_id: The pairing code (e.g. "PAIR-7A9KXM4Q") or entry ID
 		notes: Optional notes regarding the approval
+		gateway_name: Gateway the code belongs to (required when using a code)
 
 	Returns:
 		Dict with approval status and sender details
@@ -229,80 +242,22 @@ def approve_pairing_code(pairing_code_or_id: str, notes: str | None = None) -> d
 	if not pairing_code_or_id:
 		return {"success": False, "error": "pairing_code_or_id is required."}
 
-	code_clean = pairing_code_or_id.strip().upper()
+	from huf.ai.gateway_service import approve_gateway_pairing
 
-	# Match by pairing_code first, then by name or external_id
-	entries = frappe.get_all(
-		"Gateway Access Entry",
-		filters=[
-			["state", "=", "Pending"],
-			[
-				"pairing_code",
-				"=",
-				code_clean,
-			],
-		],
-		fields=["name", "gateway", "provider", "external_id", "entry_type"],
-		limit_page_length=1,
-	)
-
-	if not entries:
-		entries = frappe.get_all(
-			"Gateway Access Entry",
-			filters={
-				"name": pairing_code_or_id.strip(),
-				"state": "Pending",
-			},
-			fields=["name", "gateway", "provider", "external_id", "entry_type"],
-			limit_page_length=1,
-		)
-
-	if not entries:
-		return {"success": False, "error": f"No pending pairing request found matching '{pairing_code_or_id}'."}
-
-	entry = entries[0]
-	doc = frappe.get_doc("Gateway Access Entry", entry["name"])
-	doc.state = "Approved"
-	doc.approved_by = frappe.session.user if frappe.session.user != "Guest" else "Administrator"
-	doc.approved_at = now_datetime()
-	if notes:
-		doc.notes = notes
-	doc.save(ignore_permissions=True)
-
-	# Notify approved sender on external platform
-	notification_status = "Not attempted"
 	try:
-		gw_doc = frappe.get_doc("Gateway", doc.gateway)
-		if gw_doc.integration_settings:
-			int_doc = frappe.get_doc("Integration Settings", gw_doc.integration_settings)
-			creds = {}
-			for row in getattr(int_doc, "credentials", []):
-				creds[row.key] = row.get_password("value") if hasattr(row, "get_password") else row.value
-
-			from huf.ai.gateway_webhook import _adapter_class_for_provider
-			from huf.ai.gateway_adapters.types import GatewayReply
-
-			adapter_cls = _adapter_class_for_provider(gw_doc.provider)
-			adapter = adapter_cls(creds)
-
-			welcome_text = (
-				f"🎉 Your access pairing request has been approved!\n\n"
-				f"You can now interact directly with this assistant."
-			)
-			adapter.send_reply(GatewayReply(conversation_id=doc.external_id, text=welcome_text))
-			notification_status = "Welcome message sent to sender"
-	except Exception as exc:
-		notification_status = f"Approval saved, welcome message notice: {exc}"
+		result = approve_gateway_pairing(pairing_code_or_id, notes=notes, gateway=gateway_name)
+	except (frappe.ValidationError, frappe.PermissionError, frappe.TooManyRequestsError) as exc:
+		return {"success": False, "error": str(exc)}
 
 	return {
 		"success": True,
-		"entry_id": doc.name,
-		"gateway": doc.gateway,
-		"provider": doc.provider,
-		"external_id": doc.external_id,
+		"entry_id": result["name"],
+		"gateway": result["gateway"],
+		"provider": result["provider"],
+		"external_id": result["external_id"],
 		"state": "Approved",
-		"notification_status": notification_status,
-		"message": f"Pairing request '{pairing_code_or_id}' for {doc.provider} user {doc.external_id} approved successfully!",
+		"notification_status": result["notification_status"],
+		"message": f"Pairing request '{pairing_code_or_id}' for {result['provider']} user {result['external_id']} approved successfully!",
 	}
 
 
