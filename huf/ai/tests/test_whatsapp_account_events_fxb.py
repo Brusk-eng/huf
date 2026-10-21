@@ -6,6 +6,7 @@
 import json
 import pathlib
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -128,7 +129,7 @@ class TestAdapterParse(unittest.TestCase):
 
 class TestConsentOrdering(unittest.TestCase):
 	def test_meta_timestamp_stored_and_dedupe_checked(self):
-		with patch.object(ae.frappe.db, "exists", return_value=False) as exists, patch.object(ae.frappe, "get_doc") as get_doc:
+		with patch.object(ae.frappe.db, "exists", return_value=False) as exists, patch.object(ae.frappe, "get_doc") as get_doc, patch.object(ae.frappe.utils, "now_datetime", return_value=datetime(2026, 1, 1)):
 			ae.record_user_preferences("GW", PREFS)
 		doc = get_doc.call_args.args[0]
 		self.assertEqual(doc["meta_timestamp"], 1731700000)
@@ -139,7 +140,7 @@ class TestConsentOrdering(unittest.TestCase):
 		)
 
 	def test_duplicate_delivery_inserts_nothing(self):
-		with patch.object(ae.frappe.db, "exists", return_value=True), patch.object(ae.frappe, "get_doc") as get_doc:
+		with patch.object(ae.frappe.db, "exists", return_value=True), patch.object(ae.frappe, "get_doc") as get_doc, patch.object(ae.frappe.utils, "now_datetime", return_value=datetime(2026, 1, 1)):
 			self.assertEqual(ae.record_user_preferences("GW", PREFS), 0)
 		get_doc.assert_not_called()
 
