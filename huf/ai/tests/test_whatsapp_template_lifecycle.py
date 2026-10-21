@@ -316,7 +316,7 @@ class TestDrafts(LifecycleCase):
 		with patch.object(wa_tool, "_server_flag", return_value=False):
 			out = json.loads(wa_tool.handle_action("create_template", **_payload()))
 		self.assertEqual(out["error"], "management_not_permitted")
-		self.assertEqual(frappe.db.count(DRAFT), 0)
+		self.assertEqual(frappe.db.count(DRAFT, {"template_name": "lc_promo"}), 0)  # scoped: a live bench may hold other drafts
 
 	def test_agent_auto_submit_server_flag_submits_directly(self):
 		self._need_bridge()
@@ -324,7 +324,7 @@ class TestDrafts(LifecycleCase):
 			out = json.loads(wa_tool.handle_action("create_template", **_payload()))
 		self.assertTrue(out["success"], out)
 		self.assertEqual(len(self.server.requests_to("POST", "/message_templates")), 1)
-		self.assertEqual(frappe.db.count(DRAFT), 0)
+		self.assertEqual(frappe.db.count(DRAFT, {"template_name": "lc_promo"}), 0)
 
 	def test_agent_get_template_status_reports_reason_and_quality(self):
 		self._need_bridge()
