@@ -10,6 +10,7 @@ import {
 	CHECKLIST_ALL_DONE,
 	CHECKLIST_COMPLETE,
 	CHECKLIST_COPY,
+	CREDENTIALS_REPLACE_COPY,
 	CHECKLIST_HIDE,
 	CHECKLIST_SHOW,
 	stepsLeft,
@@ -54,9 +55,11 @@ export interface SetupChecklistProps {
 	items: ChecklistItem[];
 	/** Gateway health. Anything but 'healthy' keeps the steps open and never says "Setup complete". */
 	health?: HealthState;
+	/** Meta rejected the saved token: the credentials step reads as a replace, not an add. */
+	tokenRejected?: boolean;
 }
 
-export function SetupChecklist({ items, health }: SetupChecklistProps) {
+export function SetupChecklist({ items, health, tokenRejected }: SetupChecklistProps) {
 	const [expanded, setExpanded] = useState(false);
 	const left = items.filter((i) => i.state !== 'done').length;
 	const complete = items.length > 0 && left === 0;
@@ -66,30 +69,30 @@ export function SetupChecklist({ items, health }: SetupChecklistProps) {
 	const list = (
 		<ol className="divide-y divide-line rounded-lg border border-line bg-panel">
 			{items.map((item) => {
-				const copy = CHECKLIST_COPY[item.code];
+				const copy = item.code === 'credentials' && tokenRejected && item.state !== 'done' ? CREDENTIALS_REPLACE_COPY : CHECKLIST_COPY[item.code];
 				if (!copy) return null;
 				return (
 					<li
 						key={item.code}
 						aria-current={item.code === current ? 'step' : undefined}
 						className={cn(
-							'flex flex-wrap items-center gap-3 px-4 py-3',
+							'flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3',
 							item.code === current && 'bg-paper-deep'
 						)}
 					>
 						<span className="shrink-0">{STATE_ICON[item.state]}</span>
-						<div className="min-w-0 flex-1">
+						<div className="min-w-0 flex-1 basis-40">
 							<p className={cn('text-sm font-medium text-ink', item.state === 'done' && 'text-steel')}>
 								{copy.title}
 							</p>
 							<p className="text-xs text-steel">{copy.help}</p>
 						</div>
 						{item.state !== 'done' && item.action_url ? (
-							<ActionLink
+							<span className="ml-7 sm:ml-0"><ActionLink
 								url={item.action_url}
 								label={copy.action}
 								variant={item.code === current ? 'default' : 'outline'}
-							/>
+							/></span>
 						) : null}
 					</li>
 				);

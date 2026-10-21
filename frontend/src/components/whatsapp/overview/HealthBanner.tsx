@@ -4,7 +4,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import { formatTimeAgo } from '@/utils/time';
+import { TimeStamp } from '../TimeStamp';
 import type { GatewayHealthStatus } from '@/services/whatsappHealthApi';
 import {
 	BANNER_CHECKING,
@@ -108,8 +108,8 @@ export function HealthBanner({ gateway, loading, checking, onCheck, onTurnOn }: 
 			break;
 	}
 
-	const lastMessage = gateway.last_event_at ? `Last message ${formatTimeAgo(gateway.last_event_at)}` : NO_MESSAGES_YET;
-	const checked = gateway.token_check?.checked_at ? `Checked ${formatTimeAgo(gateway.token_check.checked_at)}` : null;
+	const lastMessage = gateway.last_event_at ? <>Last message <TimeStamp value={gateway.last_event_at} /></> : NO_MESSAGES_YET;
+	const checked = gateway.token_check?.checked_at ? <>Checked <TimeStamp value={gateway.token_check.checked_at} /></> : null;
 
 	return (
 		<div className="space-y-3">

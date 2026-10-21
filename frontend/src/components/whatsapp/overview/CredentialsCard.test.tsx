@@ -87,4 +87,12 @@ describe('CredentialsCard', () => {
 		await user.click(screen.getByText('Rotating a secret'));
 		expect(screen.getByRole('link', { name: 'integration settings' })).toHaveAttribute('href', '/s');
 	});
+
+	it('flags a rejected token and offers a replace action instead of Saved', () => {
+		render(<CredentialsCard {...base} tokenCheck={check({ valid: false })} integrationSettingsHref="/app/gateway/GW" />);
+		expect(screen.getByText('Meta rejected this token')).toBeInTheDocument();
+		expect(screen.getAllByText('Saved')).toHaveLength(2);
+		expect(screen.getByRole('link', { name: 'Replace access token' })).toHaveAttribute('href', '/app/gateway/GW');
+		expect(screen.queryByText('Not checked yet')).toBeNull();
+	});
 });

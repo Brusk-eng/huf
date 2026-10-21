@@ -51,7 +51,7 @@ describe('HealthBanner', () => {
 		view(gw());
 		expect(screen.getByRole('status')).toHaveTextContent('Working: receiving and replying normally.');
 		expect(screen.queryByRole('alert')).toBeNull();
-		expect(screen.getByText('Last message 4 mins ago')).toBeInTheDocument();
+		expect(screen.getByText(/Last message/)).toHaveTextContent('Last message 4 min ago');
 	});
 
 	it('degraded: warning alert using backend reason message', () => {

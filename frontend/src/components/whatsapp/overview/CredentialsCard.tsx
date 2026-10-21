@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { TimeStamp, fullTime } from '../TimeStamp';
 import type { GatewayHealthStatus, TokenCheckSummary } from '@/services/whatsappHealthApi';
 
 export interface CredentialsCardProps {
@@ -29,7 +30,7 @@ export function scopeLabel(scope: string): string {
 }
 
 function formatDate(iso: string): string {
-	return new Date(iso).toLocaleDateString(undefined, { dateStyle: 'medium' });
+	return fullTime(iso);
 }
 
 function tokenTypeText(check: TokenCheckSummary): string | null {
@@ -46,11 +47,16 @@ function friendlyError(e: unknown): string {
 	return msg || "Couldn't check the token. Try again.";
 }
 
-function Row({ label, present }: { label: string; present: boolean }) {
+function Row({ label, present, rejected }: { label: string; present: boolean; rejected?: boolean }) {
 	return (
 		<li className="flex items-center justify-between py-1.5 text-sm">
 			<span className="text-ink">{label}</span>
-			{present ? (
+			{rejected ? (
+				<Badge variant="pill-danger">
+					<X className="mr-1 h-3 w-3" aria-hidden />
+					Meta rejected this token
+				</Badge>
+			) : present ? (
 				<Badge variant="pill-success">
 					<Check className="mr-1 h-3 w-3" aria-hidden />
 					Saved
@@ -87,7 +93,7 @@ function CheckResult({ check }: { check: TokenCheckSummary }) {
 				</div>
 			)}
 			<p className="text-steel">Webhook subscribed: {subscribed}</p>
-			{check.checked_at && <p className="text-xs text-steel">Checked {new Date(check.checked_at).toLocaleString()}</p>}
+			{check.checked_at && <p className="text-xs text-steel">Checked <TimeStamp value={check.checked_at} /></p>}
 		</div>
 	);
 }
@@ -126,7 +132,7 @@ export function CredentialsCard({
 			</CardHeader>
 			<CardContent className="space-y-4">
 				<ul className="divide-y divide-line">
-					<Row label="Access token" present={accessTokenPresent} />
+					<Row label="Access token" present={accessTokenPresent} rejected={shown?.valid === false} />
 					<Row label="App secret" present={appSecretPresent} />
 					<Row label="Verify token" present={verifyTokenPresent} />
 					<Row label="App ID" present={appIdPresent} />
@@ -140,6 +146,11 @@ export function CredentialsCard({
 						<p role="alert" className="text-sm text-destructive">
 							{error}
 						</p>
+					)}
+					{shown?.valid === false && integrationSettingsHref && (
+						<Button asChild size="sm">
+							<a href={integrationSettingsHref} target="_blank" rel="noopener noreferrer">Replace access token</a>
+						</Button>
 					)}
 					{shown ? <CheckResult check={shown} /> : (
 						<p className="flex items-center gap-1 text-sm text-steel">

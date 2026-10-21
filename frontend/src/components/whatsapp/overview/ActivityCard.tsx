@@ -1,5 +1,6 @@
 import { useState } from 'react';
 
+import { TimeStamp } from '../TimeStamp';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import type { GatewayHealthStatus } from '@/services/whatsappHealthApi';
@@ -56,7 +57,7 @@ export function ActivityCard({
 			</CardHeader>
 			<CardContent className="space-y-4">
 				{lastEventAt ? (
-					<p className="text-sm text-ink">Last message {new Date(lastEventAt).toLocaleString()}</p>
+					<p className="text-sm text-ink">Last message <TimeStamp value={lastEventAt} /></p>
 				) : (
 					<p className="text-sm text-steel">No messages yet</p>
 				)}
@@ -79,7 +80,7 @@ export function ActivityCard({
 
 				{lastFailedEvent && (
 					<div className="flex items-center justify-between gap-2 rounded border border-line px-3 py-2 text-sm">
-						<span className="text-steel">Last failed message {new Date(lastFailedEvent.at).toLocaleString()}</span>
+						<span className="text-steel">Last failed message <TimeStamp value={lastFailedEvent.at} /></span>
 						{failedEventHref && (
 							<a href={failedEventHref(lastFailedEvent.name)} className="text-signal-ink hover:underline">
 								View details

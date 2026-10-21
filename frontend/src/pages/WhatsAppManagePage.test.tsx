@@ -146,12 +146,18 @@ describe('WhatsAppManagePage', () => {
 		});
 		open('/');
 		await screen.findByText(/steps left/);
-		const credentialsItem = () => screen.getByText('Add your credentials').closest('li') as HTMLElement;
+		const credentialsItem = () => screen.getByText(/^(Add your credentials|Replace access token)$/, { selector: 'p' }).closest('li') as HTMLElement;
 		expect(within(credentialsItem()).getByLabelText('Done')).toBeInTheDocument();
 		await userEvent.click(screen.getByRole('button', { name: 'Check now' }));
 		const alert = await screen.findByRole('alert');
 		expect(alert).toHaveTextContent('The token has expired.');
 		await waitFor(() => expect(within(credentialsItem()).getByLabelText('Blocked')).toBeInTheDocument());
 		expect(within(credentialsItem()).queryByLabelText('Done')).toBeNull();
+		// banner, checklist and token card agree: replace the token, same action
+		expect(credentialsItem()).toHaveTextContent('Replace access token');
+		const links = screen.getAllByRole('link', { name: 'Replace access token' });
+		expect(links.length).toBeGreaterThanOrEqual(2);
+		for (const l of links) expect(l.getAttribute('href')).toMatch(/#credentials$/);
+		expect(screen.getByText(/Meta rejected this token/)).toBeInTheDocument();
 	});
 });

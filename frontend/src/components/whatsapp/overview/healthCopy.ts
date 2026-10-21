@@ -27,6 +27,7 @@ export const CHECK_LABELS = {
 
 export const REASON_FALLBACK: Record<string, string> = {
 	access_token_missing: 'Blocked: add the access token from Meta.',
+	access_token_fix: 'Replace access token',
 	access_token_invalid: 'Meta rejected the access token. It may have expired; replace it in Settings.',
 	phone_number_id_missing: 'Blocked: add the phone number ID from Meta.',
 	verify_token_missing: "Add the verify token so Meta can confirm this gateway's callback URL.",
@@ -37,6 +38,13 @@ export const REASON_FALLBACK: Record<string, string> = {
 	fallback_template_unavailable: 'Replies after 24 hours will fail until the fallback template is approved.',
 	no_events_yet:
 		"Meta hasn't sent us anything yet. Check the callback URL and that the messages field is subscribed.",
+};
+
+/** Credentials step when Meta rejected the saved token: same wording and action as the banner. */
+export const CREDENTIALS_REPLACE_COPY = {
+	title: 'Replace access token',
+	help: 'Meta rejected the saved token. Paste a new one.',
+	action: 'Replace access token',
 };
 
 export function degradedFallback(failed: number): string {

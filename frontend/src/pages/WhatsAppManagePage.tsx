@@ -35,7 +35,8 @@ function withTokenVerdict(g: GatewayHealthStatus): GatewayHealthStatus {
   if (g.token_check?.valid !== false) return g;
   return {
     ...g,
-    checklist: g.checklist.map((c) => (c.code === 'credentials' && c.state === 'done' ? { ...c, state: 'blocked' as const } : c)),
+    checklist: g.checklist.map((c) => (c.code === 'credentials' && c.state === 'done' ? { ...c, state: 'blocked' as const, action_url: c.action_url ?? '#credentials' } : c)),
+    next_step: { code: 'fix_access_token', label: REASON_FALLBACK.access_token_fix, action_url: '#credentials' },
     health: g.health === 'healthy' || g.health === 'degraded' ? 'blocked' : g.health,
     reasons: g.reasons.some((r) => r.code === 'access_token_invalid')
       ? g.reasons
@@ -178,13 +179,16 @@ export default function WhatsAppManagePage() {
           <NoGateway />
         ) : (
           <Tabs value={tab} onValueChange={(v) => update({ tab: asTab(v) })}>
-            <TabsList className="w-full justify-start overflow-x-auto sm:w-auto">
+            <div className="relative">
+            <TabsList layout="scroll" className="sm:w-auto [&>*]:shrink-0">
               <TabsTrigger value="overview">Overview</TabsTrigger>
               <TabsTrigger value="messages">Messages</TabsTrigger>
               <TabsTrigger value="templates">Templates</TabsTrigger>
               <TabsTrigger value="access">Access</TabsTrigger>
               <TabsTrigger value="settings">Settings</TabsTrigger>
             </TabsList>
+            <div aria-hidden className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent sm:hidden" />
+            </div>
             {gateway && (
               <>
                 <TabsContent value="overview" className="pt-3">
