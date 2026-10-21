@@ -242,6 +242,25 @@ def handle_action(action: str, **kwargs: Any) -> str:
 	if refusal:
 		return refusal
 
+	if action in _SEND_ACTIONS and action != "create_template":
+		return _idempotent_send(action, kwargs, gateway_name)
+	return _dispatch(action, kwargs)
+
+
+def _idempotent_send(action: str, kwargs: dict, gateway_name: str) -> str:
+	"""Run a send at most once per idempotency key (durable; see ``huf.ai.whatsapp_send_keys``)."""
+	from huf.ai import whatsapp_send_keys as send_keys
+
+	try:
+		explicit = send_keys.explicit_key(kwargs)
+	except send_keys.InvalidKey as e:
+		return _refused("invalid_idempotency_key", str(e))
+	run_id = getattr(frappe.flags, "huf_current_agent_run_id", None)
+	key = send_keys.derive_key(gateway_name, run_id, kwargs.get("call_id"), action, kwargs, explicit)
+	return send_keys.run_once(gateway_name, key, action, lambda: _dispatch(action, kwargs))
+
+
+def _dispatch(action: str, kwargs: dict) -> str:
 	if action == "send_message":
 		return _send_message(kwargs)
 	elif action == "send_media":
