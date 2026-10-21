@@ -478,7 +478,8 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		"""Send the first attachment of a reply (caption = reply text), then audio's text separately."""
 		att = reply.attachments[0]
 		kind = (att.kind if att.kind in wt.MEDIA_KINDS else "") or _kind_from_mime(att.mime_type)
-		is_audio = kind == "audio"
+		# Audio and stickers cannot carry a caption (Meta rejects it): send the text separately.
+		is_audio = kind in ("audio", "sticker")
 		delivery = self._deliver_media(
 			reply.conversation_id,
 			kind,
@@ -489,8 +490,8 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			reply_to=reply.reply_to_provider_message_id,
 			trusted=True,
 		)
-		if is_audio:
-			# Audio cannot carry a caption: follow with the text as a normal message.
+		if is_audio and str(reply.text or "").strip():
+			# No caption allowed: follow with the text as a normal message.
 			text = self._send_text(reply)
 			return OutboundDelivery(
 				provider_message_id=text.provider_message_id,

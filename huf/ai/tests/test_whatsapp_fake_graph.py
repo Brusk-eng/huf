@@ -295,6 +295,20 @@ class TestDirectMode(FakeGraphCase):
 		)
 		self.assertEqual(self.server.sent[-1]["image"], {"link": "https://cdn.example/a.png", "caption": "here you go"})
 
+	def test_reply_with_sticker_sends_no_caption_then_text(self):
+		self._inbound(self.direct_gateway)
+		adapter = gateway_webhook.get_gateway_adapter(self.direct_gateway)
+		adapter.send_reply(
+			GatewayReply(
+				conversation_id=SENDER, text="enjoy",
+				attachments=(GatewayAttachment(url="https://cdn.example/a.webp", kind="sticker", mime_type="image/webp"),),
+			)
+		)
+		sent = self.server.sent
+		self.assertEqual(sent[-2]["type"], "sticker")
+		self.assertEqual(sent[-2]["sticker"], {"link": "https://cdn.example/a.webp"})
+		self.assertEqual(sent[-1]["type"], "text")
+
 	def test_inbound_media_download_direct_mode(self):
 		self.server.add_media("MID-D1", "image/png", PNG)
 		payload = fake.inbound_media_webhook(self.server.phone_id, SENDER, "wamid.MEDIA1", "image", "MID-D1", "image/png", "look")
