@@ -319,7 +319,7 @@ class TestPairingScopeAndAuthority(_GatewayFixture, IntegrationTestCase):
 		a = self.make_gateway("A")
 		b = self.make_gateway("B")
 		self.make_entry(a, "111", code="PAIR-ABCD2345")
-		self.assertTrue(any(r["pairing_code"] == "PAIR-ABCD2345" for r in tools.list_pairing_requests(a)))
+		self.assertTrue(any(r["pairing_code"] == "*" * 11 + "45" for r in tools.list_pairing_requests(a)))
 		wrong = tools.approve_pairing_code("PAIR-ABCD2345", gateway_name=b)
 		self.assertFalse(wrong["success"])
 		frappe.set_user("Guest")
