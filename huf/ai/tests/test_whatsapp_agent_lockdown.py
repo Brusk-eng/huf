@@ -129,11 +129,11 @@ class TestAuthority(unittest.TestCase):
 	def tearDown(self):
 		patch.stopall()
 
-	def test_send_without_write_authority_is_refused_before_any_send(self):
+	def test_template_creation_without_write_authority_is_refused_before_any_send(self):
 		with patch.object(whatsapp, "_run_gateway", return_value="GW"), patch(
 			"huf.ai.whatsapp_management._send_authority", side_effect=frappe.PermissionError("no")
-		), patch.object(whatsapp, "_send_message") as send:
-			result = json.loads(whatsapp.handle_action("send_message", to="1", message="x"))
+		), patch.object(whatsapp, "_create_template") as send:
+			result = json.loads(whatsapp.handle_action("create_template", template_name="t"))
 		self.assertEqual(result["error"], "permission_denied")
 		send.assert_not_called()
 

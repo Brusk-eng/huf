@@ -18,7 +18,8 @@ popped and discarded in ``handle_action``. The gateway is derived server-side fr
 agent run (its conversation channel ``gateway:<name>``). A run that is not bound to an enabled
 WhatsApp gateway (a chat run, a flow run, a forged context) is refused with
 ``gateway_context_required``; there is no fallback to a default account or to the first
-Integration Settings row. Every send also requires Gateway write authority for the run user
+Integration Settings row. Sends are authorised for the run's own gateway (the gateway admitted the sender), so its execution
+user needs no Gateway write; template creation still requires write authority
 (``whatsapp_management._send_authority``); reads require Gateway read authority.
 
 Privilege gating (A8)
@@ -220,18 +221,41 @@ def _get_whatsapp_credentials(kwargs: dict | None = None) -> tuple[str, str]:
 
 
 def _authorize(action: str, gateway_name: str) -> Optional[str]:
-	"""Gateway authority of the run user: write for every send / template creation, read for the rest."""
+	"""Authority of the run over its own gateway.
+
+	Sending is authorised for the run's own gateway: ``gateway_name`` is bound server-side from the run
+	(or ``trusted_gateway``), never from the model, and the gateway already admitted the sender, so the
+	gateway's execution user needs no Gateway write. Template management (``create_template``) keeps
+	requiring real write authority; every other action requires read.
+	"""
 	from huf.ai import whatsapp_management as mgmt
 
 	try:
-		if action in _SEND_ACTIONS:
+		if action == "create_template":
 			refused = mgmt._send_authority(gateway_name)
 			return json.dumps(refused, default=str) if refused else None
+		if action in _SEND_ACTIONS:
+			return None
 		if not mgmt._gateway_read_allowed(gateway_name):
 			raise frappe.PermissionError("Not permitted to read this Gateway")
 	except frappe.PermissionError:
 		return _refused("permission_denied", "Not permitted to use WhatsApp through this Gateway")
 	return None
+
+
+def _gateway_phone_id(gateway_name: str) -> str:
+	try:
+		return str(frappe.db.get_value("Gateway", gateway_name, "phone_number_id") or "").strip()
+	except Exception:
+		return ""
+
+
+def _disconnect_refusal(gateway_name: str) -> Optional[str]:
+	"""The normal JSON refusal when the run gateway's number is Disconnected, else None."""
+	from huf.ai import whatsapp_account_events as _ae
+
+	refusal = _ae.send_refusal(_gateway_phone_id(gateway_name))
+	return json.dumps(refusal, default=str) if refusal else None
 
 
 def handle_action(action: str, **kwargs: Any) -> str:
@@ -259,10 +283,14 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		return refusal
 
 	if action in _SEND_ACTIONS and action != "create_template":
+		refusal = _disconnect_refusal(gateway_name)
+		if refusal:
+			return refusal
 		refusal = _scope_refusal(kwargs, gateway_name)
 		if refusal:
 			return refusal
-		raw = _idempotent_send(action, kwargs, gateway_name)
+		with bridge.run_bound_send():  # the run's own gateway authorised this send
+			raw = _idempotent_send(action, kwargs, gateway_name)
 		_mark_outreach(gateway_name, kwargs, raw)
 		return raw
 	return _dispatch(action, kwargs)
