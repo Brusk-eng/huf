@@ -920,7 +920,7 @@ def _exec_agent_run(flow_run, node: dict, config: dict, settings: dict) -> dict:
 		return {"status": "failed", "error": str(e)}
 
 
-def _bound_gateway(flow_run, config: dict):
+def _bound_gateway(flow_run, config: dict, run_id: str = ""):
 	"""Trusted gateway for the WhatsApp tool: the gateway that started this flow, else the node's ``gateway``.
 
 	Model/tool arguments never select it; empty means the tool fails closed (gateway_context_required).
@@ -928,15 +928,26 @@ def _bound_gateway(flow_run, config: dict):
 	from huf.ai.tools.whatsapp import trusted_gateway
 
 	gateway = ""
+	contact = ""
 	try:
 		payload = flow_run.get("trigger_payload")
 		payload = json.loads(payload) if isinstance(payload, str) else (payload or {})
 		event = payload.get("gateway_event") if isinstance(payload, dict) else None
 		if event:
-			gateway = frappe.db.get_value("Gateway Event", event, "gateway") or ""
+			row = frappe.db.get_value("Gateway Event", event, ["gateway", "sender_id"], as_dict=True) or {}
+			gateway = row.get("gateway") or ""
+			contact = row.get("sender_id") or ""
 	except Exception:
-		gateway = ""
-	return trusted_gateway(gateway or str(config.get("gateway") or ""))
+		gateway, contact = "", ""
+	if not gateway:
+		# A node-configured gateway is the flow author's choice: they need write access to it.
+		gateway = str(config.get("gateway") or "")
+		author = getattr(flow_run, "owner", None)
+		if gateway and not (
+			author and frappe.db.exists("Gateway", gateway) and frappe.has_permission("Gateway", "write", doc=gateway, user=author)
+		):
+			gateway = ""  # fail closed: the tool reports gateway_context_required
+	return trusted_gateway(gateway, run_id=run_id, contact=contact)
 
 
 def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
@@ -1030,7 +1041,7 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 			if not isinstance(result, dict):
 				result = {"success": True, "result": result}
 		else:
-			with tool_run_context(invocation_ctx), _bound_gateway(flow_run, config):
+			with tool_run_context(invocation_ctx), _bound_gateway(flow_run, config, getattr(run_doc, "name", "") or ""):
 				result = execute_tool(tool_name, args)
 
 		is_success = result.get("success", False) if isinstance(result, dict) else bool(result)

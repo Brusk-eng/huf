@@ -71,8 +71,12 @@ META_GRAPH_URL = f"https://graph.facebook.com/{bridge.GRAPH_DEFAULT_VERSION}"
 _TRUTHY_STRINGS = {"1", "true", "yes"}
 
 
-def _error(msg: str) -> str:
-	return json.dumps({"success": False, "error": msg}, default=str)
+def _error(msg: str, definite: bool = False) -> str:
+	"""Tool error JSON. ``definite`` marks a failure that happened before anything reached Meta (safe to retry)."""
+	body: dict[str, Any] = {"success": False, "error": msg}
+	if definite:
+		body["definite"] = True
+	return json.dumps(body, default=str)
 
 
 def _success(data: Any) -> str:
@@ -115,19 +119,31 @@ _LIST_MAX_LIMIT = 50
 
 
 _trusted_gateway: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_trusted_gateway", default="")
+_trusted_contact: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_trusted_contact", default="")
+_trusted_run: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_trusted_run", default="")
+
+
+def _effective_run_id() -> Optional[str]:
+	"""The run sends are scoped and capped to: the agent run, else the trusted flow tool-node run."""
+	return getattr(frappe.flags, "huf_current_agent_run_id", None) or _trusted_run.get() or None
 
 
 @contextmanager
-def trusted_gateway(gateway_name: str):
+def trusted_gateway(gateway_name: str, run_id: str = "", contact: str = ""):
 	"""Bind the gateway for a TRUSTED, deterministic caller (the Flow engine's tool.call node).
 
 	Only server code can enter this block; tool arguments never can. The gateway comes from the flow
-	run's own gateway event, or from an admin-configured node field, never from the model.
+	run's own gateway event, or from an admin-configured node field, never from the model. The caller
+	still gets recipient scope and send caps, keyed to ``run_id`` (the flow's tool-node run).
 	"""
 	token = _trusted_gateway.set(str(gateway_name or "").strip())
+	run_token = _trusted_run.set(str(run_id or "").strip())
+	contact_token = _trusted_contact.set(str(contact or "").strip())
 	try:
 		yield
 	finally:
+		_trusted_contact.reset(contact_token)
+		_trusted_run.reset(run_token)
 		_trusted_gateway.reset(token)
 
 
@@ -246,29 +262,60 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		refusal = _scope_refusal(kwargs, gateway_name)
 		if refusal:
 			return refusal
-		return _idempotent_send(action, kwargs, gateway_name)
+		raw = _idempotent_send(action, kwargs, gateway_name)
+		_mark_outreach(gateway_name, kwargs, raw)
+		return raw
 	return _dispatch(action, kwargs)
+
+
+def _has_entry(gateway_name: str, recipient: str) -> bool:
+	from types import SimpleNamespace
+
+	from huf.ai import gateway_service
+
+	try:
+		return bool(gateway_service._has_access_entry(SimpleNamespace(name=gateway_name, provider="WhatsApp"), "Sender", recipient))
+	except Exception:
+		return False
+
+
+def _mark_outreach(gateway_name: str, kwargs: dict, raw: str) -> None:
+	"""After a successful send to a recipient with no access entry, remember we messaged them first.
+
+	Their STOP is then honoured (a stranger's STOP stays ignored). Never fails the send.
+	"""
+	try:
+		result = json.loads(raw)
+		recipient = _recipient(kwargs)
+		if not (isinstance(result, dict) and result.get("success") and recipient):
+			return
+		if _has_entry(gateway_name, recipient):
+			return
+		from huf.ai import whatsapp_outbound_policy as policy
+
+		policy.record_template_outreach(gateway_name, recipient)
+	except Exception:
+		frappe.log_error(title="WhatsApp outreach marker not recorded")
 
 
 def _scope_refusal(kwargs: dict, gateway_name: str) -> Optional[str]:
 	"""Recipient scope (WP-10): default recipient is the run's conversation contact; wider scope is gateway config.
 
-	A trusted deterministic caller (Flow tool.call) is configured by an admin, not by a model, so it is
-	not bound to a conversation. Fills ``to`` with the current contact when the model left it out.
+	A trusted flow caller is scoped the same way: its args come from agent output / inbound text, so it
+	gets no wider reach than the gateway's configured scope. Fills ``to`` with the current contact when
+	left out.
 	"""
-	if _trusted_gateway.get():
-		return None
 	from huf.ai import whatsapp_send_scope as send_scope
 
-	run_id = getattr(frappe.flags, "huf_current_agent_run_id", None)
+	run_id = _effective_run_id()
 	if not _recipient(kwargs):
-		contact = send_scope.current_contact(run_id)
+		contact = send_scope.current_contact(run_id) or send_scope._normalize(_trusted_contact.get())
 		if contact:
 			kwargs["to"] = contact
 	recipient = _recipient(kwargs)
 	if not recipient:
 		return None  # the send itself reports the missing recipient
-	return send_scope.check_recipient(gateway_name, run_id, recipient)
+	return send_scope.check_recipient(gateway_name, run_id, recipient, contact=_trusted_contact.get())
 
 
 def _idempotent_send(action: str, kwargs: dict, gateway_name: str) -> str:
@@ -279,10 +326,11 @@ def _idempotent_send(action: str, kwargs: dict, gateway_name: str) -> str:
 		explicit = send_keys.explicit_key(kwargs)
 	except send_keys.InvalidKey as e:
 		return _refused("invalid_idempotency_key", str(e))
-	run_id = getattr(frappe.flags, "huf_current_agent_run_id", None)
-	if not run_id and not explicit:
-		return _dispatch(action, kwargs)  # no run and no caller key: nothing to scope an automatic key to
-	key = send_keys.derive_key(gateway_name, run_id, kwargs.get("call_id"), action, kwargs, explicit)
+	run_id = _effective_run_id()
+	call_id = kwargs.get("call_id")
+	if not run_id and not explicit and not call_id:
+		call_id = f"norun-{frappe.generate_hash(length=16)}"  # nothing to dedupe on, but the send is still claimed and counted
+	key = send_keys.derive_key(gateway_name, run_id, call_id, action, kwargs, explicit)
 	return send_keys.run_once(
 		gateway_name, key, action, lambda: _capped_dispatch(action, kwargs, gateway_name, run_id),
 		run=run_id or "", recipient=_recipient(kwargs),
@@ -291,12 +339,11 @@ def _idempotent_send(action: str, kwargs: dict, gateway_name: str) -> str:
 
 def _capped_dispatch(action: str, kwargs: dict, gateway_name: str, run_id: Optional[str]) -> str:
 	"""Run the send unless it would exceed the gateway's per-run / per-day cap (checked after the claim)."""
-	if not _trusted_gateway.get():
-		from huf.ai import whatsapp_send_scope as send_scope
+	from huf.ai import whatsapp_send_scope as send_scope
 
-		refusal = send_scope.check_caps(gateway_name, run_id)
-		if refusal:
-			return refusal
+	refusal = send_scope.check_caps(gateway_name, run_id)
+	if refusal:
+		return refusal
 	return _dispatch(action, kwargs)
 
 
@@ -393,9 +440,9 @@ def _send_message(kwargs: dict) -> str:
 	message = (kwargs.get("message") or kwargs.get("text") or "").strip()
 
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	if not message:
-		return _error("Message text ('message') is required")
+		return _error("Message text ('message') is required", definite=True)
 
 	refusal = _free_form_refusal(kwargs, recipient, "a free-form message")
 	if refusal:
@@ -415,7 +462,7 @@ def _send_message(kwargs: dict) -> str:
 
 	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
+		return _error("WhatsApp credentials not found", definite=True)
 
 	url = f"{_graph_root(kwargs['gateway_name'])}/{phone_number_id}/messages"
 	headers = {
@@ -434,7 +481,10 @@ def _send_message(kwargs: dict) -> str:
 		res = requests.post(url, json=payload, headers=headers, timeout=15)
 		data = res.json()
 		if res.status_code != 200 or "error" in data:
-			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+			return _error(
+				f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}",
+				definite=400 <= res.status_code < 500,
+			)
 
 		msg_id = data.get("messages", [{}])[0].get("id")
 
@@ -525,7 +575,7 @@ def _deliver_typed(kwargs: dict, recipient: str, built: tuple, bridge_call: Any,
 
 	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
+		return _error("WhatsApp credentials not found", definite=True)
 	try:
 		res = requests.post(
 			f"{_graph_root(kwargs['gateway_name'])}/{phone_number_id}/messages",
@@ -535,7 +585,10 @@ def _deliver_typed(kwargs: dict, recipient: str, built: tuple, bridge_call: Any,
 		)
 		data = res.json()
 		if res.status_code != 200 or "error" in data:
-			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+			return _error(
+				f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}",
+				definite=400 <= res.status_code < 500,
+			)
 		return _success({"message_id": data.get("messages", [{}])[0].get("id"), "recipient": recipient, "status": "sent"})
 	except Exception as e:
 		return _error(f"Failed to send WhatsApp {what}: {str(e)}")
@@ -545,7 +598,7 @@ def _send_media(kwargs: dict) -> str:
 	"""Send an image/video/audio/document/sticker by public link or media id (window / proactive gated like send_message)."""
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	media, errors = wt.validate_media_request(
 		kwargs.get("kind") or kwargs.get("media_type"),
 		kwargs.get("link") or kwargs.get("url"),
@@ -581,7 +634,7 @@ def _send_voice_note(kwargs: dict) -> str:
 def _send_location(kwargs: dict) -> str:
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	args = (kwargs.get("latitude"), kwargs.get("longitude"), kwargs.get("name"), kwargs.get("address"))
 	reply_to = (kwargs.get("reply_to") or "").strip() or None
 	return _deliver_typed(
@@ -594,7 +647,7 @@ def _send_location(kwargs: dict) -> str:
 def _send_contact(kwargs: dict) -> str:
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	contacts = kwargs.get("contacts")
 	if isinstance(contacts, str) and contacts.strip():
 		try:
@@ -618,7 +671,7 @@ def _send_contact(kwargs: dict) -> str:
 def _send_reaction(kwargs: dict) -> str:
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	remove = _is_truthy(kwargs.get("remove"))
 	emoji = "" if remove else str(kwargs.get("emoji") or "")
 	message_id = kwargs.get("message_id")
@@ -633,7 +686,7 @@ def _send_interactive(kwargs: dict, kind: str) -> str:
 	"""send_buttons / send_list / send_cta_url (``body``, ``header``, ``footer`` plus the kind's own fields)."""
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	buttons = _json_list(kwargs.get("buttons"))
 	sections = _json_list(kwargs.get("sections"))
 	if buttons is None or sections is None:
@@ -718,7 +771,7 @@ def _send_template(kwargs: dict) -> str:
 
 	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
+		return _error("WhatsApp credentials not found", definite=True)
 
 	url = f"{_graph_root(kwargs['gateway_name'])}/{phone_number_id}/messages"
 	headers = {
@@ -746,7 +799,10 @@ def _send_template(kwargs: dict) -> str:
 		res = requests.post(url, json=payload, headers=headers, timeout=15)
 		data = res.json()
 		if res.status_code != 200 or "error" in data:
-			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+			return _error(
+				f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}",
+				definite=400 <= res.status_code < 500,
+			)
 
 		return _success(data)
 	except Exception as e:
@@ -800,7 +856,7 @@ def _get_account_info(kwargs: dict) -> str:
 			phone_number_id = phone_number_id or str(acct.get("phone_id") or "")
 			access_token = access_token or str(acct.get("token") or "")
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
+		return _error("WhatsApp credentials not found", definite=True)
 
 	url = f"{_graph_root(gateway_name)}/{phone_number_id}"
 	headers = {"Authorization": f"Bearer {access_token}"}
@@ -809,7 +865,10 @@ def _get_account_info(kwargs: dict) -> str:
 		res = requests.get(url, headers=headers, timeout=10)
 		data = res.json()
 		if res.status_code != 200 or "error" in data:
-			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+			return _error(
+				f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}",
+				definite=400 <= res.status_code < 500,
+			)
 		return _success(data)
 	except Exception as e:
 		return _error(f"Failed to fetch WhatsApp account info: {str(e)}")

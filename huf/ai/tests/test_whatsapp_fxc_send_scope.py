@@ -97,7 +97,7 @@ class TestFlowAuthorGatewayBinding(unittest.TestCase):
 		from huf.ai import flow_engine
 
 		flow_run = SimpleNamespace(owner="nobody@example.com", name="FR", get=lambda k, d=None: None)
-		with patch.object(frappe, "has_permission", return_value=False):
+		with patch.object(frappe, "has_permission", return_value=False), patch.object(frappe.db, "exists", return_value=True):
 			with flow_engine._bound_gateway(flow_run, {"gateway": GW}):
 				self.assertEqual(whatsapp._trusted_gateway.get(), "")
 
@@ -105,7 +105,7 @@ class TestFlowAuthorGatewayBinding(unittest.TestCase):
 		from huf.ai import flow_engine
 
 		flow_run = SimpleNamespace(owner="a@example.com", name="FR", get=lambda k, d=None: None)
-		with patch.object(frappe, "has_permission", return_value=True):
+		with patch.object(frappe, "has_permission", return_value=True), patch.object(frappe.db, "exists", return_value=True):
 			with flow_engine._bound_gateway(flow_run, {"gateway": GW}):
 				self.assertEqual(whatsapp._trusted_gateway.get(), GW)
 
@@ -179,17 +179,31 @@ class TestCallIdFromSdk(unittest.TestCase):
 
 
 class TestOptOutOnEveryBranch(unittest.TestCase):
-	CASES = [
-		("send_message", {"message": "x"}),
-		("send_reaction", {"message_id": "wamid.x", "emoji": "x"}),
-		("send_buttons", {"body": "b", "buttons": [{"id": "1", "title": "t"}]}),
-		("send_image", {"link": "https://e.com/a.png"}),
-		("send_location", {"latitude": 1, "longitude": 2}),
-		("send_template", {"template_name": "t"}),
-	]
+	"""Text and template check opt-out themselves; every typed send (media, location, contact, reaction,
+	interactive) funnels through ``_deliver_typed``, whose gate runs before any bridge call."""
 
-	def test_every_send_branch_refuses_an_opted_out_contact(self):
-		for action, extra in self.CASES:
-			with self.subTest(action=action), patch.object(whatsapp, "_is_opted_out", return_value=True):
-				res = json.loads(whatsapp._dispatch(action, {"to": CONTACT, "gateway_name": GW, **extra}))
-				self.assertEqual(res.get("error"), "opted_out")
+	def test_typed_sends_refuse_an_opted_out_contact_before_the_bridge(self):
+		bridge_call = MagicMock()
+		with patch.object(whatsapp, "_is_opted_out", return_value=True):
+			res = json.loads(whatsapp._deliver_typed({"gateway_name": GW}, CONTACT, ({"type": "x"}, []), bridge_call, "a reaction"))
+		self.assertEqual(res["error"], "opted_out")
+		bridge_call.assert_not_called()
+
+	def test_text_and_template_refuse_an_opted_out_contact(self):
+		with patch.object(whatsapp, "_is_opted_out", return_value=True):
+			for action, extra in (("send_message", {"message": "x"}), ("send_template", {"template_name": "t"})):
+				with self.subTest(action=action):
+					res = json.loads(whatsapp._dispatch(action, {"to": CONTACT, "gateway_name": GW, **extra}))
+					self.assertEqual(res["error"], "opted_out")
+
+	def test_every_typed_action_is_routed_through_deliver_typed(self):
+		for action, extra in (
+			("send_reaction", {"message_id": "wamid.x", "emoji": "x"}),
+			("send_buttons", {"body": "b", "buttons": [{"id": "1", "title": "t"}]}),
+			("send_image", {"link": "https://e.com/a.png"}),
+			("send_location", {"latitude": 1, "longitude": 2}),
+			("send_contact", {"contacts": [{"name": {"formatted_name": "A"}}]}),
+		):
+			with self.subTest(action=action), patch.object(whatsapp, "_deliver_typed", return_value="routed") as gate:
+				whatsapp._dispatch(action, {"to": CONTACT, "gateway_name": GW, **extra})
+				self.assertTrue(gate.called, action)

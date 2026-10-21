@@ -156,7 +156,7 @@ class TestCaps(_Base):
 
 	def test_a_failed_send_does_not_use_the_cap(self):
 		self.settings = _settings(per_run=1)
-		self.sent.side_effect = [json.dumps({"success": False, "error": "x"}), _ok()]
+		self.sent.side_effect = [json.dumps({"success": False, "error": "opted_out"}), _ok()]
 		self.assertFalse(self.call()["success"])
 		self.assertTrue(self.call()["success"])
 
@@ -167,7 +167,8 @@ class TestCaps(_Base):
 
 
 class TestTrustedFlowCaller(_Base):
-	def test_trusted_flow_send_is_not_bound_to_a_conversation_contact(self):
+	def test_trusted_flow_send_follows_the_gateway_scope(self):
+		self.settings = _settings(scope="Any number")
 		with patch.object(scope, "current_contact", return_value=""):
 			with whatsapp.trusted_gateway(GW):
 				res = json.loads(whatsapp.handle_action("send_message", to=OTHER, message="hi"))

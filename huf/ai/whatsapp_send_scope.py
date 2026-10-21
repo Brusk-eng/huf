@@ -104,12 +104,12 @@ def _refusal(error: str, message: str, **extra: Any) -> str:
 	return json.dumps({"success": False, "error": error, "message": message, **extra}, default=str)
 
 
-def check_recipient(gateway: str, run_id: Optional[str], recipient: str) -> Optional[str]:
+def check_recipient(gateway: str, run_id: Optional[str], recipient: str, contact: str = "") -> Optional[str]:
 	"""Refusal JSON when ``recipient`` is outside the gateway's scope for this run, else None."""
 	number = _normalize(recipient)
 	conf = settings(gateway)
-	contact = current_contact(run_id)
-	if contact and number == contact:
+	own = current_contact(run_id) or _normalize(contact)  # a flow run's contact is the sender that triggered it
+	if own and number == own:
 		return None
 	scope = conf["scope"] if conf["scope"] in SCOPES else DEFAULT_SCOPE
 	allowed = (
