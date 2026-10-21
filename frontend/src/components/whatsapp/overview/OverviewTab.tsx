@@ -4,6 +4,7 @@ import { ActivityCard } from './ActivityCard';
 import { ConnectionCard } from './ConnectionCard';
 import { HealthBanner } from './HealthBanner';
 import { SetupChecklist } from './SetupChecklist';
+import { TokenCard } from './TokenCard';
 
 export interface OverviewTabProps {
 	gateway: GatewayHealthStatus | null;
@@ -39,6 +40,8 @@ export function OverviewTab({ gateway, loading, checking, onCheck, onTurnOn, set
 							integrationSettingsHref={settingsHref}
 						/>
 					</div>
+					<div className="grid items-start gap-4 lg:grid-cols-2">
+					<TokenCard check={gateway.token_check} />
 					<ActivityCard
 						lastEventAt={gateway.last_event_at}
 						lastError={gateway.last_error}
@@ -47,6 +50,7 @@ export function OverviewTab({ gateway, loading, checking, onCheck, onTurnOn, set
 						unroutedPhoneIds={gateway.unrouted_phone_ids}
 						failedEventHref={failedEventHref}
 					/>
+					</div>
 				</>
 			)}
 		</div>

@@ -13,12 +13,13 @@ import {
 } from '@/services/whatsappHealthApi';
 import { BridgeUnavailable, LoadError } from '@/components/whatsapp/BridgeUnavailable';
 import { TemplatesTab } from '@/components/whatsapp/TemplatesTab';
+import { AccessTab } from '@/components/whatsapp/AccessTab';
 import { MessageLogTab } from '@/components/whatsapp/MessageLogTab';
 import { GatewaySwitcher } from '@/components/whatsapp/overview/GatewaySwitcher';
 import { OverviewTab } from '@/components/whatsapp/overview/OverviewTab';
 import { SettingsTab } from '@/components/whatsapp/overview/SettingsTab';
 
-const TABS = ['overview', 'messages', 'templates', 'settings'] as const;
+const TABS = ['overview', 'messages', 'templates', 'access', 'settings'] as const;
 type TabName = (typeof TABS)[number];
 
 /** In-app checklist anchors: Settings sections, or the Messages tab for the test message. */
@@ -150,6 +151,7 @@ export default function WhatsAppManagePage() {
               <TabsTrigger value="overview">Overview</TabsTrigger>
               <TabsTrigger value="messages">Messages</TabsTrigger>
               <TabsTrigger value="templates">Templates</TabsTrigger>
+              <TabsTrigger value="access">Access</TabsTrigger>
               <TabsTrigger value="settings">Settings</TabsTrigger>
             </TabsList>
             {!gateway ? (
@@ -176,6 +178,9 @@ export default function WhatsAppManagePage() {
                 </TabsContent>
                 <TabsContent value="templates" className="pt-3">
                   {connectorAvailable ? <TemplatesTab gateway={gateway} /> : <BridgeUnavailable />}
+                </TabsContent>
+                <TabsContent value="access" className="pt-3">
+                  <AccessTab gateway={gateway} />
                 </TabsContent>
                 <TabsContent value="settings" className="pt-3">
                   {detailError ? (

@@ -57,3 +57,18 @@ describe('status and labels', () => {
     expect(statusTimeline(null).every((s) => !s.reached)).toBe(true);
   });
 });
+
+describe('delivery state and error info', () => {
+  it('treats played as reached', async () => {
+    const m = await import('./messageLogModel');
+    expect(m.statusTicks('played').label).toBe('Played');
+    expect(m.statusTimeline('played').every((s) => s.reached)).toBe(true);
+  });
+
+  it('classifies Meta error codes and falls back to text hints', async () => {
+    const m = await import('./messageLogModel');
+    expect(m.errorInfo('(#131047) Re-engagement message')).toMatchObject({ code: 131047, label: 'Window closed' });
+    expect(m.errorInfo('request timed out')?.label).toBe('Temporary problem');
+    expect(m.errorInfo('')).toBeNull();
+  });
+});

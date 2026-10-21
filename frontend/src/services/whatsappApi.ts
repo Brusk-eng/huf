@@ -549,6 +549,106 @@ export const sendMediaMessage = (
     'post',
   );
 
+export interface StickerSend { link?: string; fileUrl?: string }
+export const sendStickerMessage = (gatewayName: string, to: string, sticker: StickerSend) =>
+  invoke<Record<string, unknown>>(
+    'send_sticker_message',
+    { gateway_name: gatewayName, to, link: sticker.link?.trim() || undefined, file_url: sticker.fileUrl || undefined },
+    'post',
+  );
+
+export interface LocationSend { latitude: number; longitude: number; name?: string; address?: string }
+export const sendLocationMessage = (gatewayName: string, to: string, loc: LocationSend) =>
+  invoke<Record<string, unknown>>(
+    'send_location_message',
+    {
+      gateway_name: gatewayName,
+      to,
+      latitude: loc.latitude,
+      longitude: loc.longitude,
+      name: loc.name?.trim() || undefined,
+      address: loc.address?.trim() || undefined,
+    },
+    'post',
+  );
+
+export interface ContactCard {
+  name: { formatted_name: string };
+  phones?: { phone: string }[];
+  emails?: { email: string }[];
+  org?: { company: string };
+}
+export const sendContactsMessage = (gatewayName: string, to: string, contacts: ContactCard[]) =>
+  invoke<Record<string, unknown>>(
+    'send_contacts_message',
+    { gateway_name: gatewayName, to, contacts: JSON.stringify(contacts) },
+    'post',
+  );
+
+export const sendReactionMessage = (gatewayName: string, to: string, messageId: string, emoji: string, remove = false) =>
+  invoke<Record<string, unknown>>(
+    'send_reaction_message',
+    { gateway_name: gatewayName, to, message_id: messageId.trim(), emoji: remove ? '' : emoji.trim(), remove: remove ? 1 : 0 },
+    'post',
+  );
+
+export type InteractiveKind = 'buttons' | 'list' | 'cta_url';
+export interface InteractiveButton { id: string; title: string }
+export interface InteractiveSection { title: string; rows: { id: string; title: string; description?: string }[] }
+export interface InteractiveSend {
+  kind: InteractiveKind;
+  body: string;
+  header?: string;
+  footer?: string;
+  buttons?: InteractiveButton[];
+  buttonText?: string;
+  sections?: InteractiveSection[];
+  displayText?: string;
+  url?: string;
+}
+export const INTERACTIVE_LIMITS = { buttons: 3, buttonTitle: 20, listRows: 10, rowTitle: 24, ctaText: 20 } as const;
+
+/** Validate an interactive message before calling the server. */
+export function validateInteractive(m: InteractiveSend): string | null {
+  if (!m.body.trim()) return 'Add the message text';
+  if (m.kind === 'buttons') {
+    const b = m.buttons ?? [];
+    if (b.length < 1) return 'Add at least one button';
+    if (b.length > INTERACTIVE_LIMITS.buttons) return 'Use at most 3 buttons';
+    if (b.some((x) => !x.title.trim())) return 'Every button needs a label';
+    if (b.some((x) => x.title.length > INTERACTIVE_LIMITS.buttonTitle)) return 'Button labels are limited to 20 characters';
+  } else if (m.kind === 'list') {
+    const rows = (m.sections ?? []).flatMap((s) => s.rows);
+    if (!m.buttonText?.trim()) return 'Add the label for the list button';
+    if (rows.length < 1) return 'Add at least one list item';
+    if (rows.length > INTERACTIVE_LIMITS.listRows) return 'A list can have at most 10 items';
+    if (rows.some((r) => !r.title.trim() || r.title.length > INTERACTIVE_LIMITS.rowTitle)) return 'List item titles are required and limited to 24 characters';
+  } else {
+    if (!m.displayText?.trim()) return 'Add the button label';
+    if (!/^https:\/\//.test((m.url ?? '').trim())) return 'The link must start with https://';
+  }
+  return null;
+}
+
+export const sendInteractiveMessage = (gatewayName: string, to: string, m: InteractiveSend) =>
+  invoke<Record<string, unknown>>(
+    'send_interactive_message',
+    {
+      gateway_name: gatewayName,
+      to,
+      kind: m.kind,
+      body: m.body.trim(),
+      header: m.header?.trim() || undefined,
+      footer: m.footer?.trim() || undefined,
+      buttons: m.kind === 'buttons' ? JSON.stringify(m.buttons ?? []) : undefined,
+      button_text: m.kind === 'list' ? m.buttonText?.trim() : undefined,
+      sections: m.kind === 'list' ? JSON.stringify(m.sections ?? []) : undefined,
+      display_text: m.kind === 'cta_url' ? m.displayText?.trim() : undefined,
+      url: m.kind === 'cta_url' ? m.url?.trim() : undefined,
+    },
+    'post',
+  );
+
 /** Upload a public file (so Meta can fetch it) and return its server path. */
 export async function uploadPublicFile(f: File): Promise<{ fileUrl: string } | WhatsAppError> {
   try {

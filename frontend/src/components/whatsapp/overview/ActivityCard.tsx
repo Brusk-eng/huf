@@ -16,10 +16,10 @@ export interface ActivityCardProps {
 
 const TRUNCATE_AT = 140;
 
-function Stat({ label, value }: { label: string; value: number }) {
+function Stat({ label, value, alert = false }: { label: string; value: number; alert?: boolean }) {
 	return (
-		<div className="rounded border border-line px-3 py-2">
-			<dd className="text-lg font-medium text-ink">{value}</dd>
+		<div className={alert && value > 0 ? 'rounded border border-destructive/40 bg-destructive-tint px-3 py-2' : 'rounded border border-line px-3 py-2'}>
+			<dd className={alert && value > 0 ? 'text-lg font-medium text-destructive' : 'text-lg font-medium text-ink'}>{value}</dd>
 			<dt className="text-xs text-steel">{label}</dt>
 		</div>
 	);
@@ -63,15 +63,15 @@ export function ActivityCard({
 
 				<dl className="grid grid-cols-2 gap-2 sm:grid-cols-4">
 					<Stat label="Received" value={events24h.received} />
-					<Stat label="Failed" value={events24h.failed} />
+					<Stat label="Failed" value={events24h.failed} alert />
 					<Stat label="Unrouted" value={events24h.unrouted} />
-					<Stat label="Rejected" value={events24h.rejected} />
+					<Stat label="Rejected" value={events24h.rejected} alert />
 				</dl>
 
 				{lastError && (
-					<div className="text-sm">
-						<p className="text-ink">Last error</p>
-						<p className="text-steel">
+					<div role="alert" className="rounded border border-destructive/40 bg-destructive-tint px-3 py-2 text-sm">
+						<p className="font-medium text-destructive">Last error</p>
+						<p className="text-ink">
 							<ExpandableText text={lastError} />
 						</p>
 					</div>

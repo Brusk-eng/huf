@@ -12,7 +12,7 @@ import {
   type MessageLogFilterOptions, type MessageLogItem,
 } from '@/services/whatsappApi';
 import { BridgeUnavailable, LoadError } from './BridgeUnavailable';
-import { MessageDetailSheet, StatusTicks } from './MessageDetailSheet';
+import { ErrorBadge, MessageDetailSheet, StatusTicks } from './MessageDetailSheet';
 import { SendPanel } from './SendPanel';
 import {
   ALL, EMPTY_FILTERS, activeFilterCount, agentRunPath, filtersFromParams, filtersToParams, filtersToQuery,
@@ -213,7 +213,12 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                     </TableCell>
                     <TableCell>
                       <StatusTicks status={m.status} />
-                      {m.error && <div className="max-w-48 truncate text-[11px] text-destructive" title={m.error}>{m.error}</div>}
+                      {m.error && (
+                        <div className="mt-1 space-y-0.5">
+                          <ErrorBadge error={m.error} />
+                          <div className="max-w-48 truncate text-[11px] text-destructive" title={m.error}>{m.error}</div>
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell className="text-xs">
                       {runPath ? (

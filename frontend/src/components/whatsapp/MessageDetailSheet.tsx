@@ -4,7 +4,7 @@ import { Badge } from '@/components/ui/badge';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { MessageLogItem } from '@/services/whatsappApi';
 import { cn } from '@/lib/utils';
-import { agentRunPath, sentByLabel, statusTicks, statusTimeline, type TickTone } from './messageLogModel';
+import { agentRunPath, errorInfo, sentByLabel, statusTicks, statusTimeline, type TickTone } from './messageLogModel';
 import { TemplateSend } from './TemplateSend';
 
 export const TONE_CLASS: Record<TickTone, string> = { neutral: 'text-steel', good: 'text-good', danger: 'text-destructive' };
@@ -28,6 +28,12 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+export function ErrorBadge({ error }: { error?: string | null }) {
+  const info = errorInfo(error);
+  if (!info) return null;
+  return <Badge variant="pill-danger" title={info.hint}>{info.code ? `${info.label} · ${info.code}` : info.label}</Badge>;
+}
+
 export function MessageDetailSheet({
   item, agentTitle, gateway, onClose,
 }: { item: MessageLogItem | null; agentTitle?: string; gateway?: string; onClose: () => void }) {
@@ -49,7 +55,7 @@ export function MessageDetailSheet({
               {item.direction === 'out' ? (
                 <ol className="flex items-center gap-3">
                   {statusTimeline(item.status).map((s) => (
-                    <li key={s.key} className={cn('flex items-center gap-1 text-xs', !s.reached ? 'text-steel opacity-50' : s.key === 'failed' ? 'text-destructive' : s.key === 'read' ? 'text-good' : 'text-ink')}>
+                    <li key={s.key} className={cn('flex items-center gap-1 text-xs', !s.reached ? 'text-steel opacity-50' : s.key === 'failed' ? 'text-destructive' : s.key === 'read' || s.key === 'played' ? 'text-good' : 'text-ink')}>
                       {s.key === 'failed' ? <X className="h-3.5 w-3.5" /> : s.reached ? <Check className="h-3.5 w-3.5" /> : <Circle className="h-3.5 w-3.5" />}
                       {s.label}
                     </li>
@@ -58,7 +64,13 @@ export function MessageDetailSheet({
               ) : (
                 <StatusTicks status={item.status} />
               )}
-              {item.error && <p role="alert" className="text-xs text-destructive">{item.error}</p>}
+              {item.error && (
+                <div role="alert" className="space-y-1">
+                  <ErrorBadge error={item.error} />
+                  <p className="text-xs text-ink">{errorInfo(item.error)?.hint}</p>
+                  <p className="text-xs text-destructive">{item.error}</p>
+                </div>
+              )}
             </div>
             <dl className="grid grid-cols-2 gap-3">
               <Field label="Time">{item.creation}</Field>
