@@ -25,7 +25,7 @@ class TestGatewayPairingTools(IntegrationTestCase):
         res = setup_gateway(
             provider="Telegram",
             gateway_name=test_gw,
-            credentials={"token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"},
+            credentials={"token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz", "webhook_secret": "test-webhook-secret"},
             direct_policy="Pairing",
         )
         self.assertTrue(res["success"])
@@ -43,7 +43,7 @@ class TestGatewayPairingTools(IntegrationTestCase):
         setup_gateway(
             provider="Telegram",
             gateway_name=gw_name,
-            credentials={"token": "987654321:ABCdefGHIjklMNOpqrsTUVwxyz"},
+            credentials={"token": "987654321:ABCdefGHIjklMNOpqrsTUVwxyz", "webhook_secret": "test-webhook-secret"},
             direct_policy="Pairing",
         )
 
@@ -72,7 +72,7 @@ class TestGatewayPairingTools(IntegrationTestCase):
         setup_gateway(
             provider="Telegram",
             gateway_name=gw_name,
-            credentials={"token": "111222333:ABCdefGHIjklMNOpqrsTUVwxyz"},
+            credentials={"token": "111222333:ABCdefGHIjklMNOpqrsTUVwxyz", "webhook_secret": "test-webhook-secret"},
         )
 
         health = test_gateway_health(gw_name)
