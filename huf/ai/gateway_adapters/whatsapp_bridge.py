@@ -645,6 +645,10 @@ def _graph_err(error: str, resp_or_exc: Any, **extra: Any) -> dict[str, Any]:
 
 def _graph_post_message(acct: dict[str, Any], data: dict[str, Any], http_post: Callable[..., Any] | None = None) -> str:
 	"""POST a ``/messages`` body with the account credentials; returns the wamid or raises BridgeError."""
+	from huf.ai import whatsapp_account_events as _ae
+
+	if (refusal := _ae.send_refusal(acct.get("phone_id"))):
+		raise BridgeError(refusal)
 	http_post = http_post or _default_post
 	url = f"{acct['url']}/{acct['version']}/{acct['phone_id']}/messages"
 	try:
@@ -1099,6 +1103,10 @@ def send_media(
 # ---------------------------------------------------------------------------
 def _post_typed_message(acct: dict[str, Any], data: dict[str, Any], http_post: Callable[..., Any] | None = None) -> str:
 	"""POST a ``/messages`` body; returns the wamid or raises BridgeError carrying the structured Graph error."""
+	from huf.ai import whatsapp_account_events as _ae
+
+	if (refusal := _ae.send_refusal(acct.get("phone_id"))):
+		raise BridgeError(refusal)
 	http_post = http_post or _default_post
 	url = f"{acct['url']}/{acct['version']}/{acct['phone_id']}/messages"
 	try:
