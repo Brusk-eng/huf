@@ -119,7 +119,7 @@ class TestFlowWhatsAppGatewayTrigger(fs.TestWhatsAppMultiGateway):
 		self.assertTrue(self._inbound("A", "wamid.FLOW1", "start the flow")["success"])
 		result = process_gateway_event(self._events(self.gateway_a, "wamid.FLOW1")[0])
 		frappe.set_user("Administrator")
-		self.assertEqual(result["status"], "Queued")
+		self.assertEqual(result["status"], "Running")
 		event, flow_run = self._flow_run_for("wamid.FLOW1")
 		self.assertEqual((event.target_type, event.target_flow), ("Flow", flow_id))
 		self.assertEqual(flow_run.flow_id, flow_id)
