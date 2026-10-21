@@ -78,6 +78,12 @@ export function statusTicks(status?: string | null): StatusTicks {
   }
 }
 
+/** Incoming messages are not "Succeeded": unless they failed, they were simply received. */
+export function displayStatus(item: Pick<MessageLogItem, 'direction' | 'status'>): string | null | undefined {
+  if (item.direction === 'in' && (item.status ?? '').toLowerCase() !== 'failed') return 'received';
+  return item.status;
+}
+
 export function sentByLabel(sentBy?: MessageSentBy | null, agentTitle?: string | null): string {
   if (agentTitle) return agentTitle;
   switch (sentBy) {

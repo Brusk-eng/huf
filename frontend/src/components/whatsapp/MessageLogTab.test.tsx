@@ -78,6 +78,13 @@ describe('MessageLogTab one-shot links', () => {
     expect(screen.queryByText(/statuss/)).toBeNull();
   });
 
+  it('shows a relative time with the full date on hover', async () => {
+    open('/?tab=messages');
+    await screen.findByText('msg m1');
+    expect(screen.queryByText('2026-10-14 10:00:00')).toBeNull();
+    expect(document.querySelector('time[title]')).not.toBeNull();
+  });
+
   it('has no Gateway column and rows open with the keyboard', async () => {
     open('/?tab=messages');
     await screen.findByText('msg m1');

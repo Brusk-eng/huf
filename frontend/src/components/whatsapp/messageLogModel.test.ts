@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  displayStatus,
   activeFilterCount, agentRunPath, EMPTY_FILTERS, filtersFromParams, filtersToParams, filtersToQuery, messagePreview,
   sentByLabel, statusTicks, statusTimeline,
 } from './messageLogModel';
@@ -71,4 +72,12 @@ describe('delivery state and error info', () => {
     expect(m.errorInfo('request timed out')?.label).toBe('Temporary problem');
     expect(m.errorInfo('')).toBeNull();
   });
+
+describe('displayStatus', () => {
+  it('shows incoming messages as received unless they failed', () => {
+    expect(displayStatus({ direction: 'in', status: 'Succeeded' })).toBe('received');
+    expect(displayStatus({ direction: 'in', status: 'failed' })).toBe('failed');
+    expect(displayStatus({ direction: 'out', status: 'delivered' })).toBe('delivered');
+  });
+});
 });

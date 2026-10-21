@@ -13,10 +13,11 @@ import {
 } from '@/services/whatsappApi';
 import { BridgeUnavailable, LoadError } from './BridgeUnavailable';
 import { ErrorBadge, MessageDetailSheet, StatusTicks } from './MessageDetailSheet';
+import { TimeStamp } from './TimeStamp';
 import { SendPanel } from './SendPanel';
 import {
   ALL, EMPTY_FILTERS, activeFilterCount, agentRunPath, filtersFromParams, filtersToParams, filtersToQuery,
-  messagePreview, sentByLabel, type MessageLogFilters,
+  displayStatus, messagePreview, sentByLabel, type MessageLogFilters,
 } from './messageLogModel';
 
 function FilterSelect({
@@ -188,7 +189,7 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                 <TableHead>Contact</TableHead>
                 <TableHead>Message</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead>Agent</TableHead>
+                <TableHead className="min-w-32">Agent</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -208,7 +209,7 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelected(m); }
                     }}
                   >
-                    <TableCell className="whitespace-nowrap font-mono text-xs text-steel">{m.creation}</TableCell>
+                    <TableCell className="whitespace-nowrap text-xs text-steel"><TimeStamp value={m.creation} /></TableCell>
                     <TableCell><Badge variant={m.direction === 'in' ? 'pill-neutral' : 'pill-success'}>{m.direction === 'in' ? 'In' : 'Out'}</Badge></TableCell>
                     <TableCell className="text-xs">
                       <div className="font-mono text-ink">{m.phone}</div>
@@ -222,7 +223,7 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                       </div>
                     </TableCell>
                     <TableCell>
-                      <StatusTicks status={m.status} />
+                      <StatusTicks status={displayStatus(m)} />
                       {m.error && (
                         <div className="mt-1 space-y-0.5">
                           <ErrorBadge error={m.error} />
@@ -230,11 +231,11 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                         </div>
                       )}
                     </TableCell>
-                    <TableCell className="text-xs">
+                    <TableCell className="min-w-32 max-w-48 text-xs">
                       {runPath ? (
-                        <Link to={runPath} onClick={(e) => e.stopPropagation()} className="text-signal-ink underline">{sentByLabel(m.sent_by, title ?? m.agent)}</Link>
+                        <Link to={runPath} onClick={(e) => e.stopPropagation()} title={sentByLabel(m.sent_by, title ?? m.agent)} className="block truncate text-signal-ink underline">{sentByLabel(m.sent_by, title ?? m.agent)}</Link>
                       ) : (
-                        <span className="text-steel">{sentByLabel(m.sent_by, title ?? m.agent)}</span>
+                        <span className="block truncate text-steel" title={sentByLabel(m.sent_by, title ?? m.agent)}>{sentByLabel(m.sent_by, title ?? m.agent)}</span>
                       )}
                     </TableCell>
                   </TableRow>
