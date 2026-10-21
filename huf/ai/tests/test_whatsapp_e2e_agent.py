@@ -464,7 +464,7 @@ class TestWhatsAppE2EAgentUnapproved(_E2EMixin, IntegrationTestCase):
 	test_e_window_closed_without_fallback_fails_cleanly_with_no_post = None
 	test_e_window_closed_with_fallback_template_sends_one_template = None
 	test_g_duplicate_wamid_one_event_and_one_agent_run = None
-	test_h_provider_failure_marks_event_failed_and_sends_nothing = None
+	test_h_provider_failure_marks_event_failed_and_sends_default_fallback = None
 	test_h_error_without_kind_is_agent_run_failed_and_raw_text_not_sent = None
 	test_h_empty_response_fails_without_send = None
 	test_h_configured_fallback_text_sent_once_per_event = None
