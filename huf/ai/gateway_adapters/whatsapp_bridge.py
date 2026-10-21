@@ -314,15 +314,15 @@ def record_incoming(account_name: str, message: dict[str, Any], profile_name: st
 	existing = frappe.db.get_value("WhatsApp Message", {"message_id": message_id}, "name")
 	if existing:
 		return existing
-	content_type = message.get("type") or message.get("content_type") or "text"
-	body = ""
-	if content_type == "text":
-		body = (message.get("text") or {}).get("body", "") if isinstance(message.get("text"), dict) else message.get("text") or ""
-	elif isinstance(message.get(content_type), dict):
-		body = message[content_type].get("caption", "") or ""
+	from huf.ai.gateway_adapters import whatsapp_inbound as inbound
+
+	raw_type = message.get("type") or message.get("content_type") or "text"
+	if raw_type == "reaction":
+		return None  # reactions are kept on the Gateway Event only, never mirrored
+	content_type = inbound.CONTENT_TYPES.get(raw_type, "text")
+	body = inbound.render_message_text({**message, "type": raw_type})
 	if not body:
 		body = message.get("body") or message.get("message") or ""
-	allowed = {"text", "document", "image", "video", "audio", "flow", "reaction", "location", "contact", "button", "interactive", "order"}
 	doc = frappe.get_doc(
 		{
 			"doctype": "WhatsApp Message",

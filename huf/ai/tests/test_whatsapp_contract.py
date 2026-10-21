@@ -15,6 +15,8 @@ import pathlib
 import unittest
 
 from huf.ai.gateway_adapters.types import GatewayInboundRequest
+from huf.ai.gateway_adapters.whatsapp_bridge import message_time
+from huf.ai.gateway_adapters.whatsapp_inbound import render_message_text
 from huf.ai.gateway_adapters.whatsapp import WhatsAppGatewayAdapter
 
 FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures" / "whatsapp"
@@ -172,15 +174,140 @@ class TestParseMessages(WhatsAppContractBase):
 		self.assertEqual(event.attachments[0].kind, "audio")
 		self.assertEqual(event.attachments[0].file_id, "3234567890123456")
 
-	def test_location_is_unsupported_and_ignored(self):
-		parsed = self.parse("location_unsupported.json")
-		self.assertEqual(parsed.messages, ())
-		self.assertEqual(parsed.ignored, 1)
+	def test_location_text_and_window_anchor(self):
+		event = self.parse("location.json").messages[0]
+		self.assertEqual(event.message_text, '[Location: 12.9716,77.5946 "Head office" MG Road, Bengaluru]')
+		self.assertEqual(event.kind, "message")
+		self.assertEqual(event.provider_event_id, WAMID)
+		self.assert_anchors_window(event, "location")
 
-	def test_reaction_is_unsupported_and_ignored(self):
-		parsed = self.parse("reaction.json")
-		self.assertEqual(parsed.messages, ())
-		self.assertEqual(parsed.ignored, 1)
+	def test_location_partial_omits_missing_parts(self):
+		self.assertEqual(self.parse("location_minimal.json").messages[0].message_text, "[Location: -33.86,151.2]")
+
+	def test_contacts_text_and_caps(self):
+		event = self.parse("contacts.json").messages[0]
+		self.assertEqual(
+			event.message_text,
+			"[Contact: Barbara J. Johnson +1 (415) 555-0829 +1 650 555 0100]\n[Contact: Zoë 山田]",
+		)
+		self.assert_anchors_window(event, "contacts")
+
+	def test_contacts_cap_five_and_three_phones(self):
+		cards = [{"name": {"formatted_name": f"C{i}"}, "phones": [{"phone": str(n)} for n in range(6)]} for i in range(8)]
+		text = render_message_text({"type": "contacts", "contacts": cards})
+		self.assertEqual(text.count("[Contact:"), 5)
+		self.assertIn("[+3 more contacts]", text)
+		self.assertIn("[Contact: C0 0 1 2]", text)
+
+	def test_order_text(self):
+		event = self.parse("order.json").messages[0]
+		self.assertEqual(
+			event.message_text,
+			"[Order: 2 items, catalog CAT123] SKU-1 x2 @ 30 USD, SKU-2 x1 @ 7.99 USD Please deliver after 5pm",
+		)
+		self.assert_anchors_window(event, "order")
+
+	def test_order_cap_ten_items(self):
+		items = [{"product_retailer_id": f"S{i}", "quantity": 1} for i in range(14)]
+		text = render_message_text({"type": "order", "order": {"product_items": items}})
+		self.assertTrue(text.startswith("[Order: 14 items]"))
+		self.assertIn("S9 x1", text)
+		self.assertNotIn("S10", text)
+		self.assertIn("(+4 more)", text)
+
+	def test_nfm_reply_flow_response_compacted(self):
+		event = self.parse("interactive_nfm_reply.json").messages[0]
+		self.assertEqual(
+			event.message_text, '[Form response: flow] {"flow_token":"unused","city":"Bengaluru","note":"café 😀"}'
+		)
+		self.assert_anchors_window(event, "interactive")
+
+	def test_nfm_reply_capped_at_2kb(self):
+		big = json.dumps({"k": "é" * 5000})
+		text = render_message_text({"type": "interactive", "interactive": {"type": "nfm_reply", "nfm_reply": {"name": "f", "response_json": big}}})
+		payload = text.split("] ", 1)[1]
+		self.assertLessEqual(len(payload.encode("utf-8")), 2048)
+		self.assertTrue(payload.endswith("..."))
+
+	def test_nfm_reply_invalid_json_passes_through(self):
+		text = render_message_text({"type": "interactive", "interactive": {"type": "nfm_reply", "nfm_reply": {"response_json": "not json"}}})
+		self.assertEqual(text, "[Form response: flow] not json")
+
+	def test_system_message(self):
+		event = self.parse("system_number_change.json").messages[0]
+		self.assertEqual(event.message_text, "[system message] User A changed from 919876543210 to 919876500000")
+
+	def test_unsupported_message(self):
+		event = self.parse("unsupported.json").messages[0]
+		self.assertEqual(event.message_text, "[unsupported message: edit] Message type unknown")
+
+	def test_sticker_passes_with_attachment(self):
+		event = self.parse("sticker.json").messages[0]
+		self.assertEqual(event.message_text, "[sticker message]")
+		self.assertEqual(event.attachments[0].kind, "sticker")
+		self.assertEqual(event.attachments[0].file_id, "7234567890123456")
+
+	def test_button_quick_reply_keeps_text_and_reply_id(self):
+		event = self.parse("button_quick_reply.json").messages[0]
+		self.assertEqual(event.message_text, "Confirm")
+		self.assertEqual(event.raw_payload["reply_to_message_id"], "wamid.PREV")
+
+	def test_reaction_event_kind_and_ids(self):
+		event = self.parse("reaction.json").messages[0]
+		self.assertEqual(event.kind, "reaction")
+		self.assertEqual(event.reaction_emoji, "👍")
+		self.assertEqual(event.reaction_to, WAMID2)
+		self.assertEqual(event.message_text, f"[Reaction: 👍 to {WAMID2}]")
+		self.assertEqual(event.raw_payload["kind"], "reaction")
+		self.assertEqual(event.raw_payload["reaction_to"], WAMID2)
+
+	def test_reaction_removed_has_no_emoji(self):
+		event = self.parse("reaction_removed.json").messages[0]
+		self.assertEqual((event.kind, event.reaction_emoji), ("reaction", ""))
+		self.assertEqual(event.message_text, f"[Reaction removed from {WAMID2}]")
+
+	def test_ctwa_referral_prefix_and_raw(self):
+		event = self.parse("text_ctwa_referral.json").messages[0]
+		self.assertEqual(event.message_text, "[Ad referral: Summer sale] Is this still available?")
+		self.assertEqual(event.raw_payload["referral"]["ctwa_clid"], "AR-abc")
+		self.assertEqual(event.raw_payload["referral"]["source_url"], "https://fb.me/ad1")
+		self.assertNotIn("referral", self.parse("text_inbound.json").messages[0].raw_payload)
+
+	def test_forwarded_flag(self):
+		self.assertTrue(self.parse("text_forwarded.json").messages[0].raw_payload["forwarded"])
+		self.assertFalse(self.parse("text_inbound.json").messages[0].raw_payload["forwarded"])
+
+	def test_malformed_and_partial_payloads_do_not_raise(self):
+		base = {"from": "919876543210", "id": "wamid.X", "timestamp": "1792000000"}
+		bad = [
+			{"type": "location", "location": None},
+			{"type": "location", "location": "x"},
+			{"type": "contacts", "contacts": "oops"},
+			{"type": "contacts", "contacts": [None, 3, {"name": None, "phones": [None]}]},
+			{"type": "order", "order": []},
+			{"type": "order", "order": {"product_items": [None, {"quantity": object.__name__}]}},
+			{"type": "interactive", "interactive": None},
+			{"type": "interactive", "interactive": {"type": "nfm_reply", "nfm_reply": None}},
+			{"type": "system", "system": None},
+			{"type": "unsupported", "errors": "x", "unsupported": 5},
+			{"type": "reaction", "reaction": None},
+			{"type": "carrier_pigeon"},
+			{"type": "image", "image": None},
+			{"type": "text", "text": {"body": "hi"}, "context": "x", "referral": ["x"]},
+		]
+		for extra in bad:
+			with self.subTest(extra=extra):
+				event = self.adapter._message_event({**base, **extra}, {}, {})
+				if event is not None:
+					self.assertIsInstance(event.message_text, str)
+					self.assertTrue(event.message_text.strip())
+
+	def assert_anchors_window(self, event, msg_type):
+		"""bridge.window_state reads raw_payload.message.timestamp: it must survive for every type."""
+		message = event.raw_payload["message"]
+		self.assertEqual(message["type"], msg_type)
+		self.assertEqual(message["timestamp"], "1792000000")
+		self.assertIsNotNone(message_time(event.raw_payload))
 
 	def test_batch_yields_two_messages_and_one_status(self):
 		parsed = self.parse("batch_two_messages_one_status.json")
@@ -297,3 +424,48 @@ class TestReplayDedupeKey(WhatsAppContractBase):
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+class TestRecordIncomingMirror(WhatsAppContractBase):
+	"""bridge.record_incoming mirrors every non-reaction type with the right content_type and text."""
+
+	def mirror(self, fixture):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from huf.ai.gateway_adapters import whatsapp_bridge as wb
+
+		message = self.parse(fixture).messages[0].raw_payload["message"]
+		doc = MagicMock()
+		doc.name = "WAM-1"
+		with patch.object(wb, "is_available", return_value=True), patch.object(
+			frappe.db, "get_value", return_value=None
+		), patch.object(frappe, "get_doc", return_value=doc) as get_doc:
+			result = wb.record_incoming("ACC", message, "Ravi")
+		return result, (get_doc.call_args.args[0] if get_doc.called else None)
+
+	def test_mirrored_types(self):
+		for fixture, content_type, text in (
+			("location.json", "location", '[Location: 12.9716,77.5946 "Head office" MG Road, Bengaluru]'),
+			("contacts.json", "contact", None),
+			("order.json", "order", None),
+			("interactive_nfm_reply.json", "interactive", None),
+			("sticker.json", "image", "[sticker message]"),
+			("system_number_change.json", "text", None),
+			("unsupported.json", "text", "[unsupported message: edit] Message type unknown"),
+			("image_with_caption.json", "image", "Receipt for the team lunch"),
+			("text_inbound.json", "text", "Hi, what are my open leave requests?"),
+		):
+			with self.subTest(fixture=fixture):
+				result, values = self.mirror(fixture)
+				self.assertEqual(result, "WAM-1")
+				self.assertEqual(values["content_type"], content_type)
+				self.assertTrue(values["message"])
+				if text:
+					self.assertEqual(values["message"], text)
+
+	def test_reaction_not_mirrored(self):
+		result, values = self.mirror("reaction.json")
+		self.assertIsNone(result)
+		self.assertIsNone(values)

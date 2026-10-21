@@ -153,8 +153,10 @@ class TestWhatsAppGatewayAdapter(unittest.TestCase):
 	def test_error_and_unknown_messages_ignored_without_raise(self):
 		msgs = [{"from": "1", "id": "w1", "errors": [{"code": 131051}]}, {"from": "1", "id": "w2", "type": "unsupported"}]
 		parsed = self.adapter.parse_payload(_request(_payload(msgs)))
-		self.assertEqual(parsed.messages, ())
-		self.assertEqual(parsed.ignored, 2)
+		# w1 has no type/text (dropped); w2 is Meta's `unsupported` and now reaches the agent as text.
+		self.assertEqual([m.provider_event_id for m in parsed.messages], ["w2"])
+		self.assertEqual(parsed.messages[0].message_text, "[unsupported message]")
+		self.assertEqual(parsed.ignored, 1)
 
 	def test_empty_payload_raises(self):
 		with self.assertRaises(ValueError):

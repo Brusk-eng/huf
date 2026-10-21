@@ -17,6 +17,7 @@ from typing import Any
 
 import frappe
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+from huf.ai.gateway_adapters import whatsapp_inbound as inbound
 from huf.ai.gateway_adapters import whatsapp_templates as wt
 from huf.ai.gateway_adapters.whatsapp_bridge import direct_send_components, send_error
 from huf.ai.gateway_adapters.adapter import GatewayAdapter
@@ -39,8 +40,7 @@ _TEMPLATE_FIELD_KINDS = {
 	"message_template_quality_update": "quality",
 	"template_category_update": "category",
 }
-_MEDIA_TYPES = ("image", "document", "audio", "video", "sticker")
-_TEXTUAL_TYPES = ("text", "interactive", "button") + _MEDIA_TYPES
+_MEDIA_TYPES = inbound.MEDIA_TYPES
 
 
 class WhatsAppWindowClosed(frappe.ValidationError):
@@ -221,33 +221,31 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		if not isinstance(msg, dict):
 			return None
 		msg_type = msg.get("type") or "text"
-		if msg_type not in _TEXTUAL_TYPES:
-			return None
 		provider_event_id = str(msg.get("id") or "").strip()
 		sender = bridge.normalize_phone(msg.get("from"))
 		if not provider_event_id or not sender:
 			return None
+		try:
+			return self._build_event(msg, msg_type, provider_event_id, sender, metadata, names)
+		except Exception:  # never let one odd message break a batch
+			return None
 
-		message_text = ""
-		if msg_type == "text":
-			message_text = (msg.get("text") or {}).get("body") or ""
-		elif msg_type == "interactive":
-			interactive = msg.get("interactive") or {}
-			for key in ("button_reply", "list_reply"):
-				if key in interactive:
-					reply = interactive[key] or {}
-					message_text = reply.get("title") or reply.get("id") or ""
-					break
-		elif msg_type == "button":
-			message_text = (msg.get("button") or {}).get("text") or (msg.get("button") or {}).get("payload") or ""
+	def _build_event(
+		self, msg: dict, msg_type: str, provider_event_id: str, sender: str,
+		metadata: Mapping[str, Any], names: Mapping[str, str],
+	) -> NormalizedGatewayEvent | None:
+		kind, emoji, reaction_to = "message", "", ""
+		if msg_type == "reaction":
+			message_text, emoji, reaction_to = inbound.render_reaction(msg)
+			kind = "reaction"
 		else:
-			message_text = (msg.get(msg_type) or {}).get("caption") or f"[{msg_type} message]"
+			message_text = inbound.render_message_text(msg)
 		if not message_text.strip():
 			return None
 
 		attachments = []
 		if msg_type in _MEDIA_TYPES:
-			media = msg.get(msg_type) or {}
+			media = msg.get(msg_type) if isinstance(msg.get(msg_type), dict) else {}
 			media_id = str(media.get("id") or "")
 			if media_id:
 				attachments.append(
@@ -261,6 +259,27 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 
 		context = msg.get("context") if isinstance(msg.get("context"), dict) else {}
 		quoted = str(context.get("id") or "") or None
+		raw: dict[str, Any] = {
+			"message": msg,
+			"metadata": dict(metadata),
+			"quoted_message_id": quoted,
+			"reply_to_message_id": quoted,
+			"forwarded": bool(context.get("forwarded") or context.get("frequently_forwarded")),
+		}
+		referral = msg.get("referral") if isinstance(msg.get("referral"), dict) else {}
+		if referral:
+			raw["referral"] = {
+				k: referral[k]
+				for k in ("source_url", "source_id", "source_type", "headline", "body", "ctwa_clid")
+				if referral.get(k)
+			}
+			headline = inbound.cap(referral.get("headline"), 120)
+			if headline and kind == "message":
+				message_text = f"[Ad referral: {headline}] {message_text}"
+		if kind == "reaction":
+			# Meta: a reaction is not a customer-service-window opener (UNVERIFIED in docs).
+			# bridge.window_state must skip rows whose raw_payload.kind == "reaction".
+			raw.update({"kind": "reaction", "reaction_to": reaction_to, "reaction_emoji": emoji})
 		return NormalizedGatewayEvent(
 			provider_event_id=provider_event_id,
 			sender_id=sender,
@@ -268,9 +287,12 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			message_text=message_text,
 			thread_id=None,  # A2: quoted id stays in raw_payload only
 			is_room=False,
-			raw_payload={"message": msg, "metadata": dict(metadata), "quoted_message_id": quoted},
+			raw_payload=raw,
 			display_name=names.get(sender, ""),
 			attachments=tuple(attachments),
+			kind=kind,
+			reaction_emoji=emoji,
+			reaction_to=reaction_to,
 		)
 
 	# ------------------------------------------------------------------ egress
