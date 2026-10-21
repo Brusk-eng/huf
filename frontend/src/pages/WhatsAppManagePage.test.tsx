@@ -55,7 +55,7 @@ describe('WhatsAppManagePage', () => {
 		open('/');
 		expect(await screen.findByText(/steps left/)).toBeInTheDocument();
 		await waitFor(() => expect(screen.getByTestId('search')).toHaveTextContent('gateway=GW-1'));
-		expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Overview', 'Messages', 'Templates', 'Settings']);
+		expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Overview', 'Messages', 'Templates', 'Access', 'Settings']);
 	});
 
 	it('honours ?tab= and ?gateway= deep links', async () => {
@@ -110,7 +110,7 @@ describe('WhatsAppManagePage', () => {
 		open('/');
 		await userEvent.click(await screen.findByRole('button', { name: 'Check now' }));
 		await waitFor(() => expect(api.checkToken).toHaveBeenCalledWith('GW-1'));
-		expect(await screen.findByText('Token valid')).toBeInTheDocument();
+		expect(await screen.findByText('Token is valid')).toBeInTheDocument();
 		expect(api.getSetupStatus.mock.calls.filter((c) => c[0] === 'GW-1').length).toBe(2);
 	});
 
