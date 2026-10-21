@@ -17,6 +17,7 @@ from typing import Any
 
 import frappe
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+from huf.ai.gateway_adapters import whatsapp_calls as wc
 from huf.ai.gateway_adapters import whatsapp_errors as we
 from huf.ai.gateway_adapters import whatsapp_format as wf
 from huf.ai.gateway_adapters import whatsapp_inbound as inbound
@@ -109,6 +110,7 @@ class WhatsAppParsed:
 	template_updates: tuple[dict, ...]
 	ignored: int
 	unknown_phone_ids: tuple[str, ...] = ()
+	calls: tuple[wc.WhatsAppCall, ...] = ()  # `calls` webhook field (normalised, metadata + in-memory SDP)
 
 
 def _requests_post(url: str, *, json: dict, headers: dict, timeout: int) -> Any:
@@ -209,6 +211,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		template_updates: list[dict] = []
 		ignored = 0
 		unknown_phone_ids: list[str] = []
+		calls: list[wc.WhatsAppCall] = []
 
 		for entry in _as_list(payload.get("entry")):
 			for change in _as_list(entry.get("changes") if isinstance(entry, dict) else None):
@@ -225,7 +228,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					waba_id = str(entry.get("id") or "") if isinstance(entry, dict) else ""
 					template_updates.append({**value, "kind": _TEMPLATE_FIELD_KINDS[field], "waba_id": waba_id})
 					continue
-				items = _as_list(value.get("messages")) + _as_list(value.get("statuses"))
+				items = _as_list(value.get("messages")) + _as_list(value.get("statuses")) + _as_list(value.get("calls"))
 				metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
 				phone_id = str(metadata.get("phone_number_id") or "")
 				# Fail closed: a change without metadata.phone_number_id is ignored.
@@ -234,13 +237,19 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 						unknown_phone_ids.append(phone_id)
 					ignored += max(len(items), 1)
 					continue
+				if field == "calls" or "calls" in value or any(wc.is_call_status(x) for x in _as_list(value.get("statuses"))):
+					found = wc.normalize_calls(value)
+					calls.extend(found)
+					ignored += max(len(_as_list(value.get("calls"))) - len([c for c in found if c.event != "status"]), 0)
 				for status in _as_list(value.get("statuses")):
+					if wc.is_call_status(status):
+						continue  # handled above as a call status
 					if isinstance(status, dict):
 						statuses.append(dict(status))
 					else:
 						ignored += 1
 				if "messages" not in value:
-					if not value.get("statuses"):
+					if not value.get("statuses") and not value.get("calls"):
 						ignored += 1  # account_update, errors-only, etc.
 					continue
 				names = _contact_names(value)
@@ -251,14 +260,14 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					else:
 						messages.append(event)
 
-		return WhatsAppParsed(tuple(messages), tuple(statuses), tuple(template_updates), ignored, tuple(unknown_phone_ids))
+		return WhatsAppParsed(tuple(messages), tuple(statuses), tuple(template_updates), ignored, tuple(unknown_phone_ids), tuple(calls))
 
 	def normalize_inbound(self, request: GatewayInboundRequest) -> NormalizedGatewayEvent:
 		"""Return the first message event; ValueError only if nothing actionable exists."""
 		parsed = self.parse_payload(request)
 		if parsed.messages:
 			return parsed.messages[0]
-		if parsed.statuses or parsed.template_updates:
+		if parsed.statuses or parsed.template_updates or parsed.calls:
 			raise ValueError("WhatsApp payload carries only status or template events, no message")
 		raise ValueError("WhatsApp payload contains no message, status or template events")
 

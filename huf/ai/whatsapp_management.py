@@ -30,6 +30,7 @@ from frappe.query_builder import Order
 from frappe.rate_limiter import rate_limit
 
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+from huf.ai.gateway_adapters import whatsapp_calls as wcalls
 from huf.ai.gateway_adapters import whatsapp_messages as wm
 from huf.ai.gateway_adapters import whatsapp_templates as wt
 from huf.ai.gateway_adapters.whatsapp_bridge import BridgeError
@@ -1468,3 +1469,103 @@ def check_token(gateway_name: str | None = None, force: Any = None) -> dict[str,
 	return whatsapp_token_check.check_token_for_gateway(
 		gateway_name or "", force=str(force or "").lower() in ("1", "true", "yes")
 	)
+
+
+# --- WhatsApp Calling (EXPERIMENTAL; thin Graph wrappers, never invoked unless an admin calls them) ---
+
+
+def _calls_graph(gateway_name: str | None) -> "wcalls.CallsGraph | dict[str, Any]":
+	"""CallsGraph for the Gateway's own account (admin + write authority), or an error dict."""
+	_require_admin()
+	if not bridge.is_available():
+		return {"success": False, "error": "bridge_unavailable"}
+	refused = _send_authority(gateway_name)
+	if refused:
+		return refused
+	account_name = _resolve_account_name(_gateway_whatsapp_account(gateway_name))
+	if isinstance(account_name, dict):
+		return account_name
+	account = bridge.resolve_account(account_name)
+	if not account or account.get("error"):
+		return {"success": False, "error": "no_account", "message": "WhatsApp Account not found."}
+	return wcalls.CallsGraph(account)
+
+
+def _value_error(exc: ValueError) -> dict[str, Any]:
+	return {"success": False, "error": "invalid_request", "message": str(exc)}
+
+
+@frappe.whitelist()
+@rate_limit(limit=30, seconds=60)
+@_bridge_guard
+def get_calling_settings(gateway_name: str | None = None) -> dict[str, Any]:
+	"""Read the number's Calling settings from Graph (``GET /<PHONE_ID>/settings``)."""
+	graph = _calls_graph(gateway_name)
+	if isinstance(graph, dict):
+		return graph
+	return {"success": True, "settings": graph.get_settings()}
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=20, seconds=60)
+@_bridge_guard
+def set_calling_settings(
+	gateway_name: str | None = None,
+	calls_status: str | None = None,
+	call_icon_visibility: str | None = None,
+	greeting_media_id: str | None = None,
+	callback_permission_status: str | None = None,
+) -> dict[str, Any]:
+	"""Change Calling settings. ``calls_status`` ENABLED|DISABLED, ``call_icon_visibility`` DEFAULT|DISABLE_ALL.
+
+	``greeting_media_id`` is the id of an uploaded ``call_voicemail_announcement`` media (Opus, < 60 s).
+	"""
+	graph = _calls_graph(gateway_name)
+	if isinstance(graph, dict):
+		return graph
+	try:
+		payload = wcalls.calling_settings_payload(
+			calls_status, call_icon_visibility, greeting_media_id, callback_permission_status
+		)
+	except ValueError as exc:
+		return _value_error(exc)
+	return {"success": True, "result": graph.set_settings(payload)}
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=30, seconds=60)
+@_bridge_guard
+def call_action(
+	gateway_name: str | None = None, call_id: str | None = None, action: str | None = None, sdp: str | None = None
+) -> dict[str, Any]:
+	"""pre_accept | accept | reject | terminate a call. pre_accept/accept need the SDP answer."""
+	graph = _calls_graph(gateway_name)
+	if isinstance(graph, dict):
+		return graph
+	try:
+		return {"success": True, "result": graph.action(call_id or "", action or "", sdp)}
+	except ValueError as exc:
+		return _value_error(exc)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=30, seconds=60)
+@_bridge_guard
+def send_call_permission_request(
+	gateway_name: str | None = None, to: str | None = None, text: str | None = None
+) -> dict[str, Any]:
+	"""Send a ``call_permission_request`` interactive message (free-form: needs an open 24h window)."""
+	graph = _calls_graph(gateway_name)
+	if isinstance(graph, dict):
+		return graph
+	phone = _validate_recipient(to)
+	if isinstance(phone, dict):
+		return phone
+	try:
+		wcalls.permission_request_payload(phone, text or "")
+	except ValueError as exc:
+		return _value_error(exc)
+	gated = _free_form_gate(gateway_name, phone)
+	if gated:
+		return gated
+	return {"success": True, "result": graph.send_permission_request(phone, text or "")}

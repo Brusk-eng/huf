@@ -1,6 +1,6 @@
 # WhatsApp Business Calling: design and spike (T10)
 
-Status: design + spike only. No feature code in `huf/`. Researched 2026-10-21.
+Status: design + spike, plus an EXPERIMENTAL greeting-only implementation behind `Gateway.calling_enabled` (default OFF), see section 14. Researched 2026-10-21.
 Legend: **[V]** verified against Meta's official docs fetched today; **[U]** unverified (not on a fetched page, or from prior research only); **[L]** verified locally by running code.
 Sources fetched: `developers.facebook.com/docs/whatsapp/cloud-api/calling` (+ `/user-initiated-calls`, `/business-initiated-calls`, `/call-settings`), `/docs/whatsapp/pricing`. The pricing page for calls, call-permissions page, SIP page body, limits page and test-number notes were NOT retrievable in this pass.
 
@@ -167,3 +167,45 @@ Fail -> record findings, decide between fixing SDP/ICE or the SIP+Asterisk alter
 5. Recording/consent stance (none in v1?).
 6. Budget approval for per-minute call charges (rates unverified).
 7. Admission for unknown callers: reject by default or follow gateway open policy?
+
+## 14. Owner decisions and what is implemented (2026-10-21)
+
+Decisions: scope = GREETING plus optional pre-recorded reply/closing clips (no live conversation); number is US (+1 555-075-1406), so business-initiated calls are NOT available (item 12) and only user-initiated calls apply; policy = NO RECORDING (call audio is never stored, only metadata is logged), unknown callers are rejected, the greeting audio must announce an automated assistant; Calling was enabled on the test number by the owner. Default route stays webhook + WebRTC.
+
+Implemented (all mocked-tested, nothing invoked live, default OFF):
+- `gateway_adapters/whatsapp_calls.py`: `calls` webhook normalisation (`WhatsAppCall`; connect, terminate, call-typed `statuses`), payload builders (call actions, calling settings, `call_permission_request`), `CallsGraph` Graph wrapper with injectable HTTP, strict `call_admission`, Gateway Event recording (`raw_payload.kind == "call"`, metadata only, SDP never stored), `handle_call` routing.
+- `whatsapp.py`: `parse_payload` returns `WhatsAppParsed.calls`; `gateway_webhook._handle_calls` routes them. Calls never start an agent run (no config switch exists yet).
+- `whatsapp_management.py`: `get_calling_settings`, `set_calling_settings`, `call_action`, `send_call_permission_request` (admin only; permission request obeys opt-out and the 24 h window).
+- `whatsapp_call_flow.py`: state machine `run_call` (received, answering, pre_accepted, connected, accepted, playing, terminating, completed|failed|rejected), `answer_inbound_call_job`, `AiortcMediaSession` (lazy import; `get_media_backend()` reports `not_installed`, the job then rejects the call and marks the event Failed).
+- Gateway fields: `calling_enabled` (Check, default 0), `call_greeting_audio`, `call_reply_audio`, `call_closing_audio`, `call_max_seconds`.
+- Offline simulator `tools/wa_call_sim.py` (+ tests in `huf/ai/tests/test_whatsapp_calls.py`).
+
+Behaviour: calling off -> a metadata Event (Rejected, "Calling is not enabled") and NO Graph call. Calling on, caller not in an approved Sender access entry (or blocked/opted out; `Open` and `Pairing` policies do NOT admit a caller, no pairing request is created) -> `reject` action sent and recorded on the Event (success or error), status Rejected. Approved caller -> Event Received, `answer_inbound_call_job` enqueued (idempotent on `call_id`); flow: pre_accept, wait media, accept with the SAME SDP, open the audio gate, play clips, terminate. `terminate`/status webhooks update the same Event (COMPLETED -> Succeeded, FAILED -> Failed).
+
+No-recording invariant: caller audio goes only to `CallAudioSink`; `InMemoryAudioSink` keeps name/bytes/sha256 and nothing else (`retain=True` exists only for simulator assertions); `AiortcMediaSession` drains and discards inbound RTP; Events and `CallTrace` hold no SDP and no audio. A test asserts no file I/O during a call.
+
+Stubbed / not verified: `AiortcMediaSession` (ported from the spike, never run against Meta; aiortc is not a declared dependency); the RQ job runs the media in a worker, the design target remains the `huf-media` sidecar; `call_permission_request` JSON is from recall (docs page 404 today) [U]; the settings greeting is the voicemail announcement (`voicemail.audio.default.announcement_media_id`, upload via `/media` with `use_case=call_voicemail_announcement`, Opus, < 60 s) [V] but no upload wrapper exists; Gateway audio fields are not yet synced into Meta settings; no UI.
+
+### 14.1 Audio interfaces and the realtime hook
+`CallAudioSource.next_clip(heard) -> AudioClip | None` (bot side; `wants_caller_audio` makes the flow `listen` after each clip), `CallAudioSink.write(clip)` (caller side, must not persist), `MediaSession` (transport: `create_answer`, `wait_connected`, `open_gate`, `play`, `listen`, `close`). Now: `FilePlayback` (2-3 files in order) and `InMemoryAudioSink`. A realtime provider (e.g. Gemini Live) later implements a duplex source/sink pair over the same `MediaSession` (stream frames instead of clips); the flow, admission, events and terminate logic stay unchanged. The clip-based `next_clip` is turn-based, so a true streaming bridge will need a frame-level `MediaSession.stream(source, sink)` addition.
+
+### 14.2 Simulating a call without Meta
+`python tools/wa_call_sim.py [--unknown]` (bench python; no site, DB, network or aiortc needed) feeds a signed simulated `calls` connect webhook through the real adapter parser and `run_call` with `FakeMediaSession`: greeting -> caller file(s) heard (memory only) -> bot reply -> closing -> terminate, then a simulated terminate webhook; it prints a metadata-only report (states, actions, played, heard hashes). `--unknown` shows the reject path. An aiortc loopback variant is not implemented.
+
+## 15. SIP vs WebRTC (aiortc) signalling [V: developers.facebook.com/docs/whatsapp/cloud-api/calling/sip, fetched 2026-10-21]
+
+SIP facts: enable with `settings.calling.sip = {status: ENABLED, servers: [{hostname, port (default 5061, TLS only), request_uri_user_params?}], webhook_delivery?}`; one effective SIP server per number; while SIP is enabled the number does NOT work with the Graph calling endpoints (pre_accept/accept/reject/terminate, connect) and the `calls` webhooks are off unless `webhook_delivery` is ENABLED (then only `call_created`/`terminate`, no SDP). Auth: SIP digest; Meta generates a password per number+app, read with `GET /<PHONE_ID>/settings?include_sip_credentials=true` (needs `whatsapp_business_management` Advanced access); username is the normalised business number; rotate by disable, clear servers, re-enable. TLS mandatory (Meta cert covers `wa.meta.vc`; yours must match the configured hostname; optional mTLS when your server requests a client cert). Media: SRTP with DTLS key exchange by default or SDES (key in SDP, skips ICE/STUN/DTLS, faster setup); the business side must send the first SRTP packet; Opus 48 kHz is the example codec, `telephone-event/8000` for DTMF; whether media flows straight to your SIP server is not stated explicitly (confirm with Meta); allowlist Meta's IP ranges for signalling and media. User-initiated flow: Meta INVITEs your server (answer with a digest challenge, then 200 OK with SDP). Meta adds custom headers (`x-wa-meta-wacid`, phone-number-id, user id, `x-wa-meta-call-duration` on BYE, cta/deeplink payloads). App mode must be Live.
+
+| | Webhook + WebRTC (aiortc), current route | SIP |
+|---|---|---|
+| Signalling | Graph `/calls` actions + `calls` webhook, SDP in JSON | SIP INVITE/200/BYE over TLS to our server |
+| Settings change | none | switches the number to SIP-only; Graph calling actions stop working (reversible by disabling) |
+| Our component | aiortc app (Python), tied to Huf webhook/Event code | any SIP server: Asterisk, FreeSWITCH, Pipecat/Pion/LiveKit SIP |
+| Caller admission | in Huf (reject action) | in the SIP layer (needs an HTTP lookup into Huf by `x-wa-meta-*` headers or caller id; digest-challenge is not admission) |
+| Playing files | MediaPlayer + gated track, self-written | native (Asterisk `Playback`, FreeSWITCH `playback`), battle tested |
+| Media setup | ICE + DTLS-SRTP, aiortc compatibility with Meta unproven | DTLS or SDES; SDES is simpler, no ICE |
+| Infra | public UDP range, STUN/TURN maybe | public TLS 5061 + cert + SRTP/UDP range; a real SIP/media server to operate |
+| Observability | Huf Events natively | SIP logs + optional `webhook_delivery` for `call_created`/`terminate` |
+| Realtime (Gemini Live) | aiortc track to PCM bridge in Python; fine for a few calls | SIP server or Pipecat/LiveKit bridges audio to the model; scales better |
+
+Recommendation. Greeting-only with audio-file playback: stay on webhook + WebRTC for the first live test (no settings change beyond Calling, reuses Huf admission/Events, already coded and simulated). If aiortc fails against Meta's SDP/ICE (spike exit criteria in section 12) or capacity matters, switch to SIP with Asterisk or FreeSWITCH playing the files: it is the lowest-risk playback path, with SDES for simple media. Realtime (Gemini Live) later: prefer SIP into a media framework (Pipecat or LiveKit SIP, or FreeSWITCH with a streaming module) over growing aiortc, because codec/jitter/scale work is already solved there; keep the `CallAudioSource`/`CallAudioSink` interfaces as the Huf-side contract either way. Do not enable SIP on the test number until the WebRTC route has been tried: enabling it disables the Graph call endpoints this implementation uses.

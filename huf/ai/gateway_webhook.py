@@ -530,6 +530,19 @@ def _record_template_update(update: dict, gateway_name: str = "") -> bool:
 	return True
 
 
+def _handle_calls(gateway, calls) -> list[dict]:
+	"""Record/route `calls` webhook items (metadata only; never an agent run). Errors never fail the ack."""
+	from huf.ai.gateway_adapters import whatsapp_calls
+
+	results: list[dict] = []
+	for call in list(calls)[:MAX_MESSAGES_PER_PAYLOAD]:
+		try:
+			results.append(whatsapp_calls.handle_call(gateway, call))
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "WhatsApp call handling failed")
+	return results
+
+
 def _supports_batch_parse(adapter) -> bool:
 	# Class-level lookup so duck-typed/mock adapters do not accidentally qualify.
 	return callable(getattr(type(adapter), "parse_payload", None))
@@ -554,7 +567,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			f"WhatsApp gateway {gateway.name}: payload carried {len(parsed.messages)} messages; "
 			f"processed the first {MAX_MESSAGES_PER_PAYLOAD}, ignored {over_cap}"
 		)
-	if messages:
+	if messages or getattr(parsed, "calls", ()):
 		_ingest_rate_gate()
 
 	ingested = duplicates = 0
@@ -613,6 +626,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		if str(status.get("status") or "").lower() == "failed":
 			_record_failed_status(gateway.name, status)
 	routed_updates = [update for update in parsed.template_updates if _record_template_update(update, gateway.name)]
+	call_results = _handle_calls(gateway, getattr(parsed, "calls", ()) or ())
 
 	forwarded = 0
 	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
@@ -639,6 +653,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		"duplicates": duplicates,
 		"statuses": len(parsed.statuses),
 		"template_updates": len(parsed.template_updates),
+		"calls": len(call_results),
 		"forwarded": forwarded,
 		"ignored": parsed.ignored + over_cap,
 		"note": (f"Only the first {MAX_MESSAGES_PER_PAYLOAD} messages were processed" if over_cap else ""),
