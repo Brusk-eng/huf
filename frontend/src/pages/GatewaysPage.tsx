@@ -573,7 +573,7 @@ export default function GatewaysPage() {
             </>
           ) : (
             <>
-              <Plus className="mr-1.5 h-4 w-4" /> Add Gateway
+              <Plus className="mr-1.5 h-4 w-4" /> Add gateway
             </>
           )}
         </Button>
