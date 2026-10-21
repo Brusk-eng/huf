@@ -79,17 +79,17 @@ class TestRunGatewayBinding(unittest.TestCase):
 				return "gateway:GW-A"
 			return {"provider": "WhatsApp", "is_enabled": 1}
 
-		with patch.object(whatsapp.frappe.flags, "huf_current_agent_run_id", "RUN-1", create=True), patch.object(
+		with patch.object(whatsapp.frappe, "flags", SimpleNamespace(huf_current_agent_run_id="RUN-1")), patch.object(
 			whatsapp.frappe.db, "get_value", side_effect=get_value
 		):
 			self.assertEqual(whatsapp._run_gateway(), "GW-A")
 
 	def test_chat_run_and_disabled_gateway_are_unbound(self):
-		with patch.object(whatsapp.frappe.flags, "huf_current_agent_run_id", "RUN-1", create=True), patch.object(
+		with patch.object(whatsapp.frappe, "flags", SimpleNamespace(huf_current_agent_run_id="RUN-1")), patch.object(
 			whatsapp.frappe.db, "get_value", side_effect=lambda d, n, f=None, as_dict=False: "CONV" if d == "Agent Run" else "chat:x"
 		):
 			self.assertEqual(whatsapp._run_gateway(), "")
-		with patch.object(whatsapp.frappe.flags, "huf_current_agent_run_id", None, create=True):
+		with patch.object(whatsapp.frappe, "flags", SimpleNamespace(huf_current_agent_run_id=None)):
 			self.assertEqual(whatsapp._run_gateway(), "")
 
 		def disabled(doctype, name, field=None, as_dict=False):
@@ -99,7 +99,7 @@ class TestRunGatewayBinding(unittest.TestCase):
 				return "gateway:GW-A"
 			return {"provider": "WhatsApp", "is_enabled": 0}
 
-		with patch.object(whatsapp.frappe.flags, "huf_current_agent_run_id", "RUN-1", create=True), patch.object(
+		with patch.object(whatsapp.frappe, "flags", SimpleNamespace(huf_current_agent_run_id="RUN-1")), patch.object(
 			whatsapp.frappe.db, "get_value", side_effect=disabled
 		):
 			self.assertEqual(whatsapp._run_gateway(), "")
