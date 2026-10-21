@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
+import userEvent from '@testing-library/user-event';
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 
@@ -54,12 +55,14 @@ describe('MessageDetailSheet', () => {
     expect(screen.getByText('[image]')).toBeInTheDocument();
   });
 
-  it('explains a failed delivery in plain words', () => {
+  it('explains a failed delivery in plain words', async () => {
     open(item({ status: 'failed', error: 'error 131047: Re-engagement message' }));
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent('Window closed');
     expect(alert).toHaveTextContent('131047');
     expect(alert).toHaveTextContent('Send an approved template instead');
+    expect(alert).not.toHaveTextContent('error 131047: Re-engagement message');
+    await userEvent.click(screen.getByText('Technical details'));
     expect(alert).toHaveTextContent('error 131047: Re-engagement message');
     expect(screen.getByText('Failed')).toBeInTheDocument();
     expect(screen.queryByText('Read')).toBeNull();

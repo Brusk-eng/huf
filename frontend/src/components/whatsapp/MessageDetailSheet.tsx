@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import { Check, CheckCheck, Circle, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { MessageLogItem } from '@/services/whatsappApi';
 import { cn } from '@/lib/utils';
@@ -71,7 +72,12 @@ export function MessageDetailSheet({
                 <div role="alert" className="space-y-1">
                   <ErrorBadge error={item.error} />
                   <p className="text-xs text-ink">{errorInfo(item.error)?.hint}</p>
-                  <p className="text-xs text-destructive">{item.error}</p>
+                  <Collapsible>
+                    <CollapsibleTrigger className="text-xs text-steel underline">Technical details</CollapsibleTrigger>
+                    <CollapsibleContent>
+                      <p className="mt-1 break-words text-xs text-destructive">{item.error}</p>
+                    </CollapsibleContent>
+                  </Collapsible>
                 </div>
               )}
             </div>

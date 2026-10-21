@@ -17,7 +17,7 @@ import { TimeStamp } from './TimeStamp';
 import { SendPanel } from './SendPanel';
 import {
   ALL, EMPTY_FILTERS, activeFilterCount, agentRunPath, filtersFromParams, filtersToParams, filtersToQuery,
-  displayStatus, messagePreview, sentByLabel, type MessageLogFilters,
+  displayStatus, errorInfo, messagePreview, sentByLabel, type MessageLogFilters,
 } from './messageLogModel';
 
 function FilterSelect({
@@ -227,7 +227,7 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                       {m.error && (
                         <div className="mt-1 space-y-0.5">
                           <ErrorBadge error={m.error} />
-                          <div className="max-w-48 truncate text-[11px] text-destructive" title={m.error}>{m.error}</div>
+                          <div className="max-w-48 text-[11px] text-steel">{errorInfo(m.error)?.hint}</div>
                         </div>
                       )}
                     </TableCell>
