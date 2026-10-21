@@ -153,8 +153,14 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
         <FilterSelect label="Template" allLabel="All templates" value={filters.template} onChange={(v) => update({ template: v })}
           options={(options?.templates ?? []).map((t) => ({ value: t, label: t }))} />
         <Input value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} placeholder="Number" className="w-36 font-mono" aria-label="Contact number" />
-        <Input type="date" value={filters.from} onChange={(e) => update({ from: e.target.value })} className="w-40" aria-label="From date" />
-        <Input type="date" value={filters.to} onChange={(e) => update({ to: e.target.value })} className="w-40" aria-label="To date" />
+        <label className="flex items-center gap-1.5 text-xs text-steel">
+          From
+          <Input type="date" value={filters.from} onChange={(e) => update({ from: e.target.value })} className="w-40" aria-label="From date" />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-steel">
+          To
+          <Input type="date" value={filters.to} onChange={(e) => update({ to: e.target.value })} className="w-40" aria-label="To date" />
+        </label>
         <Button variant="outline" size="sm" onClick={reset} disabled={active === 0 && !qInput && !phoneInput}>
           Reset{active > 0 ? ` (${active})` : ''}
         </Button>

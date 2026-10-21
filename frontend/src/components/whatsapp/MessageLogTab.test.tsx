@@ -44,12 +44,12 @@ describe('MessageLogTab one-shot links', () => {
   it('stays collapsed without ?send=1', async () => {
     open('/?tab=messages');
     await screen.findByText('msg m1');
-    expect(screen.queryByLabelText('To')).toBeNull();
+    expect(screen.queryByLabelText('To', { selector: '#whatsapp-send-to' })).toBeNull();
   });
 
   it('?send=1 opens the send panel and clears the param', async () => {
     open('/?tab=messages&gateway=GW-1&send=1');
-    expect(await screen.findByLabelText('To')).toBeInTheDocument();
+    expect(await screen.findByLabelText('To', { selector: '#whatsapp-send-to' })).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId('search')).not.toHaveTextContent('send='));
     expect(screen.getByTestId('search')).toHaveTextContent('gateway=GW-1');
   });
