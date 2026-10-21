@@ -422,6 +422,7 @@ def _format_mcp_error(exc) -> str:
 
 # Bounded exponential backoff parameters for 429 / 5xx retries.
 _MCP_RETRY_MAX_ATTEMPTS = 5
+_MCP_GENERIC_RETRY_MAX_ATTEMPTS = 3
 _MCP_RETRY_BASE_DELAY_SECONDS = 1
 _MCP_RETRY_MAX_DELAY_SECONDS = 60
 
@@ -563,9 +564,16 @@ async def execute_with_mcp_session(
             # Rate-limited (429) or upstream server error (5xx): back off and retry,
             # up to _MCP_RETRY_MAX_ATTEMPTS total attempts.
             retryable = _is_retryable_status(e)
+            max_attempts = _MCP_RETRY_MAX_ATTEMPTS
             if not idempotent:
                 retryable = _has_status_code(e, "429") and not _is_timeout_error(e)
-            if retryable and attempt < _MCP_RETRY_MAX_ATTEMPTS:
+            elif not retryable and _is_generic_mcp_error(e) and not _is_timeout_error(e):
+                # mcp>=2 drops the HTTP status (a 429/5xx arrives as a bare "Server
+                # returned an error response"), so a read-only call gets a couple of
+                # retries rather than none. Side-effecting calls never take this path.
+                retryable = True
+                max_attempts = _MCP_GENERIC_RETRY_MAX_ATTEMPTS
+            if retryable and attempt < max_attempts:
                 wait_seconds = _extract_retry_after_seconds(e)
                 if wait_seconds is None:
                     wait_seconds = delay_seconds

@@ -370,6 +370,21 @@ class TestNonIdempotentRetryAndRetryAfterCap(unittest.TestCase):
         self._run([_RetryableError(429, retry_after=3600), "ok"], idempotent=True)
         self.mock_sleep.assert_awaited_once_with(float(mcp_client._MCP_RETRY_MAX_DELAY_SECONDS))
 
+    def test_status_less_mcp2_error_is_retried_for_idempotent_tool(self):
+        generic = Exception("Server returned an error response")
+        result, calls = self._run([generic, "ok"], idempotent=True)
+        self.assertEqual((result, calls), ("ok", 2))
+
+    def test_status_less_mcp2_error_retries_are_bounded(self):
+        generic = Exception("Server returned an error response")
+        result, calls = self._run([generic] * 5, idempotent=True)
+        self.assertEqual((result, calls), ("raised", mcp_client._MCP_GENERIC_RETRY_MAX_ATTEMPTS))
+
+    def test_status_less_mcp2_error_is_never_retried_for_non_idempotent_tool(self):
+        generic = Exception("Server returned an error response")
+        result, calls = self._run([generic, "ok"], idempotent=False)
+        self.assertEqual((result, calls), ("raised", 1))
+
 
 class TestApprovalGateAndHeaders(unittest.TestCase):
     def test_accept_header_allows_sse(self):
