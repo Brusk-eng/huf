@@ -45,6 +45,16 @@ _TEMPLATE_FIELD_KINDS = {
 	"template_category_update": "category",
 }
 _MEDIA_TYPES = inbound.MEDIA_TYPES
+# Webhook fields whose content is ingested; a change on any other field yields zero events.
+_INGESTED_FIELDS = frozenset({"messages", "statuses", "calls"})
+
+
+def _log_ignored(reason: str) -> None:
+	"""Log a dropped webhook change (reason only: never payload content, never a phone number)."""
+	try:
+		frappe.logger("huf.whatsapp").info(f"WhatsApp webhook change ignored: {reason}")
+	except Exception:
+		pass
 
 
 class WhatsAppWindowClosed(frappe.ValidationError):
@@ -228,6 +238,11 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					waba_id = str(entry.get("id") or "") if isinstance(entry, dict) else ""
 					template_updates.append({**value, "kind": _TEMPLATE_FIELD_KINDS[field], "waba_id": waba_id})
 					continue
+				if field not in _INGESTED_FIELDS:
+					# standby/echo/account_review/... : never ingest, only count and log (no payload content)
+					ignored += 1
+					_log_ignored(f"field_not_ingested field={str(field)[:64]}")
+					continue
 				items = _as_list(value.get("messages")) + _as_list(value.get("statuses")) + _as_list(value.get("calls"))
 				metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
 				phone_id = str(metadata.get("phone_number_id") or "")
@@ -288,6 +303,11 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		sender = bridge.normalize_phone(msg.get("from"))
 		if not provider_event_id or not sender:
 			return None
+		display = bridge.normalize_phone(metadata.get("display_phone_number"))
+		if display and sender == display:
+			# echo-shaped: the business's own number as sender must never become an inbound event
+			_log_ignored("echo_shaped_message_dropped")
+			return None
 		try:
 			return self._build_event(msg, msg_type, provider_event_id, sender, metadata, names)
 		except Exception:  # never let one odd message break a batch
@@ -297,14 +317,17 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		self, msg: dict, msg_type: str, provider_event_id: str, sender: str,
 		metadata: Mapping[str, Any], names: Mapping[str, str],
 	) -> NormalizedGatewayEvent | None:
-		kind, emoji, reaction_to = "message", "", ""
+		emoji, reaction_to = "", ""
+		kind = inbound.message_kind(msg_type)
 		if msg_type == "reaction":
 			message_text, emoji, reaction_to = inbound.render_reaction(msg)
-			kind = "reaction"
 		else:
 			message_text = inbound.render_message_text(msg)
 		if not message_text.strip():
-			return None
+			if kind in inbound.RECORD_ONLY_KINDS:
+				message_text = f"[{kind} message]"
+			else:
+				return None
 
 		attachments = []
 		if msg_type in _MEDIA_TYPES:
@@ -343,6 +366,11 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			# Meta: a reaction is not a customer-service-window opener (UNVERIFIED in docs).
 			# bridge.window_state must skip rows whose raw_payload.kind == "reaction".
 			raw.update({"kind": "reaction", "reaction_to": reaction_to, "reaction_emoji": emoji})
+		elif kind != "message":
+			raw["kind"] = kind
+			if kind in ("edit", "revoke"):
+				original = msg.get(kind) if isinstance(msg.get(kind), dict) else {}
+				raw["original_message_id"] = str(original.get("original_message_id") or "")
 		return NormalizedGatewayEvent(
 			provider_event_id=provider_event_id,
 			sender_id=sender,
