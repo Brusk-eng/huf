@@ -26,7 +26,7 @@ def parse(name=None, body=None):
 
 class TestNormalize(unittest.TestCase):
 	def test_bsuid_verbatim(self):
-		for v in (BSUID, "US.13491208655302741918", "ABCdef123", " IN.4608 "):
+		for v in (BSUID, "US.13491208655302741918", "US.ENT.1349120865", " IN.4608 "):
 			self.assertEqual(bridge.normalize_phone(v), v.strip())
 			self.assertTrue(bridge.is_bsuid(v))
 
@@ -60,9 +60,7 @@ class TestParse(unittest.TestCase):
 		self.assertEqual(ev.raw_payload["message"]["from_user_id"], BSUID)
 
 	def test_bsuid_only_logged_masked(self):
-		with patch("huf.ai.gateway_adapters.whatsapp._log_ignored") as _l, patch(
-			"huf.ai.gateway_adapters.whatsapp.frappe.logger"
-		) as lg:
+		with patch("huf.ai.gateway_adapters.whatsapp.frappe.logger") as lg:
 			parse("bsuid_only.json")
 		lines = " ".join(str(c) for c in lg.return_value.info.call_args_list)
 		self.assertIn("bsuid_only_sender", lines)

@@ -147,8 +147,16 @@ def is_available() -> bool:
 		return False
 
 
+def is_bsuid(raw: Any) -> bool:
+	"""True for a business-scoped user id (``IN.4608...``): country-prefix dot form (``IN.123``, ``US.ENT.123``)."""
+	text = str(raw or "").strip()
+	return bool(re.match(r"^[A-Za-z]{2}\.[A-Za-z0-9.]+$", text))
+
+
 def normalize_phone(raw: Any) -> str:
-	"""Return digits only (no +, spaces, dashes, parens, leading ``00``)."""
+	"""Return digits only (no +, spaces, dashes, parens, leading ``00``); a BSUID is returned verbatim."""
+	if is_bsuid(raw):
+		return str(raw).strip()
 	digits = re.sub(r"\D", "", str(raw or ""))
 	if digits.startswith("00"):
 		digits = digits[2:]
