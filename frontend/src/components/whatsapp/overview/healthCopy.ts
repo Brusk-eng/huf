@@ -88,6 +88,7 @@ export const CHECKLIST_COPY: Record<ChecklistCode, { title: string; help: string
 };
 
 export const CHECKLIST_COMPLETE = 'Setup complete';
+export const CHECKLIST_ALL_DONE = 'All steps done';
 export const CHECKLIST_SHOW = 'Show steps';
 export const CHECKLIST_HIDE = 'Hide steps';
 

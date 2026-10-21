@@ -5,8 +5,9 @@ import { AlertCircle, CheckCircle2, ChevronDown, Circle, ExternalLink } from 'lu
 import { Button } from '@/components/ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { cn } from '@/lib/utils';
-import type { ChecklistItem } from '@/services/whatsappHealthApi';
+import { healthLabel, type ChecklistItem, type HealthState } from '@/services/whatsappHealthApi';
 import {
+	CHECKLIST_ALL_DONE,
 	CHECKLIST_COMPLETE,
 	CHECKLIST_COPY,
 	CHECKLIST_HIDE,
@@ -51,12 +52,15 @@ const STATE_ICON = {
 
 export interface SetupChecklistProps {
 	items: ChecklistItem[];
+	/** Gateway health. Anything but 'healthy' keeps the steps open and never says "Setup complete". */
+	health?: HealthState;
 }
 
-export function SetupChecklist({ items }: SetupChecklistProps) {
+export function SetupChecklist({ items, health }: SetupChecklistProps) {
 	const [expanded, setExpanded] = useState(false);
 	const left = items.filter((i) => i.state !== 'done').length;
 	const complete = items.length > 0 && left === 0;
+	const healthIssue = health !== undefined && health !== 'healthy';
 	const current = items.find((i) => i.state !== 'done')?.code;
 
 	const list = (
@@ -92,6 +96,23 @@ export function SetupChecklist({ items }: SetupChecklistProps) {
 			})}
 		</ol>
 	);
+
+	if (complete && healthIssue) {
+		return (
+			<section className="space-y-2" aria-label="Setup steps">
+				<div className="space-y-0.5">
+					<p className="flex items-center gap-2 text-sm font-medium text-ink">
+						<CheckCircle2 className="h-4 w-4 text-good" aria-hidden />
+						{CHECKLIST_ALL_DONE}
+					</p>
+					<p className="text-xs text-steel">
+						Health is {healthLabel(health).toLowerCase()}, so this is not a working setup yet. Fix the issue in the banner above.
+					</p>
+				</div>
+				{list}
+			</section>
+		);
+	}
 
 	if (complete) {
 		return (

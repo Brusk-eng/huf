@@ -704,7 +704,7 @@ export default function GatewaysPage() {
                         <span className="line-clamp-1 text-destructive">{gateway.last_error}</span>
                       </>
                     ) : (
-                      <span>Last event: {formatTimeAgo(gateway.last_event_at)}</span>
+                      <span>Last event: {gateway.last_event_at ? formatTimeAgo(gateway.last_event_at) : 'No messages yet'}</span>
                     )}
                   </div>
                 ) : (

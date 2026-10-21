@@ -65,4 +65,15 @@ describe('MessageLogTab one-shot links', () => {
     expect(await screen.findByText(/Event not in the loaded messages/)).toBeInTheDocument();
     expect(screen.queryByText(/^detail/)).toBeNull();
   });
+  it('filter placeholders use correct plurals', async () => {
+    vi.mocked(listMessageLogFilters).mockResolvedValue({
+      success: true, statuses: ['sent'], agents: [], templates: [],
+    } as never);
+    open('/?tab=messages');
+    expect(await screen.findByText('All statuses')).toBeInTheDocument();
+    expect(screen.getByText('All directions')).toBeInTheDocument();
+    expect(screen.getByText('All agents')).toBeInTheDocument();
+    expect(screen.getByText('All templates')).toBeInTheDocument();
+    expect(screen.queryByText(/statuss/)).toBeNull();
+  });
 });

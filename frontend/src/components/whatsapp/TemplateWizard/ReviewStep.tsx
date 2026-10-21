@@ -79,14 +79,14 @@ export function ReviewStep({ draft, kindLabel, isEdit, direct, intro }: Props) {
         {draft.category === 'UTILITY' && (
           <Row label="Expires after">{draft.ttl === null ? 'WhatsApp default' : ttlLabel(draft.ttl)}</Row>
         )}
-        <Row label="Checks">issues.length === 0 ? (
+        <Row label="Checks">{issues.length === 0 ? (
             <Badge variant="pill-success" size="sm">Ready to send</Badge>
           ) : (
             <span className="space-y-0.5">
               <Badge variant="pill-warning" size="sm">{issues.length === 1 ? '1 problem' : `${issues.length} problems`}</Badge>
               <span className="block text-xs text-steel">{issues[0]}</span>
             </span>
-          )</Row>
+          )}</Row>
       </dl>
 
       <ul className="list-disc space-y-1 pl-4 text-xs text-steel">

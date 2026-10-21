@@ -20,13 +20,13 @@ import {
 } from './messageLogModel';
 
 function FilterSelect({
-  label, value, onChange, options,
-}: { label: string; value: string; onChange: (v: string) => void; options: { value: string; label: string }[] }) {
+  label, allLabel, value, onChange, options,
+}: { label: string; allLabel: string; value: string; onChange: (v: string) => void; options: { value: string; label: string }[] }) {
   return (
     <Select value={value || ALL} onValueChange={(v) => onChange(v === ALL ? '' : v)}>
       <SelectTrigger className="w-40" aria-label={label}><SelectValue /></SelectTrigger>
       <SelectContent>
-        <SelectItem value={ALL}>{`All ${label.toLowerCase()}s`}</SelectItem>
+        <SelectItem value={ALL}>{allLabel}</SelectItem>
         {options.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
       </SelectContent>
     </Select>
@@ -145,12 +145,12 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
 
       <div className="flex flex-wrap items-center gap-2">
         <Input value={qInput} onChange={(e) => setQInput(e.target.value)} placeholder="Search messages" className="w-56" aria-label="Search messages" />
-        <FilterSelect label="Direction" value={filters.direction} onChange={(v) => update({ direction: v as MessageLogFilters['direction'] })}
+        <FilterSelect label="Direction" allLabel="All directions" value={filters.direction} onChange={(v) => update({ direction: v as MessageLogFilters['direction'] })}
           options={[{ value: 'in', label: 'In' }, { value: 'out', label: 'Out' }]} />
-        <FilterSelect label="Status" value={filters.status} onChange={(v) => update({ status: v })} options={opt(options?.statuses)} />
-        <FilterSelect label="Agent" value={filters.agent} onChange={(v) => update({ agent: v })}
+        <FilterSelect label="Status" allLabel="All statuses" value={filters.status} onChange={(v) => update({ status: v })} options={opt(options?.statuses)} />
+        <FilterSelect label="Agent" allLabel="All agents" value={filters.agent} onChange={(v) => update({ agent: v })}
           options={(options?.agents ?? []).map((a) => ({ value: a.name, label: a.title || a.name }))} />
-        <FilterSelect label="Template" value={filters.template} onChange={(v) => update({ template: v })}
+        <FilterSelect label="Template" allLabel="All templates" value={filters.template} onChange={(v) => update({ template: v })}
           options={(options?.templates ?? []).map((t) => ({ value: t, label: t }))} />
         <Input value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} placeholder="Number" className="w-36 font-mono" aria-label="Contact number" />
         <Input type="date" value={filters.from} onChange={(e) => update({ from: e.target.value })} className="w-40" aria-label="From date" />

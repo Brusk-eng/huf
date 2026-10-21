@@ -4,7 +4,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 
-import type { ChecklistCode, ChecklistItem } from '@/services/whatsappHealthApi';
+import type { ChecklistCode, ChecklistItem, HealthState } from '@/services/whatsappHealthApi';
 import { SetupChecklist } from './SetupChecklist';
 
 const CODES: ChecklistCode[] = ['meta_app', 'credentials', 'webhook', 'subscribed', 'app_secret', 'enabled', 'test_message'];
@@ -13,10 +13,10 @@ function items(doneCount: number, extra: Partial<Record<ChecklistCode, Partial<C
 	return CODES.map((code, i) => ({ code, state: i < doneCount ? 'done' : 'todo', ...extra[code] }) as ChecklistItem);
 }
 
-const view = (list: ChecklistItem[]) =>
+const view = (list: ChecklistItem[], health?: HealthState) =>
 	render(
 		<MemoryRouter>
-			<SetupChecklist items={list} />
+			<SetupChecklist items={list} health={health} />
 		</MemoryRouter>
 	);
 
@@ -55,5 +55,21 @@ describe('SetupChecklist', () => {
 		expect(screen.getByText('Create a Meta app')).toBeInTheDocument();
 		await userEvent.click(screen.getByRole('button', { name: /Hide steps/ }));
 		expect(screen.queryByText('Create a Meta app')).toBeNull();
+	});
+
+	it('never says Setup complete while health is blocked or degraded', () => {
+		view(items(7), 'blocked');
+		expect(screen.queryByText('Setup complete')).toBeNull();
+		expect(screen.getByText('All steps done')).toBeInTheDocument();
+		expect(screen.getByText(/Health is blocked/)).toBeInTheDocument();
+		// Steps stay open, with no collapse control.
+		expect(screen.getByText('Create a Meta app')).toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: /Show steps|Hide steps/ })).toBeNull();
+	});
+
+	it('keeps Setup complete when health is healthy', () => {
+		view(items(7), 'healthy');
+		expect(screen.getByText('Setup complete')).toBeInTheDocument();
+		expect(screen.queryByText('All steps done')).toBeNull();
 	});
 });
