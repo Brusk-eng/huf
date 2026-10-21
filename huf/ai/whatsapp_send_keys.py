@@ -140,7 +140,10 @@ def run_once(
 	try:
 		claimed = _claim(gateway, key, action, run, recipient)
 	except Exception:
-		frappe.log_error(title="WhatsApp send key claim failed")
+		try:
+			frappe.log_error(title="WhatsApp send key claim failed")
+		except Exception:
+			pass
 		return json.dumps({  # fail closed: an unrecorded send could not be capped or deduplicated
 			"success": False, "error": "send_unavailable", "definite": True,
 			"message": "The send could not be recorded, so it was not sent.",
