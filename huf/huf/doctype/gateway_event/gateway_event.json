@@ -9,7 +9,7 @@
   {"fieldname":"gateway","fieldtype":"Link","in_list_view":1,"label":"Gateway","options":"Gateway","reqd":1,"read_only":1},
   {"fieldname":"idempotency_key","fieldtype":"Data","label":"Idempotency key","read_only":1,"reqd":1,"unique":1},
   {"fieldname":"provider_event_id","fieldtype":"Data","in_list_view":1,"label":"Provider event ID","length":255,"read_only":1},
-  {"fieldname":"status","fieldtype":"Select","in_list_view":1,"label":"Status","options":"Received\nRejected\nUnrouted\nQueued\nRunning\nSucceeded\nFailed","read_only":1},
+  {"fieldname":"status","fieldtype":"Select","in_list_view":1,"label":"Status","options":"Received\nRecorded\nRejected\nUnrouted\nQueued\nRunning\nSucceeded\nFailed","read_only":1},
   {"fieldname":"received_at","fieldtype":"Datetime","label":"Received at","read_only":1},
   {"fieldname":"verified_sender","fieldtype":"Check","label":"Sender verified","read_only":1},
   {"fieldname":"sender_id","fieldtype":"Data","label":"Sender","length":255,"read_only":1},
