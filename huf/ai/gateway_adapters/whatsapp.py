@@ -273,10 +273,19 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					template_updates.append({**value, "kind": _TEMPLATE_FIELD_KINDS[field], "waba_id": waba_id})
 					continue
 				if field in _ACCOUNT_EVENT_FIELDS and account_events_mod.is_relevant(field, value):
-					# no phone metadata on account_update: routed by the WABA id (entry[].id), like templates
+					# account_update has no phone metadata (routed by the WABA id, entry[].id); user_preferences
+					# must name this gateway's number. A named phone id that is not ours is never applied.
 					waba_id = str(entry.get("id") or "") if isinstance(entry, dict) else ""
 					meta = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
-					account_events.append({**value, "field": field, "waba_id": waba_id, "phone_id": str(meta.get("phone_number_id") or "")})
+					event_phone = str(meta.get("phone_number_id") or "")
+					if (event_phone or field == "user_preferences") and not (
+						event_phone and self._phone_id_accepted(event_phone)
+					):
+						ignored += 1
+						if event_phone and event_phone not in unknown_phone_ids:
+							unknown_phone_ids.append(event_phone)
+						continue
+					account_events.append({**value, "field": field, "waba_id": waba_id, "phone_id": event_phone})
 					continue
 				if field not in _INGESTED_FIELDS:
 					# standby/echo/account_review/... : never ingest, only count and log (no payload content)

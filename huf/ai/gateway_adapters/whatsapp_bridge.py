@@ -213,6 +213,17 @@ def gateway_account(gateway_name: str) -> str:
 		return ""
 
 
+def account_business_id(account_name: Any) -> str:
+	"""``WhatsApp Account.business_id`` ('' when unlinked, unknown or the bridge is unavailable)."""
+	name = str(account_name or "").strip()
+	if not name or not is_available():
+		return ""
+	try:
+		return str(frappe.db.get_value("WhatsApp Account", name, "business_id") or "").strip()
+	except Exception:
+		return ""
+
+
 def accounts_for_waba(waba_id: Any) -> list[str]:
 	"""WhatsApp Accounts whose ``business_id`` is the given WABA id (payload ``entry[].id``)."""
 	waba = str(waba_id or "").strip()

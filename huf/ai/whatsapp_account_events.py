@@ -3,8 +3,8 @@
 
 """WhatsApp account-level webhooks: `account_update` connection state and `user_preferences` consent.
 
-`account_update` carries no phone number metadata; it is routed by ``entry[].id`` (the WABA id)
-to the Gateways linked to a WhatsApp Account with that ``business_id`` and sets
+`account_update` carries no phone number metadata; it is applies only to the RECEIVING gateway, and only when ``entry[].id`` (the WABA id) equals that
+gateway's own WABA (linked WhatsApp Account ``business_id`` or ``Gateway.whatsapp_business_account_id``); it sets
 ``Gateway.connection_state``: Disconnected (sends refused), Degraded (sends allowed, health
 warns) or Connected. No Gateway Event is created; a short comment on the Gateway is the audit.
 
@@ -72,15 +72,22 @@ def is_relevant(field: str, value: Any) -> bool:
 # --- account_update -------------------------------------------------------------------
 
 
-def _gateways_for_waba(waba_id: str) -> list[str]:
+def _gateway_identity(gateway: str) -> dict[str, str]:
+	"""The receiving Gateway's own phone number id and WABA id ('' when unknown).
+
+	WABA: the linked WhatsApp Account's ``business_id``; direct-mode gateways (no account) use
+	``Gateway.whatsapp_business_account_id``.
+	"""
 	from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 
-	accounts = bridge.accounts_for_waba(waba_id)
-	if not accounts:
-		return []
-	return list(
-		frappe.get_all("Gateway", filters={"provider": "WhatsApp", "whatsapp_account": ["in", accounts]}, pluck="name") or []
-	)
+	row = frappe.db.get_value(
+		"Gateway", gateway, ["phone_number_id", "whatsapp_account", "whatsapp_business_account_id"], as_dict=True
+	) or {}
+	account = str(row.get("whatsapp_account") or "").strip()
+	waba = bridge.account_business_id(account) if account else ""
+	if not waba:
+		waba = str(row.get("whatsapp_business_account_id") or "").strip()
+	return {"phone_number_id": str(row.get("phone_number_id") or "").strip(), "waba_id": waba}
 
 
 def _set_state(gateway: str, state: str, reason: str) -> None:
@@ -94,35 +101,41 @@ def _audit(gateway: str, text: str) -> None:
 		pass
 
 
-def apply_account_event(event: dict) -> list[str]:
-	"""Apply one routed ``account_update``/``user_preferences`` change; returns the Gateways touched."""
+def apply_account_event(event: dict, gateway: str) -> list[str]:
+	"""Apply one ``account_update``/``user_preferences`` change to the RECEIVING gateway only.
+
+	Fail closed: account_update needs the payload WABA to equal the gateway's own WABA (and the
+	phone id, when the payload names one, to equal its number); user_preferences needs the payload
+	phone id to equal the gateway's number. Anything else is dropped.
+	"""
 	field = event.get("field")
 	waba_id = str(event.get("waba_id") or "").strip()
+	phone_id = str(event.get("phone_id") or "").strip()
 	value = {k: v for k, v in event.items() if k not in ("field", "waba_id", "phone_id")}
+	if not gateway or field not in ("account_update", "user_preferences"):
+		return []
+	own = _gateway_identity(gateway)
 	if field == "account_update":
 		verdict = classify_account_update(value)
-		if not verdict:
+		if not verdict or not waba_id or waba_id != own.get("waba_id"):
 			return []
-		gateways = _gateways_for_waba(waba_id)
-		for gateway in gateways:
-			_set_state(gateway, verdict["state"], verdict["reason"])
-			_audit(gateway, f"WhatsApp account event {verdict['event']}: connection is now {verdict['state']}.")
-		return gateways
-	if field == "user_preferences":
-		phone_id = str(event.get("phone_id") or "")
-		gateways = _gateways_for_phone_id(phone_id)
-		for gateway in gateways:
-			record_user_preferences(gateway, value.get("user_preferences"))
-		return gateways
-	return []
+		if phone_id and phone_id != own.get("phone_number_id"):
+			return []
+		_set_state(gateway, verdict["state"], verdict["reason"])
+		_audit(gateway, f"WhatsApp account event {verdict['event']}: connection is now {verdict['state']}.")
+		return [gateway]
+	if not phone_id or phone_id != own.get("phone_number_id"):
+		return []
+	record_user_preferences(gateway, value.get("user_preferences"))
+	return [gateway]
 
 
-def apply_account_events(events) -> int:
+def apply_account_events(events, gateway: str) -> int:
 	"""Webhook entry: never raises (a failure here must not turn into a Meta retry storm)."""
 	applied = 0
 	for event in list(events or [])[:50]:
 		try:
-			applied += 1 if apply_account_event(event) else 0
+			applied += 1 if apply_account_event(event, gateway) else 0
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "WhatsApp account event failed")
 	return applied
@@ -181,7 +194,22 @@ def _norm_sender(sender: Any) -> str:
 	return raw  # BSUID / user id: keep as given
 
 
-def _insert_consent(gateway: str, sender: str, category: str, value: str, detail: str = "", timestamp: Any = None) -> None:
+def _meta_ts(value: Any) -> int | None:
+	try:
+		ts = int(float(value))
+	except (TypeError, ValueError):
+		return None
+	return ts if ts > 0 else None
+
+
+def _insert_consent(gateway: str, sender: str, category: str, value: str, detail: str = "", timestamp: Any = None) -> bool:
+	"""Insert one consent row; False when Meta's (gateway, sender, category, value, timestamp) was already stored."""
+	meta_ts = _meta_ts(timestamp)
+	if meta_ts is not None and frappe.db.exists(
+		"Gateway Consent",
+		{"gateway": gateway, "sender_id": sender, "category": category, "value": value, "meta_timestamp": meta_ts},
+	):
+		return False
 	frappe.get_doc(
 		{
 			"doctype": "Gateway Consent",
@@ -191,12 +219,15 @@ def _insert_consent(gateway: str, sender: str, category: str, value: str, detail
 			"value": value,
 			"detail": (detail or "")[:500],
 			"changed_at": frappe.utils.now_datetime(),
+			# Meta's event time orders rows; a missing one falls back to receipt time
+			"meta_timestamp": meta_ts or int(frappe.utils.now_datetime().timestamp()),
 		}
 	).insert(ignore_permissions=True)
+	return True
 
 
 def record_user_preferences(gateway: str, items: Any) -> int:
-	"""Append a consent row per identifier (wa_id and user_id) of each marketing stop/resume item."""
+	"""Append a consent row per identifier (wa_id and user_id) of each marketing stop/resume item; returns rows added."""
 	count = 0
 	for item in items if isinstance(items, list) else []:
 		if not isinstance(item, dict) or item.get("category") != MARKETING or item.get("value") not in ("stop", "resume"):
@@ -204,8 +235,8 @@ def record_user_preferences(gateway: str, items: Any) -> int:
 		for key in ("wa_id", "user_id"):
 			sender = _norm_sender(item.get(key))
 			if sender:
-				_insert_consent(gateway, sender, MARKETING, item["value"], str(item.get("detail") or ""), item.get("timestamp"))
-				count += 1
+				if _insert_consent(gateway, sender, MARKETING, item["value"], str(item.get("detail") or ""), item.get("timestamp")):
+					count += 1
 	return count
 
 
@@ -214,7 +245,7 @@ def _latest_consent(gateway: str, sender: str, category: str) -> str | None:
 		"Gateway Consent",
 		filters={"gateway": gateway, "sender_id": sender, "category": category},
 		fields=["value"],
-		order_by="creation desc, name desc",
+		order_by="meta_timestamp desc, creation desc, name desc",
 		limit_page_length=1,
 	)
 	return rows[0]["value"] if rows else None
