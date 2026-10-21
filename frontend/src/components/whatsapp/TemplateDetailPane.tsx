@@ -10,7 +10,9 @@ import { ManagerLink } from './ManagerLink';
 import { fromTemplateDetail } from './template/payload';
 import { ttlLabel } from './TemplateWizard/draftActions';
 import { draftToPreviewModel } from './TemplateWizard/previewModel';
-import { parseServerTime, rejectionCopy, statusInfo, timeAgo } from './templateModel';
+import { localeLabel } from './template/locales';
+import { TimeStamp } from './TimeStamp';
+import { parseServerTime, rejectionCopy, statusInfo } from './templateModel';
 
 interface Props {
   row: WhatsAppTemplate;
@@ -93,7 +95,7 @@ export function TemplateDetailPane({ row, refreshKey, onSend, onEdit, onDelete, 
             <p className="text-ink">{info.hint}</p>
             {updatedDate && (
               <p className="text-steel">
-                Last updated {timeAgo(updated)} ({format(updatedDate, 'd MMM yyyy, HH:mm')})
+                Last updated <TimeStamp value={updated} />
               </p>
             )}
             {detail.previous_category && detail.previous_category !== detail.category && (
@@ -123,9 +125,9 @@ export function TemplateDetailPane({ row, refreshKey, onSend, onEdit, onDelete, 
 
           <dl className="grid grid-cols-[110px_1fr] gap-y-1.5 text-xs">
             <dt className="text-steel">Category</dt><dd className="text-ink">{categoryLabel(detail.category)}</dd>
-            <dt className="text-steel">Language</dt><dd className="font-mono text-ink">{detail.language_code}</dd>
+            <dt className="text-steel">Language</dt><dd className="text-ink">{localeLabel(detail.language_code)}</dd>
             <dt className="text-steel">Variables</dt>
-            <dd className="text-ink">{wizardDraft.variableType === 'name' ? 'Name variables' : 'Number variables'}</dd>
+            <dd className="text-ink">{wizardDraft.variableType === 'name' ? 'Named, like {{first_name}}' : 'Numbered, like {{1}}'}</dd>
             <dt className="text-steel">Header</dt><dd className="text-ink">{headerLabel(detail)}</dd>
             {detail.category?.toUpperCase() === 'UTILITY' && (
               <>
@@ -145,7 +147,6 @@ export function TemplateDetailPane({ row, refreshKey, onSend, onEdit, onDelete, 
                 </dd>
               </>
             )}
-            {detail.whatsapp_account && (<><dt className="text-steel">Account</dt><dd className="text-ink">{detail.whatsapp_account}</dd></>)}
           </dl>
 
           <div className="space-y-2 border-t border-line pt-4">

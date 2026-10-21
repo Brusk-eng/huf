@@ -22,6 +22,7 @@ import { CategoryChangeBadge, QualityBadge, StatusBadge } from './TemplateBadges
 import { DraftsPanel } from './DraftsPanel';
 import { ManagerLink } from './ManagerLink';
 import { SendTemplateDialog } from './SendTemplateDialog';
+import { localeLabel } from './template/locales';
 import { TemplateDetailPane } from './TemplateDetailPane';
 import { fromTemplateDetail } from './template/payload';
 import { TemplateWizard, type WizardResult } from './TemplateWizard';
@@ -226,6 +227,7 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
             </TabsTrigger>
           </TabsList>
           <div className="flex flex-wrap items-center gap-2">
+            <ManagerLink url={manager.url} businessId={manager.businessId} />
             <Button variant="outline" size="sm" onClick={sync} disabled={syncing || !gateway}>
               {syncing ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
               Sync
@@ -235,9 +237,6 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
             </Button>
           </div>
         </div>
-        {manager.url && (
-          <div className="pt-2 text-xs"><ManagerLink url={manager.url} businessId={manager.businessId} /></div>
-        )}
         {!gateway && <p className="pt-2 text-xs text-steel">Choose a WhatsApp gateway above to see and sync its templates.</p>}
 
         <TabsContent value="templates" className="pt-4">
@@ -282,7 +281,7 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
                     <SelectTrigger className="col-span-2" aria-label="Filter by language"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={ALL_OPTION}>Any language</SelectItem>
-                      {languages.map((l) => <SelectItem key={l} value={l}>{l}</SelectItem>)}
+                      {languages.map((l) => <SelectItem key={l} value={l}>{localeLabel(l)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 </div>
@@ -302,7 +301,7 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
                           >
                             <span className="block truncate font-mono text-xs font-medium text-ink">{t.template_name || t.name}</span>
                             <span className="block text-[11px] text-steel">
-                              {categoryLabel(t.category)} · {t.language_code}
+                              {categoryLabel(t.category)} · {localeLabel(t.language_code ?? '')}
                             </span>
                             <span className="flex flex-wrap gap-1">
                               <StatusBadge status={t.status} />

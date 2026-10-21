@@ -42,7 +42,7 @@ describe('TemplateDetailPane', () => {
         row={{ name: 'tpl-1' } as never} refreshKey={0} onSend={vi.fn()} onEdit={vi.fn()} onDelete={vi.fn()} onUnavailable={vi.fn()}
       />,
     );
-    expect(await screen.findByText('Name variables')).toBeInTheDocument();
+    expect(await screen.findByText('Named, like {{first_name}}')).toBeInTheDocument();
     expect(screen.getByText('Video')).toBeInTheDocument();
     expect(screen.getByText('1 hour')).toBeInTheDocument();
     expect(screen.getByText('{{first_name}}')).toBeInTheDocument();
@@ -64,7 +64,7 @@ describe('TemplateDetailPane', () => {
 
   it('shows no category notice when nothing was reclassified', async () => {
     render(pane());
-    await screen.findByText('Name variables');
+    await screen.findByText('Named, like {{first_name}}');
     expect(screen.queryByText(/Meta changed this template/)).toBeNull();
   });
 

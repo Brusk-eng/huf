@@ -115,7 +115,7 @@ describe('TemplatesTab list', () => {
       success: true, templates: [{ ...row, category: 'AUTHENTICATION' }], manager_url: '', business_id: '',
     } as never);
     render(<MemoryRouter><TemplatesTab gateway="GW-1" /></MemoryRouter>);
-    expect(await screen.findByText(/Authentication · en_US/)).toBeInTheDocument();
+    expect(await screen.findByText(/Authentication · English \(US\)/)).toBeInTheDocument();
     expect(categoryLabel('MARKETING')).toBe('Marketing');
     expect(categoryLabel(null)).toBe('');
   });

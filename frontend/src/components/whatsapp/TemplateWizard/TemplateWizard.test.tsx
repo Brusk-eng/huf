@@ -49,6 +49,7 @@ describe('step 1', () => {
     expect(screen.getByRole('radio', { name: /Default/ })).toBeChecked();
     expect(nextBtn).toBeEnabled();
     expect(screen.getByRole('tab', { name: 'Authentication' })).toBeDisabled();
+    expect(screen.queryByText(/Authentication:/, { selector: 'p' })).toBeNull();
     expect(screen.getAllByText('Coming soon').length).toBeGreaterThan(0);
     expect(screen.getByRole('radio', { name: /Catalogue/ })).toBeDisabled();
     expect(screen.getByRole('link', { name: /template library/ })).toHaveAttribute('rel', 'noopener noreferrer');

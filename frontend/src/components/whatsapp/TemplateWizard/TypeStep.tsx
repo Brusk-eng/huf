@@ -57,10 +57,10 @@ export function TypeStep({ kindId, onSelect }: Props) {
         <TabsList>
           <TabsTrigger value="MARKETING">Marketing</TabsTrigger>
           <TabsTrigger value="UTILITY">Utility</TabsTrigger>
-          <TabsTrigger value="AUTHENTICATION" disabled aria-describedby="auth-reason">Authentication</TabsTrigger>
+          <TabsTrigger value="AUTHENTICATION" disabled title={auth?.disabledReason} aria-describedby="auth-reason">Authentication</TabsTrigger>
         </TabsList>
       </Tabs>
-      {auth?.disabledReason && <p id="auth-reason" className="-mt-3 text-xs text-steel">Authentication: {auth.disabledReason}</p>}
+      {auth?.disabledReason && <span id="auth-reason" className="sr-only">Authentication: {auth.disabledReason}</span>}
 
       <RadioGroup
         aria-label="Template type"
