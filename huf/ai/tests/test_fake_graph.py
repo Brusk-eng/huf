@@ -81,6 +81,74 @@ class FakeGraphTest(unittest.TestCase):
 		self.assertEqual(graph.calls, [])
 		self.assertEqual(graph.post(MESSAGES_URL, json={}).json()["messages"][0]["id"], "wamid.FAKE1")
 
+	def test_subscribed_apps_get_then_post_subscribe(self):
+		graph = FakeGraph(app_id="fake-app-1")
+		url = "https://graph.facebook.com/v21.0/200000000000002/subscribed_apps"
+
+		empty = graph.get(url)
+		subscribed = graph.post(url)
+		listed = graph.get(url)
+
+		self.assertEqual(empty.json(), {"data": [], "paging": {}})
+		self.assertEqual(subscribed.json(), {"success": True})
+		entries = listed.json()["data"]
+		self.assertEqual(len(entries), 1)
+		self.assertEqual(entries[0]["whatsapp_business_api_data"]["id"], "fake-app-1")
+		self.assertEqual(entries[0]["subscribed_fields"], ["messages"])
+		self.assertEqual([c["method"] for c in graph.calls], ["GET", "POST", "GET"])
+
+	def test_register_phone_number_records_call(self):
+		graph = FakeGraph()
+		url = "https://graph.facebook.com/v21.0/1234567890/register"
+
+		response = graph.post(url, json={"messaging_product": "whatsapp"})
+
+		self.assertEqual(response.json(), {"success": True})
+		self.assertEqual(graph.calls[0]["method"], "POST")
+		self.assertEqual(graph.calls[0]["url"], url)
+		self.assertEqual(graph.calls[0]["body"], {"messaging_product": "whatsapp"})
+
+	def test_debug_token_reports_configured_validity_and_expiry(self):
+		graph = FakeGraph(token_valid=True, token_expires_at=1_900_000_000)
+
+		response = graph.get(
+			"https://graph.facebook.com/v21.0/debug_token",
+			params={"input_token": "fake-input-token", "access_token": "fake-app|fake-secret"},
+		)
+
+		data = response.json()["data"]
+		self.assertTrue(data["is_valid"])
+		self.assertEqual(data["expires_at"], 1_900_000_000)
+		self.assertNotIn("error", data)
+
+	def test_debug_token_invalid_reports_meta_error(self):
+		graph = FakeGraph(token_valid=False)
+
+		data = graph.get(
+			"https://graph.facebook.com/v21.0/debug_token", params={"input_token": "fake-input-token"}
+		).json()["data"]
+
+		self.assertFalse(data["is_valid"])
+		self.assertEqual(data["error"]["code"], 190)
+
+	def test_rate_limited_can_emit_cloud_api_code_130429(self):
+		graph = FakeGraph(rate_limited=True, rate_limit_code=130429)
+
+		response = graph.post(MESSAGES_URL, json={"to": "15551234567"})
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json()["error"]["code"], 130429)
+		self.assertIn("Cloud API", response.json()["error"]["message"])
+
+	def test_phone_details_expose_configurable_health_status(self):
+		graph = FakeGraph(health_status="LIMITED")
+		url = "https://graph.facebook.com/v21.0/1234567890"
+
+		self.assertEqual(graph.get(url).json(), {"id": "1234567890", "health_status": "LIMITED"})
+
+		graph.health_status = "AVAILABLE"
+		self.assertEqual(graph.get(url).json()["health_status"], "AVAILABLE")
+
 
 if __name__ == "__main__":
 	unittest.main()
