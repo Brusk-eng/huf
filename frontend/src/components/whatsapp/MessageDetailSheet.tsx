@@ -4,7 +4,8 @@ import { Badge } from '@/components/ui/badge';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { MessageLogItem } from '@/services/whatsappApi';
 import { cn } from '@/lib/utils';
-import { agentRunPath, errorInfo, sentByLabel, statusTicks, statusTimeline, type TickTone } from './messageLogModel';
+import { agentRunPath, displayStatus, errorInfo, sentByLabel, statusTicks, statusTimeline, type TickTone } from './messageLogModel';
+import { TimeStamp } from './TimeStamp';
 import { TemplateSend } from './TemplateSend';
 
 export const TONE_CLASS: Record<TickTone, string> = { neutral: 'text-steel', good: 'text-good', danger: 'text-destructive' };
@@ -64,7 +65,7 @@ export function MessageDetailSheet({
                   ))}
                 </ol>
               ) : (
-                <StatusTicks status={item.status} />
+                <StatusTicks status={displayStatus(item)} />
               )}
               {item.error && (
                 <div role="alert" className="space-y-1">
@@ -75,7 +76,7 @@ export function MessageDetailSheet({
               )}
             </div>
             <dl className="grid grid-cols-2 gap-3">
-              <Field label="Time">{item.creation}</Field>
+              <Field label="Time"><TimeStamp value={item.creation} /></Field>
               <Field label="Gateway">{item.gateway}</Field>
               <Field label="Type">{item.content_type || 'text'}</Field>
               <Field label="Template">{item.template ? <Badge variant="chip">{item.template}</Badge> : <Empty />}</Field>
@@ -84,7 +85,7 @@ export function MessageDetailSheet({
             </dl>
             <div className="flex flex-wrap gap-3 text-xs">
               {runPath && <Link to={runPath} className="text-signal-ink underline">Open agent run</Link>}
-              {item.event && <a href={`/app/gateway-event/${encodeURIComponent(item.event)}`} target="_blank" rel="noreferrer" className="text-signal-ink underline">Open gateway event</a>}
+              {item.event && <a href={`/app/gateway-event/${encodeURIComponent(item.event)}`} target="_blank" rel="noreferrer" className="text-signal-ink underline">View full event record</a>}
             </div>
             <div className="space-y-1 border-t border-line pt-4">
               <h4 className="text-xs font-semibold text-ink">Send template to this number</h4>

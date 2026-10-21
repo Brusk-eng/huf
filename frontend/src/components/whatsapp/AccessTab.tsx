@@ -1,3 +1,4 @@
+import { TimeStamp } from './TimeStamp';
 import { useCallback, useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { Loader2 } from 'lucide-react';
@@ -96,7 +97,7 @@ export function AccessTab({ gateway }: { gateway: string }) {
                     <Badge variant={e.state === 'Approved' ? 'pill-success' : e.state === 'Revoked' ? 'pill-danger' : 'pill-warning'}>{STATE_LABEL[e.state]}</Badge>
                     {e.approved_by && <div className="text-[11px] text-steel">by {e.approved_by}</div>}
                   </TableCell>
-                  <TableCell className="whitespace-nowrap font-mono text-xs text-steel">{e.creation}</TableCell>
+                  <TableCell className="whitespace-nowrap text-xs text-steel"><TimeStamp value={e.creation} /></TableCell>
                   <TableCell className="space-x-2 whitespace-nowrap text-right">
                     {e.state === 'Pending' && (
                       <Button size="sm" disabled={busy === e.name} onClick={() => void act(e, 'approve')}>Approve</Button>

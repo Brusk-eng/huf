@@ -68,13 +68,13 @@ describe('MessageDetailSheet', () => {
   it('links to the agent run and gateway event only when present', () => {
     open(item({ agent_run: 'run 1', event: 'EV-1' }));
     expect(screen.getByRole('link', { name: 'Open agent run' })).toHaveAttribute('href', '/executions/run%201');
-    expect(screen.getByRole('link', { name: 'Open gateway event' })).toHaveAttribute('href', '/app/gateway-event/EV-1');
+    expect(screen.getByRole('link', { name: 'View full event record' })).toHaveAttribute('href', '/app/gateway-event/EV-1');
   });
 
   it('hides the links when there is no run or event', () => {
     open(item());
     expect(screen.queryByRole('link', { name: 'Open agent run' })).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Open gateway event' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'View full event record' })).toBeNull();
   });
 });
 
