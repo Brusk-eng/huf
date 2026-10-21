@@ -83,22 +83,20 @@ class TestAdapterRouting(unittest.TestCase):
 
 
 class TestApply(unittest.TestCase):
-	def test_routes_to_matching_gateways_sets_state_and_audits(self):
-		gw = MagicMock()
+	def test_sets_state_on_receiving_gateway_and_audits(self):
 		with (
-			patch.object(ae, "_gateways_for_waba", return_value=["GW-1"]) as route,
+			patch.object(ae, "_gateway_identity", return_value={"phone_number_id": "p", "waba_id": "W1"}),
 			patch.object(ae, "_set_state") as setter,
 			patch.object(ae, "_audit") as audit,
 		):
-			out = ae.apply_account_event({"field": "account_update", "waba_id": "W1", **change_value("account_update_partner_removed.json")})
-		route.assert_called_once_with("W1")
+			out = ae.apply_account_event({"field": "account_update", "waba_id": "W1", **change_value("account_update_partner_removed.json")}, "GW-1")
 		self.assertEqual(out, ["GW-1"])
 		self.assertEqual(setter.call_args.args[:2], ("GW-1", "Disconnected"))
 		audit.assert_called_once()
 
-	def test_no_matching_gateway_changes_nothing(self):
-		with patch.object(ae, "_gateways_for_waba", return_value=[]), patch.object(ae, "_set_state") as setter:
-			self.assertEqual(ae.apply_account_event({"field": "account_update", "waba_id": "nope", "event": "ACCOUNT_OFFBOARDED"}), [])
+	def test_non_matching_waba_changes_nothing(self):
+		with patch.object(ae, "_gateway_identity", return_value={"phone_number_id": "p", "waba_id": "W1"}), patch.object(ae, "_set_state") as setter:
+			self.assertEqual(ae.apply_account_event({"field": "account_update", "waba_id": "nope", "event": "ACCOUNT_OFFBOARDED"}, "GW-1"), [])
 		setter.assert_not_called()
 
 

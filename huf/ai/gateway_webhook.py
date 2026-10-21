@@ -288,6 +288,9 @@ MAX_MESSAGES_PER_PAYLOAD = 100  # calls handled per delivery
 # the redelivery skips what is stored and continues with the rest. Meta caps a delivery at ~3 MB.
 MAX_INGEST_PER_REQUEST = 500
 _DEFERRED_RETRY_AFTER_SECONDS = 30
+# A payload that still has unprocessed messages after this many 503 passes is acked; the rest are dead-lettered.
+MAX_DEFERRALS_PER_PAYLOAD = 5
+_DEFERRAL_TTL_SECONDS = 3600
 
 
 def _ingest_rate_gate() -> None:
@@ -614,13 +617,33 @@ def _dead_letter(gateway_name: str, event, exc: BaseException) -> int:
 		frappe.log_error(frappe.get_traceback(), "WhatsApp gateway dead letter failed")
 		return 0
 
-def _apply_account_events(events) -> int:
-	"""account_update / user_preferences: routed by WABA/phone id, no Gateway Event row (WP-11)."""
+def _apply_account_events(events, gateway_name: str) -> int:
+	"""account_update / user_preferences: applied to the receiving gateway only, no Gateway Event row (WP-11)."""
 	if not events:
 		return 0
 	from huf.ai import whatsapp_account_events
 
-	return whatsapp_account_events.apply_account_events(events)
+	return whatsapp_account_events.apply_account_events(events, gateway_name)
+
+
+def _deferral_key(gateway_name: str, request) -> str:
+	import hashlib
+
+	return f"huf:wa_deferrals:{gateway_name}:{hashlib.sha256(getattr(request, 'body', b'') or b'').hexdigest()[:32]}"
+
+
+def _deferral_count(key: str) -> int:
+	try:
+		return int(frappe.cache.get_value(key) or 0)
+	except Exception:
+		return 0
+
+
+def _bump_deferral(key: str, count: int) -> None:
+	try:
+		frappe.cache.set_value(key, count + 1, expires_in_sec=_DEFERRAL_TTL_SECONDS)
+	except Exception:
+		pass
 
 
 def _supports_batch_parse(adapter) -> bool:
@@ -640,13 +663,6 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		return {"success": False, "error": "Invalid payload"}
 
 	messages = list(parsed.messages)
-	deferred = max(len(messages) - MAX_INGEST_PER_REQUEST, 0)
-	if deferred:
-		messages = messages[:MAX_INGEST_PER_REQUEST]
-		_warn(
-			f"WhatsApp gateway {gateway.name}: payload carried {len(parsed.messages)} messages; "
-			f"ingested {MAX_INGEST_PER_REQUEST}, answering 503 so the provider redelivers the other {deferred}"
-		)
 	if messages or getattr(parsed, "calls", ()):
 		_ingest_rate_gate()
 
@@ -655,7 +671,13 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 	first_transient = None
 	failed = dead_lettered = 0
 	account_name = None
-	for event in messages:
+	cap_hit_at = None
+	for index, event in enumerate(messages):
+		# Only NEW ingests count toward the cap, so a redelivery walks past already-stored
+		# duplicates and makes progress instead of re-deferring the same tail forever.
+		if ingested >= MAX_INGEST_PER_REQUEST:
+			cap_hit_at = index
+			break
 		_savepoint("gw_ingest")
 		try:
 			result = ingest_gateway_event(
@@ -702,30 +724,54 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "WhatsApp record_incoming failed")
 
-	_record_unknown_phone_ids(gateway.name, getattr(parsed, "unknown_phone_ids", ()) or ())
-	for status in parsed.statuses:
-		_update_reply_status(gateway.name, status)
-		if str(status.get("status") or "").lower() == "failed":
-			_record_failed_status(gateway.name, status)
-	routed_updates = [update for update in parsed.template_updates if _record_template_update(update, gateway.name)]
-	call_results = _handle_calls(gateway, getattr(parsed, "calls", ()) or ())
-	account_applied = _apply_account_events(getattr(parsed, "account_events", ()) or ())
+	remaining = messages[cap_hit_at:] if cap_hit_at is not None else []
+	deferred = len(remaining)
+	deferral_key = _deferral_key(gateway.name, request)
+	if deferred:
+		seen = _deferral_count(deferral_key)
+		if seen >= MAX_DEFERRALS_PER_PAYLOAD:
+			# bounded: stop asking Meta to redeliver; keep the tail as replayable dead letters and ack
+			_warn(f"WhatsApp gateway {gateway.name}: {deferred} messages still deferred after {seen} passes; dead-lettering")
+			for event in remaining:
+				dead_lettered += _dead_letter(gateway.name, event, RuntimeError("deferral limit exceeded"))
+			failed += deferred
+			deferred = 0
+		else:
+			_bump_deferral(deferral_key, seen)
+			_warn(
+				f"WhatsApp gateway {gateway.name}: ingested {MAX_INGEST_PER_REQUEST} new messages, answering 503 "
+				f"so the provider redelivers the other {deferred}"
+			)
 
-	forwarded = 0
-	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
-	changes += [
-		{
-			"field": _TEMPLATE_KIND_FIELDS.get(update.get("kind"), "message_template_status_update"),
-			"value": {k: v for k, v in update.items() if k not in ("kind", "waba_id")},
-		}
-		for update in routed_updates
-	]
-	for change in changes:
-		try:
-			if bridge.forward_status(change):
-				forwarded += 1
-		except Exception:
-			pass  # best effort, never fail the ack
+	_record_unknown_phone_ids(gateway.name, getattr(parsed, "unknown_phone_ids", ()) or ())
+	# A deferred pass only ingests messages: statuses/templates/calls/account events run once, on the
+	# final pass, so Meta's redeliveries of a big payload never re-apply them.
+	routed_updates: list = []
+	call_results: list = []
+	account_applied = forwarded = 0
+	if not deferred:
+		for status in parsed.statuses:
+			_update_reply_status(gateway.name, status)
+			if str(status.get("status") or "").lower() == "failed":
+				_record_failed_status(gateway.name, status)
+		routed_updates = [update for update in parsed.template_updates if _record_template_update(update, gateway.name)]
+		call_results = _handle_calls(gateway, getattr(parsed, "calls", ()) or ())
+		account_applied = _apply_account_events(getattr(parsed, "account_events", ()) or (), gateway.name)
+
+		changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
+		changes += [
+			{
+				"field": _TEMPLATE_KIND_FIELDS.get(update.get("kind"), "message_template_status_update"),
+				"value": {k: v for k, v in update.items() if k not in ("kind", "waba_id")},
+			}
+			for update in routed_updates
+		]
+		for change in changes:
+			try:
+				if bridge.forward_status(change):
+					forwarded += 1
+			except Exception:
+				pass  # best effort, never fail the ack
 
 	if first_transient is not None:
 		raise first_transient
@@ -737,7 +783,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			pass
 	return {
 		"success": not deferred,
-		"messages": len(messages),
+		"messages": len(messages) - deferred,
 		"ingested": ingested,
 		"duplicates": duplicates,
 		"statuses": len(parsed.statuses),
