@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 
@@ -146,8 +146,12 @@ describe('WhatsAppManagePage', () => {
 		});
 		open('/');
 		await screen.findByText(/steps left/);
+		const credentialsItem = () => screen.getByText('Add your credentials').closest('li') as HTMLElement;
+		expect(within(credentialsItem()).getByLabelText('Done')).toBeInTheDocument();
 		await userEvent.click(screen.getByRole('button', { name: 'Check now' }));
 		const alert = await screen.findByRole('alert');
 		expect(alert).toHaveTextContent('The token has expired.');
+		await waitFor(() => expect(within(credentialsItem()).getByLabelText('Blocked')).toBeInTheDocument());
+		expect(within(credentialsItem()).queryByLabelText('Done')).toBeNull();
 	});
 });
