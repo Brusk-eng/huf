@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
+import { MessageCircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageFrame } from '@/layouts/PageFrame';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
   checkToken,
@@ -15,6 +17,7 @@ import { BridgeUnavailable, LoadError } from '@/components/whatsapp/BridgeUnavai
 import { TemplatesTab } from '@/components/whatsapp/TemplatesTab';
 import { AccessTab } from '@/components/whatsapp/AccessTab';
 import { MessageLogTab } from '@/components/whatsapp/MessageLogTab';
+import { REASON_FALLBACK } from '@/components/whatsapp/overview/healthCopy';
 import { GatewaySwitcher } from '@/components/whatsapp/overview/GatewaySwitcher';
 import { OverviewTab } from '@/components/whatsapp/overview/OverviewTab';
 import { SettingsTab } from '@/components/whatsapp/overview/SettingsTab';
@@ -26,6 +29,32 @@ type TabName = (typeof TABS)[number];
 const SETTINGS_ANCHORS = new Set(['credentials', 'app-secret', 'enabled']);
 
 const asTab = (v: string | null): TabName => (TABS.find((t) => t === v) ?? 'overview');
+
+/** A live check that says the token is bad must not leave the credentials step green. */
+function withTokenVerdict(g: GatewayHealthStatus): GatewayHealthStatus {
+  if (g.token_check?.valid !== false) return g;
+  return {
+    ...g,
+    checklist: g.checklist.map((c) => (c.code === 'credentials' && c.state === 'done' ? { ...c, state: 'blocked' as const } : c)),
+    health: g.health === 'healthy' || g.health === 'degraded' ? 'blocked' : g.health,
+    reasons: g.reasons.some((r) => r.code === 'access_token_invalid')
+      ? g.reasons
+      : [{ code: 'access_token_invalid', severity: 'error' as const, message: g.token_check?.message || REASON_FALLBACK.access_token_invalid }, ...g.reasons],
+  };
+}
+
+function NoGateway() {
+  return (
+    <div className="mx-auto flex max-w-md flex-col items-center gap-3 py-16 text-center">
+      <MessageCircle className="h-8 w-8 text-steel" aria-hidden />
+      <h2 className="text-base font-semibold text-ink">Connect your first WhatsApp number</h2>
+      <p className="text-sm text-steel">Add a WhatsApp gateway to see its health, messages and templates here.</p>
+      <Button asChild>
+        <Link to="/gateways">Add a WhatsApp gateway</Link>
+      </Button>
+    </div>
+  );
+}
 
 export default function WhatsAppManagePage() {
   const [params, setParams] = useSearchParams();
@@ -105,7 +134,7 @@ export default function WhatsAppManagePage() {
   };
 
   const health: GatewayHealthStatus | null = detail?.gateway
-    ? { ...detail.gateway, token_check: tokenCheck?.gateway === gateway ? tokenCheck.result : detail.gateway.token_check }
+    ? withTokenVerdict({ ...detail.gateway, token_check: tokenCheck?.gateway === gateway ? tokenCheck.result : detail.gateway.token_check })
     : null;
   const settingsHref = gateway ? `/app/gateway/${encodeURIComponent(gateway)}` : '';
   const connectorAvailable = summary?.connector_available ?? true;
@@ -145,6 +174,8 @@ export default function WhatsAppManagePage() {
           <LoadError message={summaryError} onRetry={loadSummary} />
         ) : loadingSummary ? (
           <Skeleton className="h-40" />
+        ) : !gateway ? (
+          <NoGateway />
         ) : (
           <Tabs value={tab} onValueChange={(v) => update({ tab: asTab(v) })}>
             <TabsList className="w-full justify-start overflow-x-auto sm:w-auto">
@@ -154,9 +185,7 @@ export default function WhatsAppManagePage() {
               <TabsTrigger value="access">Access</TabsTrigger>
               <TabsTrigger value="settings">Settings</TabsTrigger>
             </TabsList>
-            {!gateway ? (
-              <p className="pt-4 text-xs text-steel">Add a WhatsApp gateway to see its health, messages and templates.</p>
-            ) : (
+            {gateway && (
               <>
                 <TabsContent value="overview" className="pt-3">
                   {detailError ? (

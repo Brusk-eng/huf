@@ -128,6 +128,9 @@ describe('WhatsAppManagePage', () => {
 		api.getSetupStatus.mockResolvedValueOnce({ ok: true, data: { success: true, connector_available: true, gateways: [] } });
 		const first = open('/');
 		expect(await screen.findByText('No WhatsApp gateway yet')).toBeInTheDocument();
+		expect(screen.getByText('Connect your first WhatsApp number')).toBeInTheDocument();
+		expect(screen.getByRole('link', { name: 'Add a WhatsApp gateway' })).toHaveAttribute('href', '/gateways');
+		expect(screen.queryAllByRole('tab')).toHaveLength(0);
 		first.unmount();
 		api.getSetupStatus.mockResolvedValueOnce({ ok: false, error: 'Boom' });
 		open('/');
