@@ -1,6 +1,7 @@
 import { PlugZap } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { useIsHufAdmin } from '@/contexts/PermissionsContext';
 import { Button } from '@/components/ui/button';
 
 export const CONNECTOR_NEEDED = 'Template management and message history need the WhatsApp Business connector app';
@@ -26,6 +27,7 @@ export function isTechnicalMessage(message: string): boolean {
 
 export function LoadError({ message, onRetry }: { message: string; onRetry?: () => void }) {
   const technical = isTechnicalMessage(message);
+  const isAdmin = useIsHufAdmin();
   return (
     <Alert variant="destructive" role="alert">
       <div className="flex items-start justify-between gap-3">
@@ -33,7 +35,7 @@ export function LoadError({ message, onRetry }: { message: string; onRetry?: () 
           <AlertDescription>
             {technical ? 'Something went wrong while loading this page. Try again; if it keeps happening, ask your administrator.' : message}
           </AlertDescription>
-          {technical && (
+          {technical && isAdmin && (
             <Collapsible>
               <CollapsibleTrigger className="text-xs underline">Technical details</CollapsibleTrigger>
               <CollapsibleContent>
