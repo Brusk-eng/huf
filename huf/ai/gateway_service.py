@@ -1236,7 +1236,16 @@ def _run_agent_with_retry(run_fn, **kwargs):
 
     for attempt in range(1, _CONVERSATION_RACE_ATTEMPTS + 1):
         try:
-            return run_fn(**kwargs)
+            result = run_fn(**kwargs)
+            if attempt > 1 and isinstance(result, dict) and (
+                result.get("queued") or result.get("status") in ("Queued", "Started")
+            ):
+                # The earlier attempt already created the Agent Run (deduped by idempotency key) and
+                # it is still in flight: never execute it a second time.
+                raise RuntimeError(
+                    f"Agent run {result.get('agent_run_id')} is still in progress after a conversation conflict"
+                )
+            return result
         except _conversation_race_errors():
             if attempt >= _CONVERSATION_RACE_ATTEMPTS:
                 raise
@@ -1412,6 +1421,7 @@ def process_gateway_event(event_name: str) -> dict:
 
             fallback_note = ""
             _maybe_mark_read_typing(event, gateway)
+            frappe.db.commit()  # keep Running status and saved media across a retry rollback
             result = _run_agent_with_retry(
                 run_agent_sync,
                 agent_name=event.target_agent,
@@ -1419,6 +1429,7 @@ def process_gateway_event(event_name: str) -> dict:
                 channel_id=f"gateway:{gateway.name}",
                 external_id=event.thread_id or event.conversation_id or event.sender_id,
                 now=True,
+                client_idempotency_key=f"gateway-event:{event.name}",
             )
             failure = _agent_run_failure(result)
             if failure:

@@ -79,6 +79,24 @@ class TestConversationRaceRetry(unittest.TestCase):
 		self.assertEqual(rollback.call_count, 2)
 		self.assertEqual(sleep.call_count, 2)
 
+	def test_retry_that_finds_inflight_run_does_not_reexecute(self):
+		run = MagicMock(
+			side_effect=[
+				frappe.QueryDeadlockError(),
+				{"queued": True, "status": "Queued", "agent_run_id": "AR-1"},
+			]
+		)
+		with patch("time.sleep"), patch.object(gateway_service.frappe.db, "rollback"):
+			with self.assertRaises(RuntimeError):
+				gateway_service._run_agent_with_retry(run, client_idempotency_key="gateway-event:E1")
+		self.assertEqual(run.call_count, 2)
+
+	def test_retry_returns_finished_run(self):
+		done = {"success": True, "status": "Success", "agent_run_id": "AR-1", "response": "hi"}
+		run = MagicMock(side_effect=[frappe.TimestampMismatchError(), done])
+		with patch("time.sleep"), patch.object(gateway_service.frappe.db, "rollback"):
+			self.assertEqual(gateway_service._run_agent_with_retry(run), done)
+
 	def test_gives_up_after_max_attempts(self):
 		run = MagicMock(side_effect=frappe.QueryDeadlockError())
 		with patch("time.sleep"), patch.object(gateway_service.frappe.db, "rollback"):

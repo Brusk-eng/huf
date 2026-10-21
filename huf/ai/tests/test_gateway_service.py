@@ -825,7 +825,7 @@ class TestGatewayEventFailureHandling(unittest.TestCase):
                 gateway_service.process_gateway_event(event.name)
 
         mock_frappe.db.rollback.assert_called_once()
-        mock_frappe.db.commit.assert_called_once()
+        self.assertEqual(mock_frappe.db.commit.call_count, 2)  # pre-run commit + Failed status
 
         failed_calls = [
             c for c in event.db_set.call_args_list
