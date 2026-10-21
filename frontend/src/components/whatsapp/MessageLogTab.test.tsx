@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import userEvent from '@testing-library/user-event';
 import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 
@@ -43,12 +44,12 @@ describe('MessageLogTab one-shot links', () => {
   it('stays collapsed without ?send=1', async () => {
     open('/?tab=messages');
     await screen.findByText('msg m1');
-    expect(screen.queryByLabelText('Recipient number')).toBeNull();
+    expect(screen.queryByLabelText('To', { selector: '#whatsapp-send-to' })).toBeNull();
   });
 
   it('?send=1 opens the send panel and clears the param', async () => {
     open('/?tab=messages&gateway=GW-1&send=1');
-    expect(await screen.findByLabelText('Recipient number')).toBeInTheDocument();
+    expect(await screen.findByLabelText('To', { selector: '#whatsapp-send-to' })).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId('search')).not.toHaveTextContent('send='));
     expect(screen.getByTestId('search')).toHaveTextContent('gateway=GW-1');
   });
@@ -75,5 +76,23 @@ describe('MessageLogTab one-shot links', () => {
     expect(screen.getByText('All agents')).toBeInTheDocument();
     expect(screen.getByText('All templates')).toBeInTheDocument();
     expect(screen.queryByText(/statuss/)).toBeNull();
+  });
+
+  it('shows a relative time with the full date on hover', async () => {
+    open('/?tab=messages');
+    await screen.findByText('msg m1');
+    expect(screen.queryByText('2026-10-14 10:00:00')).toBeNull();
+    expect(document.querySelector('time[title]')).not.toBeNull();
+  });
+
+  it('has no Gateway column and rows open with the keyboard', async () => {
+    open('/?tab=messages');
+    await screen.findByText('msg m1');
+    expect(screen.queryByRole('columnheader', { name: 'Gateway' })).toBeNull();
+    const row = screen.getAllByRole('row')[1];
+    expect(row).toHaveAttribute('tabindex', '0');
+    row.focus();
+    await userEvent.keyboard('{Enter}');
+    expect(await screen.findByText('detail m1')).toBeInTheDocument();
   });
 });

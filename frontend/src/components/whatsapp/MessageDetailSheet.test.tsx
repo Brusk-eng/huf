@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
+import userEvent from '@testing-library/user-event';
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 
@@ -45,7 +46,8 @@ describe('MessageDetailSheet', () => {
     expect(screen.getByText('Received')).toBeInTheDocument();
     expect(screen.queryByRole('list')).toBeNull();
     expect(screen.getByText('Customer')).toBeInTheDocument();
-    expect(screen.getByText('None', { selector: 'span' })).toBeInTheDocument();
+    expect(screen.queryByText('None')).toBeNull();
+    expect(screen.getAllByText('\u2014').length).toBe(2);
   });
 
   it('falls back to a placeholder for non-text content', () => {
@@ -53,12 +55,14 @@ describe('MessageDetailSheet', () => {
     expect(screen.getByText('[image]')).toBeInTheDocument();
   });
 
-  it('explains a failed delivery in plain words', () => {
+  it('explains a failed delivery in plain words', async () => {
     open(item({ status: 'failed', error: 'error 131047: Re-engagement message' }));
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent('Window closed');
     expect(alert).toHaveTextContent('131047');
     expect(alert).toHaveTextContent('Send an approved template instead');
+    expect(alert).not.toHaveTextContent('error 131047: Re-engagement message');
+    await userEvent.click(screen.getByText('Technical details'));
     expect(alert).toHaveTextContent('error 131047: Re-engagement message');
     expect(screen.getByText('Failed')).toBeInTheDocument();
     expect(screen.queryByText('Read')).toBeNull();
@@ -67,13 +71,13 @@ describe('MessageDetailSheet', () => {
   it('links to the agent run and gateway event only when present', () => {
     open(item({ agent_run: 'run 1', event: 'EV-1' }));
     expect(screen.getByRole('link', { name: 'Open agent run' })).toHaveAttribute('href', '/executions/run%201');
-    expect(screen.getByRole('link', { name: 'Open gateway event' })).toHaveAttribute('href', '/app/gateway-event/EV-1');
+    expect(screen.getByRole('link', { name: 'View full event record' })).toHaveAttribute('href', '/app/gateway-event/EV-1');
   });
 
   it('hides the links when there is no run or event', () => {
     open(item());
     expect(screen.queryByRole('link', { name: 'Open agent run' })).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Open gateway event' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'View full event record' })).toBeNull();
   });
 });
 

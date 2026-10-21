@@ -22,11 +22,12 @@ import { CategoryChangeBadge, QualityBadge, StatusBadge } from './TemplateBadges
 import { DraftsPanel } from './DraftsPanel';
 import { ManagerLink } from './ManagerLink';
 import { SendTemplateDialog } from './SendTemplateDialog';
+import { localeLabel } from './template/locales';
 import { TemplateDetailPane } from './TemplateDetailPane';
 import { fromTemplateDetail } from './template/payload';
 import { TemplateWizard, type WizardResult } from './TemplateWizard';
 import {
-  ALL_OPTION, OPEN_DRAFT_STATUSES, TEMPLATE_STATUSES, filterTemplates, statusInfo, statusToastText, type TemplateFilters,
+  ALL_OPTION, OPEN_DRAFT_STATUSES, TEMPLATE_STATUSES, categoryLabel, filterTemplates, statusInfo, statusToastText, type TemplateFilters,
 } from './templateModel';
 
 const STATUS_EVENT = 'whatsapp_template_status';
@@ -260,7 +261,7 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
                     value={filters.search} onChange={(e) => setFilter({ search: e.target.value })}
                   />
                 </div>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 gap-2">
                   <Select value={filters.status} onValueChange={(v) => setFilter({ status: v })}>
                     <SelectTrigger aria-label="Filter by status"><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -277,10 +278,10 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
                     </SelectContent>
                   </Select>
                   <Select value={filters.language} onValueChange={(v) => setFilter({ language: v })}>
-                    <SelectTrigger aria-label="Filter by language"><SelectValue /></SelectTrigger>
+                    <SelectTrigger className="col-span-2" aria-label="Filter by language"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={ALL_OPTION}>Any language</SelectItem>
-                      {languages.map((l) => <SelectItem key={l} value={l}>{l}</SelectItem>)}
+                      {languages.map((l) => <SelectItem key={l} value={l}>{localeLabel(l)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 </div>
@@ -300,7 +301,7 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
                           >
                             <span className="block truncate font-mono text-xs font-medium text-ink">{t.template_name || t.name}</span>
                             <span className="block text-[11px] text-steel">
-                              {t.category === 'MARKETING' ? 'Marketing' : t.category === 'UTILITY' ? 'Utility' : t.category} · {t.language_code}
+                              {categoryLabel(t.category)} · {localeLabel(t.language_code ?? '')}
                             </span>
                             <span className="flex flex-wrap gap-1">
                               <StatusBadge status={t.status} />

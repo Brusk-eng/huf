@@ -19,7 +19,7 @@ export function ManagerLink({ url, businessId, showId = true }: { url?: string; 
 
   return (
     <div className="flex items-center gap-2">
-      <Button variant="outline" size="sm" asChild>
+      <Button variant="ghost" size="sm" asChild>
         <a href={url} target="_blank" rel="noopener noreferrer">
           <ExternalLink className="mr-1.5 h-4 w-4" /> Open in WhatsApp Manager
         </a>

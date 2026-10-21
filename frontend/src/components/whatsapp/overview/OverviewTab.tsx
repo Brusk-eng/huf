@@ -30,7 +30,7 @@ export function OverviewTab({ gateway, loading, checking, onCheck, onTurnOn, set
 			) : (
 				<>
 					<div className="grid items-start gap-4 lg:grid-cols-2">
-						<SetupChecklist items={gateway.checklist} health={gateway.health} />
+						<SetupChecklist items={gateway.checklist} health={gateway.health} tokenRejected={gateway.token_check?.valid === false} />
 						<ConnectionCard
 							webhookUrl={gateway.webhook_url}
 							verifyTokenPresent={gateway.verify_token_present}

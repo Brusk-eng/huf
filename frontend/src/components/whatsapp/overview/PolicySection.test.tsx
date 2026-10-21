@@ -46,7 +46,9 @@ describe('PolicySection', () => {
 		const { rerender } = render(<PolicySection {...base} fallbackTemplate={null} policy={{}} />);
 		await user.click(screen.getByText('Reply rules'));
 		expect(screen.getByText('Replies after 24 hours will fail until you set a fallback template.')).toBeInTheDocument();
-		expect(screen.getAllByText('Not set').length).toBeGreaterThan(0);
+		expect(screen.getByText('New people must pair first (default)')).toBeInTheDocument();
+		expect(screen.getByText('No default agent')).toBeInTheDocument();
+		expect(screen.queryByText('Not set')).toBeNull();
 		rerender(<PolicySection {...base} fallbackTemplateApproved={false} />);
 		expect(screen.getByText(/hasn't approved/)).toBeInTheDocument();
 	});

@@ -13,10 +13,11 @@ import {
 } from '@/services/whatsappApi';
 import { BridgeUnavailable, LoadError } from './BridgeUnavailable';
 import { ErrorBadge, MessageDetailSheet, StatusTicks } from './MessageDetailSheet';
+import { TimeStamp } from './TimeStamp';
 import { SendPanel } from './SendPanel';
 import {
   ALL, EMPTY_FILTERS, activeFilterCount, agentRunPath, filtersFromParams, filtersToParams, filtersToQuery,
-  messagePreview, sentByLabel, type MessageLogFilters,
+  displayStatus, errorInfo, messagePreview, sentByLabel, type MessageLogFilters,
 } from './messageLogModel';
 
 function FilterSelect({
@@ -153,8 +154,14 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
         <FilterSelect label="Template" allLabel="All templates" value={filters.template} onChange={(v) => update({ template: v })}
           options={(options?.templates ?? []).map((t) => ({ value: t, label: t }))} />
         <Input value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} placeholder="Number" className="w-36 font-mono" aria-label="Contact number" />
-        <Input type="date" value={filters.from} onChange={(e) => update({ from: e.target.value })} className="w-40" aria-label="From date" />
-        <Input type="date" value={filters.to} onChange={(e) => update({ to: e.target.value })} className="w-40" aria-label="To date" />
+        <label className="flex items-center gap-1.5 text-xs text-steel">
+          From
+          <Input type="date" value={filters.from} onChange={(e) => update({ from: e.target.value })} className="w-40" aria-label="From date" />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-steel">
+          To
+          <Input type="date" value={filters.to} onChange={(e) => update({ to: e.target.value })} className="w-40" aria-label="To date" />
+        </label>
         <Button variant="outline" size="sm" onClick={reset} disabled={active === 0 && !qInput && !phoneInput}>
           Reset{active > 0 ? ` (${active})` : ''}
         </Button>
@@ -182,8 +189,7 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                 <TableHead>Contact</TableHead>
                 <TableHead>Message</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead>Agent</TableHead>
-                <TableHead>Gateway</TableHead>
+                <TableHead className="min-w-32">Agent</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -196,9 +202,14 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                     data-event={m.event ?? undefined}
                     aria-current={eventName && m.event === eventName ? 'true' : undefined}
                     className={`cursor-pointer ${eventName && m.event === eventName ? 'bg-paper-deep' : ''}`}
+                    tabIndex={0}
                     onClick={() => setSelected(m)}
+                    onKeyDown={(e) => {
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelected(m); }
+                    }}
                   >
-                    <TableCell className="whitespace-nowrap font-mono text-xs text-steel">{m.creation}</TableCell>
+                    <TableCell className="whitespace-nowrap text-xs text-steel"><TimeStamp value={m.creation} /></TableCell>
                     <TableCell><Badge variant={m.direction === 'in' ? 'pill-neutral' : 'pill-success'}>{m.direction === 'in' ? 'In' : 'Out'}</Badge></TableCell>
                     <TableCell className="text-xs">
                       <div className="font-mono text-ink">{m.phone}</div>
@@ -212,22 +223,21 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                       </div>
                     </TableCell>
                     <TableCell>
-                      <StatusTicks status={m.status} />
+                      <StatusTicks status={displayStatus(m)} />
                       {m.error && (
                         <div className="mt-1 space-y-0.5">
                           <ErrorBadge error={m.error} />
-                          <div className="max-w-48 truncate text-[11px] text-destructive" title={m.error}>{m.error}</div>
+                          <div className="max-w-48 text-[11px] text-steel">{errorInfo(m.error)?.hint}</div>
                         </div>
                       )}
                     </TableCell>
-                    <TableCell className="text-xs">
+                    <TableCell className="min-w-32 max-w-48 text-xs">
                       {runPath ? (
-                        <Link to={runPath} onClick={(e) => e.stopPropagation()} className="text-signal-ink underline">{sentByLabel(m.sent_by, title ?? m.agent)}</Link>
+                        <Link to={runPath} onClick={(e) => e.stopPropagation()} title={sentByLabel(m.sent_by, title ?? m.agent)} className="block truncate text-signal-ink underline">{sentByLabel(m.sent_by, title ?? m.agent)}</Link>
                       ) : (
-                        <span className="text-steel">{sentByLabel(m.sent_by, title ?? m.agent)}</span>
+                        <span className="block truncate text-steel" title={sentByLabel(m.sent_by, title ?? m.agent)}>{sentByLabel(m.sent_by, title ?? m.agent)}</span>
                       )}
                     </TableCell>
-                    <TableCell className="text-xs text-steel">{m.gateway}</TableCell>
                   </TableRow>
                 );
               })}

@@ -4,7 +4,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import { formatTimeAgo } from '@/utils/time';
+import { TimeStamp, TimeWhen } from '../TimeStamp';
 import type { GatewayHealthStatus } from '@/services/whatsappHealthApi';
 import {
 	BANNER_CHECKING,
@@ -33,17 +33,27 @@ export interface HealthBannerProps {
 interface Check {
 	label: string;
 	ok: boolean;
+	/** Red instead of grey: a step that is known to be broken, not just not done yet. */
+	bad?: boolean;
 }
 
 function buildChecks(g: GatewayHealthStatus): Check[] {
+	const credentials = g.checklist.find((c) => c.code === 'credentials')?.state;
 	const checks: Check[] = [
 		{ label: CHECK_LABELS.enabled, ok: g.enabled },
 		{
 			label: CHECK_LABELS.credentials,
-			ok: g.checklist.find((c) => c.code === 'credentials')?.state === 'done',
+			ok: credentials === 'done',
+			bad: credentials === 'blocked',
 		},
 	];
-	if (g.token_check) checks.push({ label: CHECK_LABELS.token, ok: g.token_check.valid });
+	if (g.token_check) {
+		checks.push(
+			g.token_check.valid
+				? { label: CHECK_LABELS.token, ok: true }
+				: { label: CHECK_LABELS.tokenRejected, ok: false, bad: true }
+		);
+	}
 	checks.push(
 		{ label: CHECK_LABELS.receiving, ok: g.last_event_at != null },
 		{ label: CHECK_LABELS.delivering, ok: g.last_event_at != null && g.events_24h.failed === 0 }
@@ -108,8 +118,8 @@ export function HealthBanner({ gateway, loading, checking, onCheck, onTurnOn }: 
 			break;
 	}
 
-	const lastMessage = gateway.last_event_at ? `Last message ${formatTimeAgo(gateway.last_event_at)}` : NO_MESSAGES_YET;
-	const checked = gateway.token_check?.checked_at ? `Checked ${formatTimeAgo(gateway.token_check.checked_at)}` : null;
+	const lastMessage = gateway.last_event_at ? <>Last message <TimeStamp value={gateway.last_event_at} /></> : NO_MESSAGES_YET;
+	const checked = gateway.token_check?.checked_at ? <>Checked <TimeWhen value={gateway.token_check.checked_at} /></> : null;
 
 	return (
 		<div className="space-y-3">
@@ -120,12 +130,22 @@ export function HealthBanner({ gateway, loading, checking, onCheck, onTurnOn }: 
 						<AlertTitle className="mb-0 leading-snug">{title}</AlertTitle>
 						{detail ? <AlertDescription className="mt-1">{detail}</AlertDescription> : null}
 					</div>
-					{action}
+					<div className="flex flex-wrap items-center gap-2">
+						{action}
+						<Button variant="outline" size="sm" onClick={onCheck} disabled={checking}>
+							{checking ? (
+								<Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+							) : (
+								<RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+							)}
+							{checking ? BANNER_CHECKING : BANNER_CHECK_NOW}
+						</Button>
+					</div>
 				</div>
 			</Alert>
 			<div className="flex flex-wrap items-center gap-2">
 				{buildChecks(gateway).map((c) => (
-					<Badge key={c.label} variant={c.ok ? 'pill-success' : 'pill-neutral'}>
+					<Badge key={c.label} variant={c.ok ? 'pill-success' : c.bad ? 'pill-danger' : 'pill-neutral'}>
 						<span className="sr-only">{c.ok ? 'Passed: ' : 'Not passing: '}</span>
 						{c.label}
 					</Badge>
@@ -134,14 +154,6 @@ export function HealthBanner({ gateway, loading, checking, onCheck, onTurnOn }: 
 			<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-steel">
 				<span>{lastMessage}</span>
 				{checked ? <span>{checked}</span> : null}
-				<Button variant="ghost" size="sm" onClick={onCheck} disabled={checking}>
-					{checking ? (
-						<Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
-					) : (
-						<RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden />
-					)}
-					{checking ? BANNER_CHECKING : BANNER_CHECK_NOW}
-				</Button>
 			</div>
 		</div>
 	);

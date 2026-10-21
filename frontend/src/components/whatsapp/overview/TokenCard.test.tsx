@@ -64,4 +64,12 @@ describe('TokenCard', () => {
 		expect(screen.getByText('Checked')).toBeInTheDocument();
 		expect(screen.queryByText('Never')).toBeNull();
 	});
+
+	it('says Meta rejected the token and points to Settings', () => {
+		render(<TokenCard check={check({ valid: false, checked_at: '2026-10-14T10:00:00Z' })} />);
+		expect(screen.getByText(/Meta rejected this token/)).toBeInTheDocument();
+		expect(screen.getByText(/Meta rejected this token/)).not.toHaveTextContent(/ on \d+ min ago/);
+		expect(screen.getByRole('link', { name: 'Replace it in Settings' })).toHaveAttribute('href', '#credentials');
+		expect(screen.queryByText(/Not checked yet/)).toBeNull();
+	});
 });

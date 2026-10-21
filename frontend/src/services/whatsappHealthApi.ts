@@ -106,7 +106,7 @@ export interface GatewayHealthStatus {
 	unrouted_phone_ids: string[];
 	policy: GatewayPolicy;
 	meta_links: MetaLinks;
-	/** Client-side only: the last check_token result, attached by the page shell (not part of get_setup_status). */
+	/** The last token check: the server's cached result, replaced by a live check made on this page. */
 	token_check?: TokenCheckSummary | null;
 }
 

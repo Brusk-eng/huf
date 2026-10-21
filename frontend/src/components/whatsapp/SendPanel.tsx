@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { ChevronDown } from 'lucide-react';
+import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { errorText, type WhatsAppError } from '@/services/whatsappApi';
@@ -53,7 +54,10 @@ export function SendPanel({
       </CollapsibleTrigger>
       <CollapsibleContent className="space-y-3 border-t border-line p-3">
         <div className="flex flex-wrap gap-2">
-          <Input ref={toRef} value={to} onChange={(e) => setTo(e.target.value)} placeholder="+15551234567" className="max-w-xs font-mono" aria-label="Recipient number" />
+          <div className="space-y-1">
+            <Label htmlFor="whatsapp-send-to" className="text-xs">To</Label>
+            <Input id="whatsapp-send-to" ref={toRef} value={to} onChange={(e) => setTo(e.target.value)} placeholder="+15551234567" className="w-56 font-mono" />
+          </div>
           <SendTypePicker value={type} onChange={(v) => { setType(v); setSendError(null); }} />
         </div>
         {note && <p className="text-[11px] text-steel">{note}</p>}

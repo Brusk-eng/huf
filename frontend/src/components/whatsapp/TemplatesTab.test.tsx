@@ -31,6 +31,7 @@ vi.mock('./TemplateWizard', () => ({
 
 import { getTemplate, listTemplateDrafts, listTemplates, type TemplateDetail } from '@/services/whatsappApi';
 import { TemplatesTab } from './TemplatesTab';
+import { categoryLabel } from './templateModel';
 
 const row = { name: 'tpl-1', template_name: 'order_update', language_code: 'en_US', category: 'UTILITY', status: 'APPROVED', template: 'Hi' };
 const detail = {
@@ -105,5 +106,17 @@ describe('TemplatesTab wizard wiring', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Finish wizard' }));
     await waitFor(() => expect(vi.mocked(listTemplates).mock.calls.length).toBeGreaterThan(loads));
     expect(screen.getByTestId('search')).not.toHaveTextContent('edit=');
+  });
+});
+
+describe('TemplatesTab list', () => {
+  it('title-cases any category in the list', async () => {
+    vi.mocked(listTemplates).mockResolvedValue({
+      success: true, templates: [{ ...row, category: 'AUTHENTICATION' }], manager_url: '', business_id: '',
+    } as never);
+    render(<MemoryRouter><TemplatesTab gateway="GW-1" /></MemoryRouter>);
+    expect(await screen.findByText(/Authentication · English \(US\)/)).toBeInTheDocument();
+    expect(categoryLabel('MARKETING')).toBe('Marketing');
+    expect(categoryLabel(null)).toBe('');
   });
 });

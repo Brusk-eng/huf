@@ -24,8 +24,8 @@ const POLICY_TEXT: Record<string, string> = {
 	deny: 'Ignored',
 };
 
-export function policyText(value: string | null | undefined): string {
-	if (!value) return 'Not set';
+export function policyText(value: string | null | undefined, unset = 'Default'): string {
+	if (!value) return unset;
 	return POLICY_TEXT[value] ?? value.replace(/_/g, ' ');
 }
 
@@ -73,12 +73,12 @@ export function PolicySection({
 						)}
 
 						<dl className="grid gap-3 sm:grid-cols-2">
-							<Item label="Direct messages" value={policyText(policy.direct_policy)} />
+							<Item label="Direct messages" value={policyText(policy.direct_policy, 'New people must pair first (default)')} />
 							<Item label="Group chats" value={policyText(policy.room_policy)} />
 							<Item label="Who can talk in groups" value={policyText(policy.room_sender_policy)} />
 							<Item label="Mention required in groups" value={policy.mention_required ? 'Yes' : 'No'} />
 							<Item label="Pairing" value={policy.pairing_enabled ? 'On' : 'Off'} />
-							<Item label="Replies go to" value={policy.default_target ? `${policy.default_target.type}: ${policy.default_target.name}` : 'Not set'} />
+							<Item label="Replies go to" value={policy.default_target ? `${policy.default_target.type}: ${policy.default_target.name}` : 'No default agent'} />
 						</dl>
 
 						{editHref && (

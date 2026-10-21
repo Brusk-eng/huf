@@ -1,10 +1,12 @@
 import { Link } from 'react-router-dom';
 import { Check, CheckCheck, Circle, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { MessageLogItem } from '@/services/whatsappApi';
 import { cn } from '@/lib/utils';
-import { agentRunPath, errorInfo, sentByLabel, statusTicks, statusTimeline, type TickTone } from './messageLogModel';
+import { agentRunPath, displayStatus, errorInfo, sentByLabel, statusTicks, statusTimeline, type TickTone } from './messageLogModel';
+import { TimeStamp } from './TimeStamp';
 import { TemplateSend } from './TemplateSend';
 
 export const TONE_CLASS: Record<TickTone, string> = { neutral: 'text-steel', good: 'text-good', danger: 'text-destructive' };
@@ -18,6 +20,8 @@ export function StatusTicks({ status }: { status?: string | null }) {
     </span>
   );
 }
+
+const Empty = () => <span className="text-steel">&mdash;</span>;
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -62,27 +66,32 @@ export function MessageDetailSheet({
                   ))}
                 </ol>
               ) : (
-                <StatusTicks status={item.status} />
+                <StatusTicks status={displayStatus(item)} />
               )}
               {item.error && (
                 <div role="alert" className="space-y-1">
                   <ErrorBadge error={item.error} />
                   <p className="text-xs text-ink">{errorInfo(item.error)?.hint}</p>
-                  <p className="text-xs text-destructive">{item.error}</p>
+                  <Collapsible>
+                    <CollapsibleTrigger className="text-xs text-steel underline">Technical details</CollapsibleTrigger>
+                    <CollapsibleContent>
+                      <p className="mt-1 break-words text-xs text-destructive">{item.error}</p>
+                    </CollapsibleContent>
+                  </Collapsible>
                 </div>
               )}
             </div>
             <dl className="grid grid-cols-2 gap-3">
-              <Field label="Time">{item.creation}</Field>
+              <Field label="Time"><TimeStamp value={item.creation} /></Field>
               <Field label="Gateway">{item.gateway}</Field>
               <Field label="Type">{item.content_type || 'text'}</Field>
-              <Field label="Template">{item.template ? <Badge variant="chip">{item.template}</Badge> : 'None'}</Field>
+              <Field label="Template">{item.template ? <Badge variant="chip">{item.template}</Badge> : <Empty />}</Field>
               <Field label="Handled by">{sentByLabel(item.sent_by, agentTitle ?? item.agent)}</Field>
-              <Field label="Message ID"><span className="break-all font-mono">{item.message_id || 'None'}</span></Field>
+              <Field label="Message ID"><span className="break-all font-mono">{item.message_id || <Empty />}</span></Field>
             </dl>
             <div className="flex flex-wrap gap-3 text-xs">
               {runPath && <Link to={runPath} className="text-signal-ink underline">Open agent run</Link>}
-              {item.event && <a href={`/app/gateway-event/${encodeURIComponent(item.event)}`} target="_blank" rel="noreferrer" className="text-signal-ink underline">Open gateway event</a>}
+              {item.event && <a href={`/app/gateway-event/${encodeURIComponent(item.event)}`} target="_blank" rel="noreferrer" className="text-signal-ink underline">View full event record</a>}
             </div>
             <div className="space-y-1 border-t border-line pt-4">
               <h4 className="text-xs font-semibold text-ink">Send template to this number</h4>

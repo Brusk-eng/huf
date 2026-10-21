@@ -58,7 +58,7 @@ export function SettingsTab({ gateway, accounts, connectorAvailable, onCheckToke
 						</div>
 						<div>
 							<dt className="text-xs text-steel">Phone number ID</dt>
-							<dd className="font-mono text-sm text-ink">{gateway.phone_number_id || 'Not set'}</dd>
+							<dd className="font-mono text-sm text-ink">{gateway.phone_number_id || 'Not added yet'}</dd>
 						</div>
 						<div>
 							<dt className="text-xs text-steel">Linked WhatsApp account</dt>

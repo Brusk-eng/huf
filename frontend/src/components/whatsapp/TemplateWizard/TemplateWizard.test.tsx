@@ -46,13 +46,13 @@ describe('step 1', () => {
   it('gates Next on a selectable type and disables unavailable ones', () => {
     setup();
     const nextBtn = screen.getByRole('button', { name: 'Next' });
-    expect(nextBtn).toBeDisabled();
+    expect(screen.getByRole('radio', { name: /Default/ })).toBeChecked();
+    expect(nextBtn).toBeEnabled();
     expect(screen.getByRole('tab', { name: 'Authentication' })).toBeDisabled();
+    expect(screen.queryByText(/Authentication:/, { selector: 'p' })).toBeNull();
     expect(screen.getAllByText('Coming soon').length).toBeGreaterThan(0);
     expect(screen.getByRole('radio', { name: /Catalogue/ })).toBeDisabled();
     expect(screen.getByRole('link', { name: /template library/ })).toHaveAttribute('rel', 'noopener noreferrer');
-    fireEvent.click(screen.getByRole('radio', { name: /Default/ }));
-    expect(nextBtn).toBeEnabled();
     next();
     expect(screen.getByRole('region', { name: 'Write it' })).toBeInTheDocument();
   });

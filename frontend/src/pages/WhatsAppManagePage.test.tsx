@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 
@@ -128,11 +128,36 @@ describe('WhatsAppManagePage', () => {
 		api.getSetupStatus.mockResolvedValueOnce({ ok: true, data: { success: true, connector_available: true, gateways: [] } });
 		const first = open('/');
 		expect(await screen.findByText('No WhatsApp gateway yet')).toBeInTheDocument();
+		expect(screen.getByText('Connect your first WhatsApp number')).toBeInTheDocument();
+		expect(screen.getByRole('link', { name: 'Add a WhatsApp gateway' })).toHaveAttribute('href', '/gateways');
+		expect(screen.queryAllByRole('tab')).toHaveLength(0);
 		first.unmount();
 		api.getSetupStatus.mockResolvedValueOnce({ ok: false, error: 'Boom' });
 		open('/');
 		expect(await screen.findByText('Boom')).toBeInTheDocument();
 		await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
 		expect(await screen.findByText(/steps left/)).toBeInTheDocument();
+	});
+
+	it('a live token check that fails turns the health blocked and the credentials step off green', async () => {
+		api.checkToken.mockResolvedValue({
+			ok: true,
+			data: { valid: false, token_type: null, expires_at: null, missing_scopes: [], waba_ids: [], phone: null, webhook_subscribed: null, checked_at: null, source: null, message: 'The token has expired.' },
+		});
+		open('/');
+		await screen.findByText(/steps left/);
+		const credentialsItem = () => screen.getByText(/^(Add your credentials|Replace access token)$/, { selector: 'p' }).closest('li') as HTMLElement;
+		expect(within(credentialsItem()).getByLabelText('Done')).toBeInTheDocument();
+		await userEvent.click(screen.getByRole('button', { name: 'Check now' }));
+		const alert = await screen.findByRole('alert');
+		expect(alert).toHaveTextContent('The token has expired.');
+		await waitFor(() => expect(within(credentialsItem()).getByLabelText('Blocked')).toBeInTheDocument());
+		expect(within(credentialsItem()).queryByLabelText('Done')).toBeNull();
+		// banner, checklist and token card agree: replace the token, same action
+		expect(credentialsItem()).toHaveTextContent('Replace access token');
+		const links = screen.getAllByRole('link', { name: 'Replace access token' });
+		expect(links.length).toBeGreaterThanOrEqual(2);
+		for (const l of links) expect(l.getAttribute('href')).toMatch(/#credentials$/);
+		expect(screen.getByText(/Meta rejected this token/)).toBeInTheDocument();
 	});
 });

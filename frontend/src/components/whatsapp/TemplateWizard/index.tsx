@@ -64,7 +64,7 @@ export function TemplateWizard(props: TemplateWizardProps) {
 
   const [step, setStep] = useState(isEdit ? WRITE : 0);
   const [draft, setDraft] = useState<TemplateWizardDraft>(() => initial ?? emptyDraft());
-  const [kindId, setKindId] = useState(() => (initial ? `${initial.category.toLowerCase()}_default` : ''));
+  const [kindId, setKindId] = useState(() => (initial ? `${initial.category.toLowerCase()}_default` : 'marketing_default'));
   const [touched, setTouched] = useState<ReadonlySet<string>>(new Set());
   const [attempts, setAttempts] = useState(0);
   const [serverFields, setServerFields] = useState<Record<string, string>>({});

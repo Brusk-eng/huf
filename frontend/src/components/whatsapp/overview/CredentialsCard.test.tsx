@@ -60,7 +60,7 @@ describe('CredentialsCard', () => {
 		expect(screen.getByText('Send and receive messages')).toBeInTheDocument();
 		expect(screen.getByText('Manage templates and account')).toBeInTheDocument();
 		expect(screen.getByText(/User token\. Expires/)).toBeInTheDocument();
-		expect(screen.getByText('Webhook subscribed: Unknown')).toBeInTheDocument();
+		expect(screen.getByText('Webhook subscribed: Not checked yet')).toBeInTheDocument();
 	});
 
 	it('shows a friendly rate-limit message', async () => {
@@ -86,5 +86,13 @@ describe('CredentialsCard', () => {
 		render(<CredentialsCard {...base} integrationSettingsHref="/s" />);
 		await user.click(screen.getByText('Rotating a secret'));
 		expect(screen.getByRole('link', { name: 'integration settings' })).toHaveAttribute('href', '/s');
+	});
+
+	it('flags a rejected token and offers a replace action instead of Saved', () => {
+		render(<CredentialsCard {...base} tokenCheck={check({ valid: false })} integrationSettingsHref="/app/gateway/GW" />);
+		expect(screen.getByText('Meta rejected this token')).toBeInTheDocument();
+		expect(screen.getAllByText('Saved')).toHaveLength(2);
+		expect(screen.getByRole('link', { name: 'Replace access token' })).toHaveAttribute('href', '/app/gateway/GW');
+		expect(screen.queryByText('Not checked yet')).toBeNull();
 	});
 });
