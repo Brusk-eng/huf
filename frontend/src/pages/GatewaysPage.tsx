@@ -51,6 +51,7 @@ import { getIntegrationSettings } from '@/services/integrationApi';
 import type { IntegrationSettingsDoc } from '@/types/integration.types';
 import { cn } from '@/lib/utils';
 import { formatTimeAgo } from '@/utils/time';
+import { gatewayErrorText } from '@/utils/gatewayErrorCopy';
 import { getGatewayReadiness } from '@/utils/gatewayReadiness';
 import { getGatewayWebhookUrl } from '@/utils/gatewayWebhook';
 import { getFrappeErrorMessage } from '@/lib/frappe-error';
@@ -546,15 +547,14 @@ export default function GatewaysPage() {
             <Link2 className="h-6 w-6" />
           </div>
           <div className="space-y-2">
-            <h2 className="font-display text-base font-semibold text-ink">Channel gateways &amp; messaging ingress</h2>
+            <h2 className="font-display text-base font-semibold text-ink">Gateways</h2>
             <p className="max-w-3xl text-sm text-steel leading-relaxed">
-              Gateways serve as safe front doors from external messaging channels (WhatsApp, Messenger,
-              Instagram, Telegram, Slack, Email) directly into Huf. Incoming messages are verified, checked
-              against security admission policies, and routed to your designated Agents or Flows.
+              Gateways connect your messaging channels (WhatsApp, Messenger, Instagram, Telegram, Slack, Email)
+              to Huf. Incoming messages are checked and passed to the agent or flow you choose.
             </p>
             <div className="flex items-center gap-2 text-xs font-medium text-steel">
               <ShieldCheck className="h-4 w-4 text-good" />
-              Live webhooks automatically authenticate signatures and enforce allowlists before executing AI tasks.
+              Only approved senders can reach your agents.
             </div>
           </div>
         </div>
@@ -655,7 +655,9 @@ export default function GatewaysPage() {
               }
               description={gateway.description || providerNames[gateway.provider] || `${gateway.provider} channel`}
               status={
-                readiness.ready
+                readiness.ready && gateway.last_error
+                  ? { label: 'Needs attention', variant: 'destructive' }
+                  : readiness.ready
                   ? { label: 'Active', variant: 'default' }
                   : {
                       // Keep this short: the status slot sits inline beside the card title and
@@ -701,7 +703,7 @@ export default function GatewaysPage() {
                     {gateway.last_error ? (
                       <>
                         <AlertTriangle className="h-3 w-3 shrink-0 text-destructive" />
-                        <span className="line-clamp-1 text-destructive">{gateway.last_error}</span>
+                        <span className="line-clamp-1 text-destructive" title={gatewayErrorText(gateway.last_error)}>{gatewayErrorText(gateway.last_error)}</span>
                       </>
                     ) : (
                       <span>Last event: {gateway.last_event_at ? formatTimeAgo(gateway.last_event_at) : 'No messages yet'}</span>
@@ -956,7 +958,7 @@ export default function GatewaysPage() {
 
               {/* GW-18: room/group-chat admission policy */}
               <div className="grid gap-3 rounded-lg border border-line bg-paper p-4">
-                <p className="text-xs font-semibold text-ink">Room &amp; group chat admission</p>
+                <p className="text-xs font-semibold text-ink">Group chats</p>
                 <div className="grid grid-cols-2 gap-3">
                   <label className="grid gap-1 text-xs font-medium text-ink">
                     Room policy
