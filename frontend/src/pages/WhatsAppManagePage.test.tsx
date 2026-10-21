@@ -138,4 +138,16 @@ describe('WhatsAppManagePage', () => {
 		await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
 		expect(await screen.findByText(/steps left/)).toBeInTheDocument();
 	});
+
+	it('a live token check that fails turns the health blocked and the credentials step off green', async () => {
+		api.checkToken.mockResolvedValue({
+			ok: true,
+			data: { valid: false, token_type: null, expires_at: null, missing_scopes: [], waba_ids: [], phone: null, webhook_subscribed: null, checked_at: null, source: null, message: 'The token has expired.' },
+		});
+		open('/');
+		await screen.findByText(/steps left/);
+		await userEvent.click(screen.getByRole('button', { name: 'Check now' }));
+		const alert = await screen.findByRole('alert');
+		expect(alert).toHaveTextContent('The token has expired.');
+	});
 });
