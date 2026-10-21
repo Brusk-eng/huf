@@ -57,6 +57,13 @@ def _log_ignored(reason: str) -> None:
 		pass
 
 
+def _log_info(line: str) -> None:
+	try:
+		frappe.logger("huf.whatsapp").info(line)
+	except Exception:
+		pass
+
+
 class WhatsAppWindowClosed(frappe.ValidationError):
 	"""The 24h customer-service window is closed and no template fallback is configured."""
 
@@ -301,6 +308,12 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		msg_type = msg.get("type") or "text"
 		provider_event_id = str(msg.get("id") or "").strip()
 		sender = bridge.normalize_phone(msg.get("from"))
+		bsuid = bridge.normalize_phone(msg.get("from_user_id") or msg.get("user_id"))
+		if not bridge.is_bsuid(bsuid):
+			bsuid = ""
+		if not sender and bsuid:
+			sender = bsuid  # BSUID-only sender: key kept verbatim, never digit-normalised
+			_log_info(f"WhatsApp bsuid_only_sender ingested tail=...{bsuid[-4:]}")
 		if not provider_event_id or not sender:
 			return None
 		display = bridge.normalize_phone(metadata.get("display_phone_number"))
@@ -309,13 +322,13 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			_log_ignored("echo_shaped_message_dropped")
 			return None
 		try:
-			return self._build_event(msg, msg_type, provider_event_id, sender, metadata, names)
+			return self._build_event(msg, msg_type, provider_event_id, sender, metadata, names, bsuid)
 		except Exception:  # never let one odd message break a batch
 			return None
 
 	def _build_event(
 		self, msg: dict, msg_type: str, provider_event_id: str, sender: str,
-		metadata: Mapping[str, Any], names: Mapping[str, str],
+		metadata: Mapping[str, Any], names: Mapping[str, str], bsuid: str = "",
 	) -> NormalizedGatewayEvent | None:
 		emoji, reaction_to = "", ""
 		kind = inbound.message_kind(msg_type)
@@ -352,6 +365,8 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			"reply_to_message_id": quoted,
 			"forwarded": bool(context.get("forwarded") or context.get("frequently_forwarded")),
 		}
+		if bsuid:
+			raw["bsuid"] = bsuid  # kept next to the phone key for a later identity merge
 		referral = msg.get("referral") if isinstance(msg.get("referral"), dict) else {}
 		if referral:
 			raw["referral"] = {
@@ -379,7 +394,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			thread_id=None,  # A2: quoted id stays in raw_payload only
 			is_room=False,
 			raw_payload=raw,
-			display_name=names.get(sender, ""),
+			display_name=names.get(sender) or names.get(bsuid, ""),
 			attachments=tuple(attachments),
 			kind=kind,
 			reaction_emoji=emoji,
@@ -747,7 +762,7 @@ def _contact_names(value: Mapping[str, Any]) -> dict[str, str]:
 	names: dict[str, str] = {}
 	for contact in _as_list(value.get("contacts")):
 		if isinstance(contact, dict):
-			wa_id = bridge.normalize_phone(contact.get("wa_id"))
+			wa_id = bridge.normalize_phone(contact.get("wa_id") or contact.get("user_id"))
 			name = (contact.get("profile") or {}).get("name") if isinstance(contact.get("profile"), dict) else ""
 			if wa_id and name:
 				names[wa_id] = str(name)
