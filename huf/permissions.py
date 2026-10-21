@@ -270,6 +270,22 @@ def has_capability(user: str | None, capability: str) -> bool:
 	return capability in get_user_capabilities(user)
 
 
+def is_gateway_admin(user: str | None = None) -> bool:
+	"""
+	Single authority for Gateway access-entry administration (list, approve, revoke).
+
+	True for Administrator, System Manager, any user whose Huf Role is
+	``Huf Admin`` and anyone holding ``system.integrations.manage``.
+	"""
+	if not user:
+		user = frappe.session.user
+	if user == ADMINISTRATOR or _is_system_manager(user):
+		return True
+	if get_user_huf_role(user) == "Huf Admin":
+		return True
+	return has_capability(user, "system.integrations.manage")
+
+
 # ---------------------------------------------------------------------------
 # Frappe app-screen hook
 # ---------------------------------------------------------------------------

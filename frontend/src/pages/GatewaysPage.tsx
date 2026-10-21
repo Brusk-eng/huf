@@ -205,7 +205,7 @@ export default function GatewaysPage() {
   async function handleApproveEntry(entry: GatewayAccessEntry) {
     setRowActionName(entry.name);
     try {
-      await approveGatewayPairing(entry.pairing_code || entry.name);
+      await approveGatewayPairing(entry.name);
       toast.success(`Approved ${entry.display_label || entry.external_id}.`);
       setPendingEntries((prev) => prev.filter((e) => e.name !== entry.name));
     } catch (err) {
