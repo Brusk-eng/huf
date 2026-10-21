@@ -120,7 +120,17 @@ export function HealthBanner({ gateway, loading, checking, onCheck, onTurnOn }: 
 						<AlertTitle className="mb-0 leading-snug">{title}</AlertTitle>
 						{detail ? <AlertDescription className="mt-1">{detail}</AlertDescription> : null}
 					</div>
-					{action}
+					<div className="flex flex-wrap items-center gap-2">
+						{action}
+						<Button variant="outline" size="sm" onClick={onCheck} disabled={checking}>
+							{checking ? (
+								<Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+							) : (
+								<RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+							)}
+							{checking ? BANNER_CHECKING : BANNER_CHECK_NOW}
+						</Button>
+					</div>
 				</div>
 			</Alert>
 			<div className="flex flex-wrap items-center gap-2">
@@ -134,14 +144,6 @@ export function HealthBanner({ gateway, loading, checking, onCheck, onTurnOn }: 
 			<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-steel">
 				<span>{lastMessage}</span>
 				{checked ? <span>{checked}</span> : null}
-				<Button variant="ghost" size="sm" onClick={onCheck} disabled={checking}>
-					{checking ? (
-						<Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
-					) : (
-						<RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden />
-					)}
-					{checking ? BANNER_CHECKING : BANNER_CHECK_NOW}
-				</Button>
 			</div>
 		</div>
 	);

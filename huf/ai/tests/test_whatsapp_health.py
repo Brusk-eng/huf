@@ -151,6 +151,19 @@ class TestEvaluate(unittest.TestCase):
 
 
 class TestEventCounts(unittest.TestCase):
+	def test_invalid_token_blocks_and_credentials_not_done(self):
+		r = wh.evaluate(facts(token_valid=False), NOW)
+		self.assertEqual(r["health"], "blocked")
+		self.assertIn("access_token_invalid", codes(r))
+		self.assertEqual(states(r)["credentials"], "blocked")
+		self.assertEqual(r["next_step"]["code"], "fix_access_token")
+
+	def test_valid_or_unknown_token_check_changes_nothing(self):
+		for value in (True, None):
+			r = wh.evaluate(facts(token_valid=value), NOW)
+			self.assertEqual(r["health"], "healthy")
+			self.assertEqual(states(r)["credentials"], "done")
+
 	def test_events_24h_counting(self):
 		rows = [
 			{"status": "Succeeded", "reply_status": "delivered", "delivery_error": ""},

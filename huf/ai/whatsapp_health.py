@@ -109,7 +109,7 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	"""Pure: facts -> health, reasons, next_step, checklist.
 
 	``facts`` keys: enabled, has_integration, access_token_present, phone_number_id_present,
-	verify_token_present, app_secret_present, app_id_present, account_phone_mismatch,
+	verify_token_present, app_secret_present, app_id_present, account_phone_mismatch, token_valid (bool|None, last live check),
 	last_event_at, signature_failure_at, verify_ok_at, last_error, events_ever (int), replied_ever (bool), events_24h (dict),
 	fallback_template (str), fallback_template_approved (bool|None), fallback_template_status.
 	"""
@@ -121,6 +121,8 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	secret = bool(facts.get("app_secret_present"))
 	app_id = bool(facts.get("app_id_present"))
 	mismatch = bool(facts.get("account_phone_mismatch"))
+	# Meta said the stored token is expired or revoked (last cached live check); None = never checked.
+	token_invalid = token and facts.get("token_valid") is False
 	last_event_at = facts.get("last_event_at")
 	last_error = str(facts.get("last_error") or "").strip()
 	events_ever = int(facts.get("events_ever") or 0)
@@ -137,6 +139,14 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	reasons: list[dict[str, str]] = []
 	if not token:
 		reasons.append(_reason("access_token_missing", "error", "The access token is missing."))
+	if token_invalid:
+		reasons.append(
+			_reason(
+				"access_token_invalid",
+				"error",
+				"Meta rejected the access token. It may have expired; replace it in Settings.",
+			)
+		)
 	if not phone:
 		reasons.append(_reason("phone_number_id_missing", "error", "The phone number ID is missing."))
 	if not verify:
@@ -230,7 +240,7 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	credentials_ok = token and phone and verify
 	steps_state = {
 		"meta_app": "done" if (app_id or token) else "todo",
-		"credentials": "blocked" if mismatch else ("done" if credentials_ok else "todo"),
+		"credentials": "blocked" if (mismatch or token_invalid) else ("done" if credentials_ok else "todo"),
 		"webhook": "done" if (verify_ok_at or last_event_at or events_ever) else ("blocked" if not verify else "todo"),
 		"subscribed": "done" if events_ever else ("blocked" if not verify else "todo"),
 		"app_secret": "done" if secret else "todo",
@@ -254,6 +264,8 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	next_step = None
 	if mismatch:
 		next_step = {"code": "fix_account_link", "label": "Link the WhatsApp account that owns this number", "action_url": "#credentials"}
+	elif token_invalid:
+		next_step = {"code": "fix_access_token", "label": "Replace the expired access token", "action_url": "#credentials"}
 	else:
 		for key, code, label, url in _STEPS:
 			if steps_state[key] != "done":
@@ -419,6 +431,19 @@ def _gateway_stamp(gateway: dict[str, Any], field: str) -> datetime | None:
 		return None
 
 
+def _cached_token_valid(gateway_name: str) -> bool | None:
+	"""Outcome of the last live token check, from cache only (no network). None when unknown."""
+	try:
+		from huf.ai.whatsapp_token_check import _result_key
+
+		cached = frappe.cache().get_value(_result_key(gateway_name))
+	except Exception:
+		return None
+	if isinstance(cached, dict) and cached.get("valid") in (True, False):
+		return bool(cached["valid"])
+	return None
+
+
 def build_health(
 	gateway: dict[str, Any],
 	presence: dict[str, bool],
@@ -443,6 +468,7 @@ def build_health(
 	last_error = redact(gateway.get("last_error") or "")
 	phone_present = bool(presence.get("phone_number_id") or own_phone)
 	facts = {
+		"token_valid": _cached_token_valid(name),
 		"enabled": gateway.get("is_enabled"),
 		"has_integration": bool(gateway.get("integration_settings")),
 		"access_token_present": presence.get("access_token"),

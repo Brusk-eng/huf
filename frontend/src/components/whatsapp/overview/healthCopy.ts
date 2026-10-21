@@ -27,6 +27,7 @@ export const CHECK_LABELS = {
 
 export const REASON_FALLBACK: Record<string, string> = {
 	access_token_missing: 'Blocked: add the access token from Meta.',
+	access_token_invalid: 'Meta rejected the access token. It may have expired; replace it in Settings.',
 	phone_number_id_missing: 'Blocked: add the phone number ID from Meta.',
 	verify_token_missing: "Add the verify token so Meta can confirm this gateway's callback URL.",
 	app_secret_missing: 'Add the app secret so we can confirm messages really come from Meta.',
