@@ -137,7 +137,15 @@ def run_once(
 	gateway: str, key: str, action: str, send: Callable[[], str], run: str = "", recipient: str = ""
 ) -> str:
 	"""Run ``send`` (returns the tool's JSON) at most once per ``key``."""
-	if not _claim(gateway, key, action, run, recipient):
+	try:
+		claimed = _claim(gateway, key, action, run, recipient)
+	except Exception:
+		frappe.log_error(title="WhatsApp send key claim failed")
+		return json.dumps({  # fail closed: an unrecorded send could not be capped or deduplicated
+			"success": False, "error": "send_unavailable", "definite": True,
+			"message": "The send could not be recorded, so it was not sent.",
+		})
+	if not claimed:
 		row = frappe.db.get_value(DOCTYPE, key, ["status", "result"], as_dict=True)
 		if row and row.status == "Sent" and row.result:
 			original = json.loads(row.result)

@@ -120,7 +120,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 	def test_settings_read_failure_fails_closed(self):
 		with patch.object(whatsapp.frappe.db, "get_value", side_effect=RuntimeError("db down")):
 			result = self._send(allow_proactive=True)
-		self.assertEqual(result["error"], "proactive_send_not_permitted")
+		self.assertFalse(result["success"])
 		self.post.assert_not_called()
 
 	def test_open_window_allows_send_without_flag(self):
