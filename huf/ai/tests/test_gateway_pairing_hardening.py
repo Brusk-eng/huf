@@ -218,7 +218,10 @@ class _GatewayFixture:
 		frappe.get_doc(
 			{"doctype": "Gateway", "gateway_name": name, "provider": provider, "is_enabled": 0, "direct_policy": policy}
 		).insert(ignore_permissions=True)
-		values = {"is_enabled": 1, "execution_user": "Administrator", "integration_settings": "x", "direct_policy": policy}
+		values = {
+			"is_enabled": 1, "execution_user": "Administrator", "integration_settings": "x",
+			"direct_policy": policy, "pairing_reply_enabled": 1,  # reply default is OFF; these tests exercise the reply path
+		}
 		values.update(extra)
 		frappe.db.set_value("Gateway", name, values)
 		self.gateways.append(name)

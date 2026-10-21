@@ -15,11 +15,6 @@ MASKED = re.compile(r"^\*+[A-Z0-9]{2}$")
 
 
 class _Fixture(_GatewayFixture):
-	def setUp(self):
-		super().setUp()
-		# Existing fixture tests assume pairing replies are sent; default is now OFF so opt in here.
-		self._orig_make = self.make_gateway
-
 	def make_gateway(self, label, **kw):
 		kw.setdefault("pairing_reply_enabled", 1)
 		return super().make_gateway(label, **kw)
@@ -88,6 +83,7 @@ class TestAudit(_Fixture, IntegrationTestCase):
 
 class TestAdminAuthority(_Fixture, IntegrationTestCase):
 	def _as(self, huf_role, frappe_roles=("Guest",)):
+		frappe.set_user("wp2.tester@example.com")
 		for p in (
 			patch.object(gsvc.frappe, "get_roles", return_value=list(frappe_roles)),
 			patch("huf.permissions.get_user_huf_role", return_value=huf_role),
