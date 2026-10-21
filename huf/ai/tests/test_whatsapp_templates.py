@@ -153,6 +153,8 @@ class TestSendBuilders(unittest.TestCase):
 		self.assertTrue(wt.validate_media_request("image", "", "", "", "")[1])  # neither link nor id
 		self.assertTrue(wt.validate_media_request("image", "https://x.example/a.png", "ID", "", "")[1])  # both
 		self.assertTrue(wt.validate_media_request("audio", "https://x.example/a.mp3", "", "caption", "")[1])
-		self.assertTrue(wt.validate_media_request("sticker", "https://x.example/a.webp", "", "", "")[1])
+		self.assertTrue(wt.validate_media_request("gif", "https://x.example/a.gif", "", "", "")[1])  # unknown kind
+		self.assertEqual(wt.validate_media_request("sticker", "https://x.example/a.webp", "", "", "")[1], [])
+		self.assertTrue(wt.validate_media_request("sticker", "https://x.example/a.webp", "", "caption", "")[1])
 		media, _ = wt.validate_media_request("image", "", "MID1", "", "")
 		self.assertEqual(wt.build_media_payload("1555", media)["image"], {"id": "MID1"})

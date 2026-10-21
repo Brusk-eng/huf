@@ -6,8 +6,9 @@
 Single consolidated tool that performs WhatsApp Cloud API actions via an
 `action` parameter.
 
-Actions: send_message, send_media, send_template, list_messages,
-get_account_info, list_templates, create_template, get_template_status.
+Actions: send_message, send_media, send_image, send_video, send_audio, send_document, send_sticker,
+send_location, send_contact, send_reaction, send_buttons, send_list, send_cta_url, send_template,
+list_messages, get_account_info, list_templates, create_template, get_template_status.
 
 Privilege gating (A8)
 ---------------------
@@ -33,8 +34,12 @@ Credentials (``access_token``, ``phone_number_id``) are never tool
 parameters: tool arguments are persisted in Agent Tool Call, so any such
 keys supplied in a call are popped and discarded.
 
-``send_media`` (image/document/audio/video by public ``link``) is free-form
-too and follows exactly the same proactive logic and flags as ``send_message``.
+``send_media`` (image/document/audio/video/sticker by public ``link`` or uploaded ``media_id``) and every
+other non-text type (``send_image``/``send_video``/``send_audio``/``send_document``/``send_sticker`` are
+``send_media`` with the kind preset; ``send_location``, ``send_contact``, ``send_reaction``, ``send_buttons``,
+``send_list``, ``send_cta_url``) are free-form too and follow exactly the same proactive logic and flags as
+``send_message``. In addition, when a ``gateway_name`` is given, a contact who opted out (STOP) is refused with
+``opted_out`` whatever the flags say.
 
 A free-form ``send_message`` is proactive unless ``gateway_name`` is given
 and ``bridge.window_state(gateway_name, to)`` reports an open window. When a
@@ -55,6 +60,7 @@ import frappe
 import requests
 
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+from huf.ai.gateway_adapters import whatsapp_messages as wm
 from huf.ai.gateway_adapters import whatsapp_templates as wt
 
 META_GRAPH_URL = f"https://graph.facebook.com/{bridge.GRAPH_DEFAULT_VERSION}"
@@ -74,6 +80,14 @@ def _refused(code: str, message: str) -> str:
 	return json.dumps({"success": False, "error": code, "message": message}, default=str)
 
 
+_MEDIA_ACTIONS = {
+	"send_image": "image",
+	"send_video": "video",
+	"send_audio": "audio",
+	"send_document": "document",
+	"send_sticker": "sticker",
+}
+_INTERACTIVE_ACTIONS = {"send_buttons": "buttons", "send_list": "list", "send_cta_url": "cta_url"}
 _PRIVILEGE_FLAGS = ("allow_proactive", "allow_whatsapp_management", "auto_submit_templates")
 _CREDENTIAL_KWARGS = ("access_token", "phone_number_id")
 
@@ -177,6 +191,16 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		return _send_message(kwargs)
 	elif action == "send_media":
 		return _send_media(kwargs)
+	elif action in _MEDIA_ACTIONS:
+		return _send_media({**kwargs, "kind": _MEDIA_ACTIONS[action]})
+	elif action == "send_location":
+		return _send_location(kwargs)
+	elif action == "send_contact":
+		return _send_contact(kwargs)
+	elif action == "send_reaction":
+		return _send_reaction(kwargs)
+	elif action in _INTERACTIVE_ACTIONS:
+		return _send_interactive(kwargs, _INTERACTIVE_ACTIONS[action])
 	elif action == "send_template":
 		return _send_template(kwargs)
 	elif action == "list_messages":
@@ -191,8 +215,10 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		return _get_template_status(kwargs)
 	else:
 		return _error(
-			f"Unknown action '{action}'. Supported actions: send_message, send_media, send_template, "
-			"list_messages, get_account_info, list_templates, create_template, get_template_status"
+			f"Unknown action '{action}'. Supported actions: send_message, send_media, send_image, send_video, "
+			"send_audio, send_document, send_sticker, send_location, send_contact, send_reaction, send_buttons, "
+			"send_list, send_cta_url, send_template, list_messages, get_account_info, list_templates, "
+			"create_template, get_template_status"
 		)
 
 
@@ -338,42 +364,57 @@ def _json_list(value: Any) -> Optional[list]:
 	return value if isinstance(value, list) else None
 
 
-def _send_media(kwargs: dict) -> str:
-	"""Send an image/document/audio/video by public link (window / proactive gated like send_message)."""
-	recipient = bridge.normalize_phone(kwargs.get("to") or kwargs.get("recipient") or kwargs.get("phone_number") or "")
-	if not recipient:
-		return _error("Recipient phone number ('to') is required")
-	media, errors = wt.validate_media_request(
-		kwargs.get("kind") or kwargs.get("media_type"),
-		kwargs.get("link") or kwargs.get("url"),
-		kwargs.get("media_id"),
-		kwargs.get("caption"),
-		kwargs.get("filename"),
-	)
-	if errors:
-		return json.dumps(wt.validation_error(errors), default=str)
+def _recipient(kwargs: dict) -> str:
+	return bridge.normalize_phone(kwargs.get("to") or kwargs.get("recipient") or kwargs.get("phone_number") or "")
 
+
+def _is_opted_out(kwargs: dict, recipient: str) -> bool:
+	"""True when the named gateway's contact opted out (STOP). Without a (known) gateway there is nothing to check."""
+	gateway_name = (kwargs.get("gateway_name") or "").strip()
+	if not gateway_name:
+		return False
+	try:
+		if not frappe.db.exists("Gateway", gateway_name):
+			return False
+		from huf.ai import gateway_service
+
+		return bool(gateway_service.is_opted_out(gateway_name, recipient))
+	except Exception:
+		return True  # fail closed
+
+
+def _free_form_refusal(kwargs: dict, recipient: str, what: str) -> Optional[str]:
+	"""Server-side gate of every free-form non-text send: opt-out, then window / allow_proactive."""
+	if _is_opted_out(kwargs, recipient):
+		return _refused("opted_out", "This contact opted out (STOP); no messages are sent until they opt back in (START).")
 	if _is_proactive_send(kwargs, recipient) and not (
 		_server_flag("allow_proactive") or _server_flag("allow_whatsapp_management")
 	):
 		return _refused(
 			"proactive_send_not_permitted",
-			"No open 24h window for this number. Enable allow_proactive to send free-form media.",
+			f"No open 24h window for this number. Enable allow_proactive to send {what}.",
 		)
+	return None
 
+
+def _deliver_typed(kwargs: dict, recipient: str, built: tuple, bridge_call: Any, what: str) -> str:
+	"""Validate (no network), gate, then send through the bridge account or, without one, straight to Graph."""
+	payload, errors = built
+	if errors or payload is None:
+		return json.dumps(wt.validation_error(errors), default=str)
+	refusal = _free_form_refusal(kwargs, recipient, what)
+	if refusal:
+		return refusal
 	acct = _resolve_bridge_account(kwargs)
 	if acct:
 		try:
-			res = bridge.send_media(
-				acct["name"], recipient, media["kind"], link=media["link"], media_id=media["media_id"],
-				caption=media["caption"], filename=media["filename"],
-			)
+			res = bridge_call(acct["name"])
 		except bridge.BridgeError as e:
 			return json.dumps(e.payload, default=str)
 		except frappe.PermissionError:
 			return _refused("permission_denied", "Not permitted to send WhatsApp messages")
 		except Exception as e:
-			return _error(f"Failed to send WhatsApp media: {str(e)}")
+			return _error(f"Failed to send WhatsApp {what}: {str(e)}")
 		return _success({"message_id": res.get("message_id"), "recipient": recipient, "status": "sent", "name": res.get("name")})
 
 	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
@@ -382,7 +423,7 @@ def _send_media(kwargs: dict) -> str:
 	try:
 		res = requests.post(
 			f"{_graph_root()}/{phone_number_id}/messages",
-			json=wt.build_media_payload(recipient, media),
+			json=payload,
 			headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
 			timeout=15,
 		)
@@ -391,7 +432,118 @@ def _send_media(kwargs: dict) -> str:
 			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
 		return _success({"message_id": data.get("messages", [{}])[0].get("id"), "recipient": recipient, "status": "sent"})
 	except Exception as e:
-		return _error(f"Failed to send WhatsApp media: {str(e)}")
+		return _error(f"Failed to send WhatsApp {what}: {str(e)}")
+
+
+def _send_media(kwargs: dict) -> str:
+	"""Send an image/video/audio/document/sticker by public link or media id (window / proactive gated like send_message)."""
+	recipient = _recipient(kwargs)
+	if not recipient:
+		return _error("Recipient phone number ('to') is required")
+	media, errors = wt.validate_media_request(
+		kwargs.get("kind") or kwargs.get("media_type"),
+		kwargs.get("link") or kwargs.get("url"),
+		kwargs.get("media_id"),
+		kwargs.get("caption"),
+		kwargs.get("filename"),
+		kwargs.get("voice"),
+	)
+	if errors:
+		return json.dumps(wt.validation_error(errors), default=str)
+	payload = wt.build_media_payload(recipient, media, (kwargs.get("reply_to") or "").strip() or None)
+	return _deliver_typed(
+		kwargs, recipient, (payload, []),
+		lambda account: bridge.send_media(
+			account, recipient, media["kind"], link=media["link"], media_id=media["media_id"],
+			caption=media["caption"], filename=media["filename"], voice=media["voice"],
+			reply_to=(kwargs.get("reply_to") or "").strip() or None,
+		),
+		"media",
+	)
+
+
+def _send_location(kwargs: dict) -> str:
+	recipient = _recipient(kwargs)
+	if not recipient:
+		return _error("Recipient phone number ('to') is required")
+	args = (kwargs.get("latitude"), kwargs.get("longitude"), kwargs.get("name"), kwargs.get("address"))
+	reply_to = (kwargs.get("reply_to") or "").strip() or None
+	return _deliver_typed(
+		kwargs, recipient, wm.build_location_payload(recipient, *args, reply_to),
+		lambda account: bridge.send_location(account, recipient, *args[:2], name=args[2], address=args[3], reply_to=reply_to),
+		"a location",
+	)
+
+
+def _send_contact(kwargs: dict) -> str:
+	recipient = _recipient(kwargs)
+	if not recipient:
+		return _error("Recipient phone number ('to') is required")
+	contacts = kwargs.get("contacts")
+	if isinstance(contacts, str) and contacts.strip():
+		try:
+			contacts = json.loads(contacts)
+		except ValueError:
+			return _error("contacts must be a JSON list of contact objects")
+	if not contacts:
+		contacts = [
+			wm.simple_contact(
+				kwargs.get("contact_name"), kwargs.get("contact_phone"), kwargs.get("contact_email"), kwargs.get("contact_org")
+			)
+		]
+	reply_to = (kwargs.get("reply_to") or "").strip() or None
+	return _deliver_typed(
+		kwargs, recipient, wm.build_contacts_payload(recipient, contacts, reply_to),
+		lambda account: bridge.send_contacts(account, recipient, contacts, reply_to=reply_to),
+		"a contact",
+	)
+
+
+def _send_reaction(kwargs: dict) -> str:
+	recipient = _recipient(kwargs)
+	if not recipient:
+		return _error("Recipient phone number ('to') is required")
+	remove = _is_truthy(kwargs.get("remove"))
+	emoji = "" if remove else str(kwargs.get("emoji") or "")
+	message_id = kwargs.get("message_id")
+	return _deliver_typed(
+		kwargs, recipient, wm.build_reaction_payload(recipient, message_id, emoji, remove),
+		lambda account: bridge.send_reaction(account, recipient, str(message_id or ""), emoji, remove=remove),
+		"a reaction",
+	)
+
+
+def _send_interactive(kwargs: dict, kind: str) -> str:
+	"""send_buttons / send_list / send_cta_url (``body``, ``header``, ``footer`` plus the kind's own fields)."""
+	recipient = _recipient(kwargs)
+	if not recipient:
+		return _error("Recipient phone number ('to') is required")
+	buttons = _json_list(kwargs.get("buttons"))
+	sections = _json_list(kwargs.get("sections"))
+	if buttons is None or sections is None:
+		return _error("buttons and sections must be JSON lists")
+	header = kwargs.get("header")
+	if isinstance(header, str) and header.strip().startswith("{"):
+		try:
+			header = json.loads(header)
+		except ValueError:
+			return _error("header must be text or a JSON object")
+	spec = {
+		"body": kwargs.get("body") or kwargs.get("message") or kwargs.get("text"),
+		"header": header,
+		"footer": kwargs.get("footer"),
+		"buttons": buttons,
+		"button_text": kwargs.get("button_text"),
+		"sections": sections,
+		"display_text": kwargs.get("display_text"),
+		"url": kwargs.get("url") or kwargs.get("link"),
+	}
+	reply_to = (kwargs.get("reply_to") or "").strip() or None
+	return _deliver_typed(
+		kwargs, recipient, wm.build_interactive_payload(recipient, kind, spec, reply_to),
+		lambda account: bridge.send_interactive(account, recipient, kind, spec, reply_to=reply_to),
+		"an interactive message",
+	)
 
 
 def _body_values(parameters: Any) -> Any:

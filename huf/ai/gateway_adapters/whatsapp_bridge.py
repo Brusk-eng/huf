@@ -30,6 +30,7 @@ from urllib.parse import quote, urljoin, urlparse
 import frappe
 import frappe.utils
 
+from huf.ai.gateway_adapters import whatsapp_messages as wm
 from huf.ai.gateway_adapters import whatsapp_templates as wt
 
 GRAPH_HOST = "https://graph.facebook.com"
@@ -301,6 +302,8 @@ def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> 
 
 
 def record_incoming(account_name: str, message: dict[str, Any], profile_name: str | None = None) -> str | None:
+		if is_reaction_payload(row.get("raw_payload")):
+			continue  # a reaction never opens or extends the customer-service window
 	"""Idempotently mirror a signed inbound message into ``WhatsApp Message``.
 
 	Returns the doc name, or None when unavailable / no message id. Does not
@@ -330,7 +333,7 @@ def record_incoming(account_name: str, message: dict[str, Any], profile_name: st
 			"from": normalize_phone(message.get("from")),
 			"message": body,
 			"message_id": message_id,
-			"content_type": content_type if content_type in allowed else "text",
+			"content_type": content_type,
 			"profile_name": profile_name,
 			"whatsapp_account": account_name,
 		}
@@ -362,7 +365,9 @@ def send_text(
 	permission checks; user-initiated calls must leave it False. Raises
 	:class:`BridgeError` (``.payload`` is the error dict) on failure.
 	"""
-	_account_or_error(account_name)
+	acct = _account_or_error(account_name)
+	if preview_url is not None and trusted:
+		return _send_text_direct(acct, to, text, reply_to, bool(preview_url), http_post)
 	values = {
 		"doctype": "WhatsApp Message",
 		"type": "Outgoing",
@@ -375,6 +380,10 @@ def send_text(
 		values["is_reply"] = 1
 		values["reply_to_message_id"] = reply_to
 	try:
+	``preview_url`` (gateway reply path, ``trusted`` only): when not None the text is posted to Graph
+	directly with the account credentials (frappe_whatsapp hardcodes ``preview_url: true``) and the
+	outgoing row is mirrored afterwards without a second send. Management sends leave it None.
+
 		doc = frappe.get_doc(values)
 		doc.insert(ignore_permissions=bool(trusted))
 		if trusted:
@@ -405,6 +414,81 @@ def _template_docname(account_name: str, template_name: str, language_code: str 
 	for field in ("actual_name", "template_name"):
 		filters = {"whatsapp_account": account_name, field: template_name}
 		if language_code:
+def _text_payload(to: str, text: str, reply_to: str | None, preview_url: bool) -> dict[str, Any]:
+	data: dict[str, Any] = {
+		"messaging_product": "whatsapp",
+		"recipient_type": "individual",
+		"to": normalize_phone(to),
+		"type": "text",
+		"text": {"preview_url": bool(preview_url), "body": text},
+	}
+	if reply_to:
+		data["context"] = {"message_id": reply_to}
+	return data
+
+
+def _send_text_direct(
+	acct: dict[str, Any], to: str, text: str, reply_to: str | None, preview_url: bool, http_post: Callable[..., Any] | None
+) -> dict[str, Any]:
+	"""Post a text straight to Graph, then mirror the Outgoing row with the wamid preset (no second send)."""
+	wamid = _graph_post_message(acct, _text_payload(to, text, reply_to, preview_url), http_post)
+	values = {
+		"doctype": "WhatsApp Message",
+		"type": "Outgoing",
+		"to": normalize_phone(to),
+		"message": text,
+		"content_type": "text",
+		"whatsapp_account": acct["name"],
+		"message_id": wamid,
+		"status": "Success",
+		# frappe_whatsapp sends every non-template Outgoing row from before_insert; "Template" is its own
+		# "already delivered" path and, with the preset message_id, makes the row audit-only (no second send).
+		"message_type": "Template",
+	}
+	if reply_to:
+		values["is_reply"] = 1
+		values["reply_to_message_id"] = reply_to
+	try:
+		doc = frappe.get_doc(values)
+		doc.insert(ignore_permissions=True)
+		frappe.db.commit()
+		return {"success": True, "name": doc.name, "message_id": wamid, "status": doc.get("status")}
+	except Exception:
+		# Already delivered: a failed audit row must never fail (or retry) the send.
+		return {"success": True, "name": None, "message_id": wamid, "status": "Success", "mirrored": False}
+
+
+READ_TYPING_TIMEOUT = 5
+
+
+def mark_read_typing(account_name: str, message_id: str, http_post: Callable[..., Any] | None = None) -> bool:
+	"""Best effort ``status: read`` + typing indicator for an inbound wamid. Never raises, no retry."""
+	try:
+		if not message_id:
+			return False
+		acct = _account_or_error(account_name)
+		http_post = http_post or _default_post
+		resp = http_post(
+			f"{acct['url']}/{acct['version']}/{acct['phone_id']}/messages",
+			json=read_typing_payload(message_id),
+			headers={"Authorization": f"Bearer {acct['token']}", "Content-Type": "application/json"},
+			timeout=READ_TYPING_TIMEOUT,
+		)
+		status = getattr(resp, "status_code", 200)
+		return not (isinstance(status, int) and status >= 400)
+	except Exception:
+		return False
+
+
+def read_typing_payload(message_id: str) -> dict[str, Any]:
+	return {
+		"messaging_product": "whatsapp",
+		"status": "read",
+		"message_id": str(message_id),
+		"typing_indicator": {"type": "text"},
+	}
+
+
 			name = frappe.db.get_value("WhatsApp Templates", {**filters, "language_code": language_code}, "name")
 			if name:
 				return name
@@ -546,10 +630,10 @@ def _graph_post_message(acct: dict[str, Any], data: dict[str, Any], http_post: C
 			timeout=_HTTP_TIMEOUT,
 		)
 	except Exception as exc:
-		raise BridgeError(_err("send_failed", message=_redact(exc))) from exc
+		raise BridgeError({**_graph_err("send_failed", exc), "message": _redact(exc)}) from exc
 	status = getattr(resp, "status_code", 200)
 	if isinstance(status, int) and status >= 400:
-		raise BridgeError(_err("send_failed", message=graph_error_message(resp)))
+		raise BridgeError({**_graph_err("send_failed", resp), "message": graph_error_message(resp)})
 	try:
 		return str(resp.json()["messages"][0]["id"])
 	except Exception as exc:
@@ -937,23 +1021,24 @@ def send_media(
 	reply_to: str | None = None,
 	trusted: bool = False,
 ) -> dict[str, Any]:
-	"""Send an image/document/audio/video as an Outgoing ``WhatsApp Message`` (it performs the send).
+	"""Send an image/document/audio/video/sticker; exactly one Graph call.
 
-	frappe_whatsapp's ``send_outgoing`` takes the media from ``attach`` (a public
-	link) and the caption from ``message``. It cannot send an uploaded media id or
-	a document filename, so those are rejected / ignored here. The caller is
-	responsible for the 24h window check; free-form media is subject to it.
+	A plain image/document/audio/video by public ``link`` is an Outgoing ``WhatsApp Message`` (frappe_whatsapp
+	reads ``attach``/``message`` and performs the send). It cannot send an uploaded ``media_id``, a sticker, a
+	voice note or a document filename, so those are posted to Graph directly with the account credentials and
+	mirrored into ``WhatsApp Message`` with ``message_id`` preset (no second send), like template sends.
+	The caller is responsible for the 24h window and opt-out checks; free-form media is subject to both.
 	"""
 	_account_or_error(account_name)
-	media, errors = wt.validate_media_request(kind, link, media_id, caption, filename)
-	if not errors and media["media_id"]:
-		errors.append(wt._e("media_id", "unsupported_in_bridge", "Bridge mode sends media by link; media_id needs direct mode."))
+	media, errors = wt.validate_media_request(kind, link, media_id, caption, filename, voice)
 	if errors:
 		raise BridgeError(wt.validation_error(errors))
 	values = {
 		"doctype": "WhatsApp Message",
 		"type": "Outgoing",
 		"to": normalize_phone(to),
+	voice: bool | None = None,
+	http_post: Callable[..., Any] | None = None,
 		"message": media["caption"],
 		"content_type": media["kind"],
 		"attach": media["link"],
@@ -1036,6 +1121,8 @@ def _check_sample_reference(sample: str) -> dict[str, str] | None:
 			return wt._e("sample", "invalid_sample", "Sample URL must be a public https URL.")
 		return None
 	if not frappe.db.exists("File", {"file_url": sample}):
+	voice: bool | None = None,
+	http_post: Callable[..., Any] | None = None,
 		return wt._e("sample", "sample_not_found", "No uploaded file matches this sample path.")
 	return None
 
@@ -1050,6 +1137,9 @@ def _is_private_host(host: str) -> bool:
 	try:
 		addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
 	except OSError:
+	if media["media_id"] or media["kind"] == "sticker" or media["voice"] or media["filename"]:
+		payload = wt.build_media_payload(normalize_phone(to), media, reply_to)
+		return _send_payload(account_name, payload, trusted, http_post)
 		return False  # unresolved here; the fetch will fail and be reported by frappe_whatsapp
 	for addr in addrs:
 		ip = ipaddress.ip_address(addr)
@@ -1074,6 +1164,184 @@ _TEMPLATE_PASSTHROUGH = ("field_names", "for_doctype")
 def template_buttons(names: list[str]) -> dict[str, list[dict[str, Any]]]:
 	"""Button rows (``WhatsApp Button``) of the given templates, keyed by template name."""
 	if not names or not is_available():
+# ---------------------------------------------------------------------------
+# Non-text outbound types (T5). Each is validated by whatsapp_messages, posted to Graph directly with the
+# account credentials (frappe_whatsapp cannot build these bodies) and mirrored without a second send.
+# ---------------------------------------------------------------------------
+def _post_typed_message(acct: dict[str, Any], data: dict[str, Any], http_post: Callable[..., Any] | None = None) -> str:
+	"""POST a ``/messages`` body; returns the wamid or raises BridgeError carrying the structured Graph error."""
+	http_post = http_post or _default_post
+	url = f"{acct['url']}/{acct['version']}/{acct['phone_id']}/messages"
+	try:
+		resp = http_post(
+			url,
+			json=data,
+			headers={"Authorization": f"Bearer {acct['token']}", "Content-Type": "application/json"},
+			timeout=_HTTP_TIMEOUT,
+		)
+	except Exception as exc:
+		raise BridgeError(_err("send_failed", message=_redact(exc))) from exc
+	status = getattr(resp, "status_code", 200)
+	if isinstance(status, int) and status >= 400:
+		raise BridgeError(_graph_err("send_failed", resp))
+	try:
+		return str(resp.json()["messages"][0]["id"])
+	except Exception as exc:
+		raise BridgeError(_err("send_failed", message="Unexpected response from WhatsApp.")) from exc
+
+
+def _mirror_direct_send(acct: dict[str, Any], payload: dict[str, Any], wamid: str, trusted: bool) -> dict[str, Any]:
+	"""Record a Graph-sent message as an Outgoing ``WhatsApp Message`` without sending again.
+
+	frappe_whatsapp sends every non-template Outgoing row from ``before_insert``. ``message_type = "Template"``
+	(its own flag for "already delivered / template path") together with the preset ``message_id`` makes it skip
+	that send; the row is audit only. Verified against frappe_whatsapp by the single-send fake-Graph test.
+	"""
+	content_type, text = wm.mirror_summary(payload)
+	mtype = payload.get("type")
+	obj = payload.get(mtype) if isinstance(payload.get(mtype), dict) else {}
+	values: dict[str, Any] = {
+		"doctype": "WhatsApp Message",
+		"type": "Outgoing",
+		"to": payload.get("to"),
+		"message": text,
+		"content_type": content_type,
+		"message_id": wamid,
+		"status": "Success",
+		"message_type": "Template",
+		"whatsapp_account": acct["name"],
+	}
+	if mtype in ("image", "video", "audio", "document", "sticker") and obj.get("link"):
+		values["attach"] = obj["link"]
+	if mtype == "reaction":
+		values["reply_to_message_id"] = obj.get("message_id")
+	elif (payload.get("context") or {}).get("message_id"):
+		values["is_reply"] = 1
+		values["reply_to_message_id"] = payload["context"]["message_id"]
+	try:
+		doc = frappe.get_doc(values)
+		doc.insert(ignore_permissions=bool(trusted))
+		if trusted:
+			frappe.db.commit()
+		return {"success": True, "name": doc.name, "message_id": wamid, "status": doc.get("status")}
+	except Exception:
+		# already delivered: a failed audit row must not fail the send
+		return {"success": True, "name": None, "message_id": wamid, "status": "Success", "mirrored": False}
+
+
+def _send_payload(
+	account_name: str, payload: dict[str, Any], trusted: bool = False, http_post: Callable[..., Any] | None = None
+) -> dict[str, Any]:
+	acct = _account_or_error(account_name)
+	if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+		raise frappe.PermissionError("Not permitted to send WhatsApp messages")
+	wamid = _post_typed_message(acct, payload, http_post)
+	return _mirror_direct_send(acct, payload, wamid, trusted)
+
+
+def _built(result: tuple[dict[str, Any] | None, list[dict[str, str]]]) -> dict[str, Any]:
+	payload, errors = result
+	if errors or payload is None:
+		raise BridgeError(wt.validation_error(errors))
+	return payload
+
+
+def send_interactive(
+	account_name: str, to: str, kind: str, spec: dict[str, Any], reply_to: str | None = None,
+	trusted: bool = False, http_post: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	"""Send reply buttons / list / CTA URL / flow / location request (``kind``: buttons|list|cta_url|flow|location_request)."""
+	_account_or_error(account_name)
+	payload = _built(wm.build_interactive_payload(normalize_phone(to), kind, spec or {}, reply_to))
+	return _send_payload(account_name, payload, trusted, http_post)
+
+
+def send_location(
+	account_name: str, to: str, latitude: Any, longitude: Any, name: str | None = None, address: str | None = None,
+	reply_to: str | None = None, trusted: bool = False, http_post: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	_account_or_error(account_name)
+	payload = _built(wm.build_location_payload(normalize_phone(to), latitude, longitude, name, address, reply_to))
+	return _send_payload(account_name, payload, trusted, http_post)
+
+
+def send_contacts(
+	account_name: str, to: str, contacts: Any, reply_to: str | None = None, trusted: bool = False,
+	http_post: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	_account_or_error(account_name)
+	payload = _built(wm.build_contacts_payload(normalize_phone(to), contacts, reply_to))
+	return _send_payload(account_name, payload, trusted, http_post)
+
+
+def send_reaction(
+	account_name: str, to: str, message_id: str, emoji: str = "", remove: bool = False, trusted: bool = False,
+	http_post: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	"""React to (``emoji``) or un-react (empty emoji / ``remove``) an inbound message (target <= 30 days old)."""
+	_account_or_error(account_name)
+	payload = _built(wm.build_reaction_payload(normalize_phone(to), message_id, emoji, remove))
+	return _send_payload(account_name, payload, trusted, http_post)
+
+
+def send_sticker(
+	account_name: str, to: str, link: str | None = None, media_id: str | None = None, reply_to: str | None = None,
+	trusted: bool = False, http_post: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	_account_or_error(account_name)
+	payload = _built(wm.build_sticker_payload(normalize_phone(to), link, media_id, reply_to))
+	return _send_payload(account_name, payload, trusted, http_post)
+
+
+def post_media_upload(
+	graph_url: str, phone_id: str, token: str, content: bytes, mime_type: str, filename: str = "",
+	http_post: Callable[..., Any] | None = None,
+) -> str:
+	"""``POST {graph_url}/{phone_id}/media`` (multipart: messaging_product, type, file); returns the media id.
+
+	``graph_url`` is the versioned Graph root (``https://graph.facebook.com/v25.0``). Media ids live 30 days.
+	"""
+	http_post = http_post or _default_post
+	name = filename or f"upload{mimetypes.guess_extension(mime_type) or ''}"
+	try:
+		resp = http_post(
+			f"{graph_url}/{phone_id}/media",
+			data={"messaging_product": "whatsapp", "type": mime_type},
+			files={"file": (name, content, mime_type)},
+			headers={"Authorization": f"Bearer {token}"},
+			timeout=60,
+		)
+	except Exception as exc:
+		raise BridgeError(_err("upload_failed", message=_redact(exc))) from exc
+	status = getattr(resp, "status_code", 200)
+	if isinstance(status, int) and status >= 400:
+		raise BridgeError(_graph_err("upload_failed", resp))
+	try:
+		return str(resp.json()["id"])
+	except Exception as exc:
+		raise BridgeError(_err("upload_failed", message="Unexpected response from WhatsApp.")) from exc
+
+
+def upload_media(
+	account_name: str, content: bytes, mime_type: str, filename: str = "", kind: str | None = None,
+	voice: bool = False, trusted: bool = False, http_post: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	"""Upload bytes to Meta and return ``{"success": True, "media_id", "kind", "mime_type", "size"}``.
+
+	Mime type and size are checked against the per-kind caps first (image 5 MB jpeg/png, video 16 MB mp4/3gp, audio
+	16 MB, document 100 MB, sticker webp 100 KB static / 500 KB animated); a failing file never reaches Meta.
+	"""
+	acct = _account_or_error(account_name)
+	if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+		raise frappe.PermissionError("Not permitted to send WhatsApp messages")
+	mime = wm.normalize_mime(mime_type)
+	kind, errors = wm.validate_upload(mime_type, content, kind, bool(voice))
+	if errors:
+		raise BridgeError(wt.validation_error(errors))
+	media_id = post_media_upload(f"{acct['url']}/{acct['version']}", acct["phone_id"], acct["token"], content, mime, filename, http_post)
+	return {"success": True, "media_id": media_id, "kind": kind, "mime_type": mime, "size": len(content)}
+
+
 		return {}
 	rows = frappe.get_all(
 		"WhatsApp Button",

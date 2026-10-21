@@ -37,6 +37,8 @@ class TestWhatsAppManagement(unittest.TestCase):
 		self.frappe.db.get_value.return_value = "ACC-1"
 		self.frappe.has_permission.return_value = True
 		self.frappe.get_roles.return_value = ["System Manager"]
+		self.opted_out = patch.object(mgmt, "_opted_out", return_value=False).start()
+		self.addCleanup(patch.stopall)
 
 		available = patch.object(bridge, "is_available", return_value=True)
 		available.start()
@@ -246,6 +248,8 @@ class TestWhatsAppManagementAuthority(unittest.TestCase):
 		self.roles = ["Desk User"]
 		self.frappe.get_roles.side_effect = lambda: list(self.roles)
 		self.frappe.session.user = "plain@example.com"
+		self.opted_out = patch.object(mgmt, "_opted_out", return_value=False).start()
+		self.addCleanup(patch.stopall)
 		self.gateway_perms = {"read": True, "write": False}
 		self.doctype_perms = {"WhatsApp Message": True, "WhatsApp Templates": True}
 		self.draft_create = False
@@ -490,6 +494,177 @@ class TestWhatsAppManagementAuthority(unittest.TestCase):
 		with patch.object(bridge, "get_template", return_value={"success": True, "whatsapp_account": "ACC-B"}):
 			with self.assertRaises(PermissionError):
 				mgmt.get_template(name="hello-en_US")
+
+
+class TestOutboundTypeEndpoints(unittest.TestCase):
+	"""Every non-text send endpoint: authority, validation, opt-out, 24h window and the Gateway's own account."""
+
+	def setUp(self):
+		patcher = patch("huf.ai.whatsapp_management.frappe")
+		self.frappe = patcher.start()
+		self.addCleanup(patcher.stop)
+		self.frappe.PermissionError = PermissionError
+		self.frappe.db.exists.return_value = True
+		self.frappe.db.get_value.side_effect = lambda doctype, name, field=None, *a, **k: "ACC-A" if doctype == "Gateway" else None
+		self.roles = ["Desk User"]
+		self.frappe.get_roles.side_effect = lambda: list(self.roles)
+		self.write = True
+		self.frappe.has_permission.side_effect = lambda doctype, ptype="read", doc=None, **kw: (
+			self.write if doctype == "Gateway" and ptype == "write" else doctype == "Gateway"
+		)
+		self.opted_out = patch.object(mgmt, "_opted_out", return_value=False).start()
+		self.window = patch.object(bridge, "window_state", return_value={"open": True}).start()
+		patch.object(bridge, "is_available", return_value=True).start()
+		patch.object(bridge, "resolve_account", side_effect=lambda n=None: {"name": n, "phone_id": "1"}).start()
+		patch("huf.permissions.has_capability", return_value=False).start()
+		self.addCleanup(patch.stopall)
+		self.contact = {"name": {"formatted_name": "Ann"}, "phones": [{"phone": "+15551230000"}]}
+		# endpoint -> (bridge function, kwargs of a valid call)
+		self.cases = {
+			"send_location_message": ("send_location", {"latitude": 1.5, "longitude": 2.5, "name": "Pin"}),
+			"send_contacts_message": ("send_contacts", {"contacts": [self.contact]}),
+			"send_reaction_message": ("send_reaction", {"message_id": "wamid.IN", "emoji": "\U0001F44D"}),
+			"send_sticker_message": ("send_media", {"media_id": "77"}),
+			"send_interactive_message": ("send_interactive", {"kind": "buttons", "body": "Pick", "buttons": json.dumps([{"id": "a", "title": "A"}])}),
+			"send_media_message": ("send_media", {"kind": "image", "link": "https://a/b.png"}),
+		}
+
+	def call(self, endpoint, **kw):
+		args = {"gateway_name": "GW-A", "to": "+44 7700 900123", **self.cases[endpoint][1], **kw}
+		return getattr(mgmt, endpoint)(**args)
+
+	def test_each_endpoint_sends_from_the_gateway_account_when_window_open(self):
+		for endpoint, (fn, _kwargs) in self.cases.items():
+			with patch.object(bridge, fn, return_value={"success": True, "message_id": "wamid.OUT"}) as sent:
+				result = self.call(endpoint)
+			self.assertTrue(result["success"], (endpoint, result))
+			self.assertEqual(sent.call_args.args[:2], ("ACC-A", "447700900123"), endpoint)
+			self.window.assert_called_with("GW-A", "447700900123")
+
+	def test_write_authority_is_required(self):
+		self.write = False
+		for endpoint, (fn, _kwargs) in self.cases.items():
+			with patch.object(bridge, fn) as sent:
+				with self.assertRaises(PermissionError, msg=endpoint):
+					self.call(endpoint)
+			sent.assert_not_called()
+
+	def test_gateway_name_is_required(self):
+		for endpoint in self.cases:
+			self.assertEqual(self.call(endpoint, gateway_name=None)["error"], "invalid_gateway", endpoint)
+		self.frappe.db.exists.return_value = False
+		self.assertEqual(self.call("send_location_message")["error"], "not_found")
+
+	def test_window_closed_refuses_before_sending(self):
+		self.window.return_value = {"open": False, "expires_at": None}
+		for endpoint, (fn, _kwargs) in self.cases.items():
+			with patch.object(bridge, fn) as sent:
+				result = self.call(endpoint)
+			self.assertEqual(result["error"], "window_closed", endpoint)
+			self.assertIn("send_template_message", result["hint"])
+			sent.assert_not_called()
+
+	def test_opted_out_contact_is_refused_before_the_window_check(self):
+		self.opted_out.return_value = True
+		self.window.reset_mock()
+		for endpoint, (fn, _kwargs) in self.cases.items():
+			with patch.object(bridge, fn) as sent:
+				result = self.call(endpoint)
+			self.assertEqual(result["error"], "opted_out", endpoint)
+			sent.assert_not_called()
+		self.window.assert_not_called()
+
+	def test_validation_errors_come_back_structured_without_sending(self):
+		bad = {
+			"send_location_message": {"latitude": 91},
+			"send_contacts_message": {"contacts": [{"name": {}}]},
+			"send_reaction_message": {"emoji": "no"},
+			"send_sticker_message": {"media_id": "", "link": ""},
+			"send_interactive_message": {"buttons": json.dumps([{"id": str(i), "title": str(i)} for i in range(4)])},
+			"send_media_message": {"kind": "gif"},
+		}
+		for endpoint, override in bad.items():
+			with patch.object(bridge, self.cases[endpoint][0]) as sent:
+				result = self.call(endpoint, **override)
+			self.assertEqual((result["success"], result["error"]), (False, "validation_failed"), (endpoint, result))
+			self.assertTrue(result["errors"])
+			sent.assert_not_called()
+		self.window.assert_not_called()  # validation runs before the window check
+
+	def test_invalid_json_arguments(self):
+		self.assertEqual(self.call("send_contacts_message", contacts="{nope")["error"], "invalid_params")
+		self.assertEqual(self.call("send_interactive_message", buttons="[oops")["error"], "invalid_params")
+
+	def test_interactive_kinds_and_flow_gate(self):
+		with patch.object(bridge, "send_interactive", return_value={"success": True}) as sent:
+			ok = mgmt.send_interactive_message(
+				gateway_name="GW-A", to="447700900123", kind="cta_url", body="See", display_text="Open", url="https://a.example",
+			)
+			lst = mgmt.send_interactive_message(
+				gateway_name="GW-A", to="447700900123", kind="list", body="Menu", button_text="Open",
+				sections=json.dumps([{"title": "S", "rows": [{"id": "1", "title": "One"}]}]), header="Hdr",
+			)
+			flow = mgmt.send_interactive_message(gateway_name="GW-A", to="447700900123", kind="flow", body="Go", flow_cta="Start")
+		self.assertTrue(ok["success"] and lst["success"])
+		self.assertEqual(flow["error"], "validation_failed")
+		self.assertIn("flow_id_required", [e["code"] for e in flow["errors"]])
+		self.assertEqual(sent.call_count, 2)
+		self.assertEqual(sent.call_args_list[0].args[2], "cta_url")
+
+	def test_reaction_remove(self):
+		with patch.object(bridge, "send_reaction", return_value={"success": True}) as sent:
+			result = mgmt.send_reaction_message(gateway_name="GW-A", to="447700900123", message_id="wamid.IN", remove=True)
+		self.assertTrue(result["success"])
+		self.assertTrue(sent.call_args.kwargs["remove"])
+
+	def test_media_id_and_voice_are_passed_through(self):
+		with patch.object(bridge, "send_media", return_value={"success": True}) as sent:
+			mgmt.send_media_message(gateway_name="GW-A", to="447700900123", kind="audio", media_id="9", voice=True)
+		self.assertEqual((sent.call_args.kwargs["media_id"], sent.call_args.kwargs["voice"]), ("9", True))
+
+	def test_private_file_is_uploaded_after_the_gates_and_sent_by_id(self):
+		file_doc = MagicMock(file_name="doc.pdf")
+		file_doc.get_content.return_value = b"%PDF"
+		self.frappe.get_doc.return_value = file_doc
+		self.frappe.db.get_value.side_effect = lambda doctype, name, field=None, *a, **k: "ACC-A" if doctype == "Gateway" else "FILE-1"
+		self.frappe.has_permission.side_effect = lambda doctype, ptype="read", doc=None, **kw: True
+		with (
+			patch.object(bridge, "upload_media", return_value={"success": True, "media_id": "MID1"}) as up,
+			patch.object(bridge, "send_media", return_value={"success": True}) as sent,
+		):
+			result = mgmt.send_media_message(gateway_name="GW-A", to="447700900123", kind="document", file_url="/private/files/doc.pdf")
+			self.assertTrue(result["success"], result)
+			self.assertEqual(up.call_args.args[:4], ("ACC-A", b"%PDF", "application/pdf", "doc.pdf"))
+			self.assertEqual((sent.call_args.kwargs["media_id"], sent.call_args.kwargs["filename"]), ("MID1", "doc.pdf"))
+			self.window.return_value = {"open": False}
+			up.reset_mock()
+			self.assertEqual(mgmt.send_media_message(gateway_name="GW-A", to="447700900123", kind="document", file_url="/private/files/doc.pdf")["error"], "window_closed")
+			up.assert_not_called()  # nothing is uploaded to Meta when the send would be refused
+
+	def test_upload_media_file_endpoint(self):
+		file_doc = MagicMock(file_name="s.webp")
+		file_doc.get_content.return_value = b"RIFF"
+		self.frappe.get_doc.return_value = file_doc
+		self.frappe.db.get_value.side_effect = lambda doctype, name, field=None, *a, **k: "ACC-A" if doctype == "Gateway" else "FILE-1"
+		self.frappe.has_permission.side_effect = lambda doctype, ptype="read", doc=None, **kw: True
+		with patch.object(bridge, "upload_media", return_value={"success": True, "media_id": "M2"}) as up:
+			result = mgmt.upload_media_file(gateway_name="GW-A", file_url="/private/files/s.webp", kind="sticker")
+		self.assertEqual(result["media_id"], "M2")
+		self.assertEqual(up.call_args.kwargs["kind"], "sticker")
+		self.write = False
+		self.frappe.has_permission.side_effect = lambda doctype, ptype="read", doc=None, **kw: doctype != "Gateway"
+		with self.assertRaises(PermissionError):
+			mgmt.upload_media_file(gateway_name="GW-A", file_url="/private/files/s.webp")
+
+	def test_bridge_unavailable(self):
+		with patch.object(bridge, "is_available", return_value=False):
+			for endpoint in self.cases:
+				self.assertEqual(self.call(endpoint), {"success": False, "error": "bridge_unavailable"}, endpoint)
+
+	def test_bridge_error_is_converted(self):
+		with patch.object(bridge, "send_location", side_effect=BridgeError({"error": "send_failed", "message": "boom", "kind": "rate_limit"})):
+			result = self.call("send_location_message")
+		self.assertEqual((result["success"], result["error"], result["kind"]), (False, "send_failed", "rate_limit"))
 
 
 if __name__ == "__main__":

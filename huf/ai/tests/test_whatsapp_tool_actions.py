@@ -404,5 +404,174 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 		self.assertIn("create_template", result["error"])
 
 
+class TestWhatsAppToolTypedSends(unittest.TestCase):
+	"""send_image/video/audio/document/sticker, send_location, send_contact, send_reaction, send_buttons/list/cta_url."""
+
+	# action -> kwargs of a valid call, and the Graph message type it must produce
+	CASES = {
+		"send_image": ({"link": "https://cdn.example/a.png", "caption": "hi"}, "image"),
+		"send_video": ({"link": "https://cdn.example/a.mp4"}, "video"),
+		"send_audio": ({"media_id": "55", "voice": True}, "audio"),
+		"send_document": ({"link": "https://cdn.example/a.pdf", "filename": "a.pdf"}, "document"),
+		"send_sticker": ({"media_id": "77"}, "sticker"),
+		"send_location": ({"latitude": 12.5, "longitude": 77.5, "name": "Office"}, "location"),
+		"send_contact": ({"contact_name": "Ann Lee", "contact_phone": "+15551230000"}, "contacts"),
+		"send_reaction": ({"message_id": "wamid.IN1", "emoji": "\U0001F44D"}, "reaction"),
+		"send_buttons": ({"body": "Pick", "buttons": [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}]}, "interactive"),
+		"send_list": ({"body": "Menu", "button_text": "Open", "sections": [{"title": "S", "rows": [{"id": "1", "title": "One"}]}]}, "interactive"),
+		"send_cta_url": ({"body": "See", "display_text": "Open", "url": "https://shop.example/x"}, "interactive"),
+	}
+
+	def setUp(self):
+		for p in (
+			patch.object(bridge, "is_available", return_value=False),
+			patch.object(bridge, "resolve_account", return_value=None),
+			patch.object(bridge, "resolve_default_account", return_value=None),
+			patch.object(bridge, "window_state", return_value={"open": False}),
+			_settings(),
+			_creds(),
+			patch.object(whatsapp, "_gateway_account_name", return_value="WA-1"),
+			patch.object(whatsapp, "_is_opted_out", return_value=False),
+		):
+			p.start()
+		self.post = patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.9"}]})).start()
+		self.addCleanup(patch.stopall)
+
+	def run_action(self, action, **overrides):
+		kwargs = {"to": "+1 (555) 123-4567", **self.CASES[action][0], **overrides}
+		return json.loads(whatsapp.handle_action(action, **kwargs))
+
+	def test_every_typed_action_is_refused_without_window_or_server_flag(self):
+		for action in self.CASES:
+			self.post.reset_mock()
+			result = self.run_action(action, allow_proactive=True, allow_whatsapp_management=True)  # LLM-supplied flags are ignored
+			self.assertEqual(result["error"], "proactive_send_not_permitted", action)
+			self.post.assert_not_called()
+
+	def test_server_flag_allows_each_action_and_sends_the_right_type(self):
+		for action, (_kw, mtype) in self.CASES.items():
+			self.post.reset_mock()
+			with _settings(allow_proactive="1"):
+				result = self.run_action(action)
+			self.assertTrue(result["success"], (action, result))
+			body = self.post.call_args.kwargs["json"]
+			self.assertEqual((body["type"], body["to"]), (mtype, "15551234567"), action)
+			self.assertIn(mtype, body)
+
+	def test_open_window_allows_without_flag(self):
+		with patch.object(bridge, "window_state", return_value={"open": True}):
+			for action in self.CASES:
+				self.post.reset_mock()
+				result = self.run_action(action, gateway_name="GW-1")
+				self.assertTrue(result["success"], (action, result))
+				self.post.assert_called_once()
+
+	def test_opted_out_contact_is_refused_even_with_flag_and_open_window(self):
+		with patch.object(whatsapp, "_is_opted_out", return_value=True), patch.object(bridge, "window_state", return_value={"open": True}), _settings(allow_proactive="1"):
+			for action in self.CASES:
+				result = self.run_action(action, gateway_name="GW-1")
+				self.assertEqual(result["error"], "opted_out", action)
+		self.post.assert_not_called()
+
+	def test_is_opted_out_consults_the_gateway_service(self):
+		patch.stopall()  # drop the setUp stubs; test the real helper with only the DB and service mocked
+		with (
+			patch.object(whatsapp.frappe.db, "exists", return_value=True),
+			patch("huf.ai.gateway_service.is_opted_out", return_value=True) as service,
+		):
+			self.assertTrue(whatsapp._is_opted_out({"gateway_name": "GW-1"}, "15551234567"))
+			service.assert_called_once_with("GW-1", "15551234567")
+			self.assertFalse(whatsapp._is_opted_out({}, "15551234567"))  # no gateway: nothing to check
+		with (
+			patch.object(whatsapp.frappe.db, "exists", return_value=True),
+			patch("huf.ai.gateway_service.is_opted_out", side_effect=RuntimeError("db")),
+		):
+			self.assertTrue(whatsapp._is_opted_out({"gateway_name": "GW-1"}, "15551234567"))  # fails closed
+
+	def test_validation_fails_before_any_network_call(self):
+		bad = {
+			"send_image": {"link": "ftp://x", "caption": "c"},
+			"send_audio": {"caption": "not allowed"},
+			"send_sticker": {"caption": "not allowed"},
+			"send_location": {"latitude": 100},
+			"send_contact": {"contact_name": ""},
+			"send_reaction": {"emoji": "text"},
+			"send_buttons": {"buttons": [{"id": str(i), "title": str(i)} for i in range(4)]},
+			"send_list": {"sections": [{"title": "S", "rows": [{"id": str(i), "title": "t"} for i in range(11)]}]},
+			"send_cta_url": {"url": "http://insecure.example"},
+		}
+		with _settings(allow_proactive="1"):
+			for action, override in bad.items():
+				result = self.run_action(action, **override)
+				self.assertEqual(result["error"], "validation_failed", (action, result))
+		self.post.assert_not_called()
+
+	def test_buttons_and_sections_may_arrive_as_json_strings(self):
+		with _settings(allow_proactive="1"):
+			result = self.run_action("send_buttons", buttons=json.dumps([{"id": "a", "title": "A"}]))
+			self.assertTrue(result["success"], result)
+			bad = self.run_action("send_buttons", buttons="[nope")
+		self.assertIn("JSON", bad["error"])
+
+	def test_reaction_remove_sends_empty_emoji(self):
+		with _settings(allow_proactive="1"):
+			result = self.run_action("send_reaction", remove=True, emoji="")
+		self.assertTrue(result["success"])
+		self.assertEqual(self.post.call_args.kwargs["json"]["reaction"], {"message_id": "wamid.IN1", "emoji": ""})
+
+	def test_contacts_list_argument(self):
+		contacts = json.dumps([{"name": {"formatted_name": "Bob"}, "emails": [{"email": "b@x.co"}]}])
+		with _settings(allow_proactive="1"):
+			result = self.run_action("send_contact", contacts=contacts)
+		self.assertTrue(result["success"], result)
+		self.assertEqual(self.post.call_args.kwargs["json"]["contacts"][0]["emails"], [{"email": "b@x.co"}])
+
+	def test_bridge_account_routes_through_the_bridge(self):
+		with (
+			patch.object(whatsapp, "_resolve_bridge_account", return_value=_account("WA-9")),
+			patch.object(bridge, "send_location", return_value={"success": True, "message_id": "wamid.B", "name": "WM-1"}) as send_location,
+			patch.object(bridge, "send_interactive", return_value={"success": True, "message_id": "wamid.C"}) as send_interactive,
+			patch.object(bridge, "send_media", return_value={"success": True, "message_id": "wamid.D"}) as send_media,
+			patch.object(bridge, "send_reaction", return_value={"success": True, "message_id": "wamid.E"}) as send_reaction,
+			_settings(allow_proactive="1"),
+		):
+			self.assertEqual(self.run_action("send_location")["data"]["message_id"], "wamid.B")
+			self.assertTrue(self.run_action("send_buttons")["success"])
+			self.assertTrue(self.run_action("send_sticker")["success"])
+			self.assertTrue(self.run_action("send_reaction")["success"])
+		self.assertEqual(send_location.call_args.args[:2], ("WA-9", "15551234567"))
+		self.assertEqual(send_interactive.call_args.args[2], "buttons")
+		self.assertEqual((send_media.call_args.args[2], send_media.call_args.kwargs["media_id"]), ("sticker", "77"))
+		self.assertEqual(send_reaction.call_args.args[2:4], ("wamid.IN1", "\U0001F44D"))
+		self.post.assert_not_called()
+
+	def test_bridge_validation_error_and_permission_error_are_reported(self):
+		with (
+			patch.object(whatsapp, "_resolve_bridge_account", return_value=_account()),
+			patch.object(bridge, "send_location", side_effect=bridge.BridgeError({"success": False, "error": "send_failed", "kind": "rate_limit"})),
+			_settings(allow_proactive="1"),
+		):
+			self.assertEqual(self.run_action("send_location")["kind"], "rate_limit")
+		with (
+			patch.object(whatsapp, "_resolve_bridge_account", return_value=_account()),
+			patch.object(bridge, "send_contacts", side_effect=whatsapp.frappe.PermissionError),
+			_settings(allow_proactive="1"),
+		):
+			self.assertEqual(self.run_action("send_contact")["error"], "permission_denied")
+
+	def test_registry_lists_every_action(self):
+		from huf.ai.tools._registry import WHATSAPP_TOOLS
+
+		tool = WHATSAPP_TOOLS[0]
+		action_desc = next(p for p in tool["parameters"] if p["fieldname"] == "action")["description"]
+		names = {p["fieldname"] for p in tool["parameters"]}
+		for action in self.CASES:
+			self.assertIn(action, action_desc)
+			self.assertIn(action, tool["description"])
+		for param in ("latitude", "longitude", "emoji", "message_id", "sections", "display_text", "button_text", "media_id", "voice", "contact_name"):
+			self.assertIn(param, names)
+		self.assertEqual(len(names), len(tool["parameters"]))  # no duplicate parameter names
+
+
 if __name__ == "__main__":
 	unittest.main()

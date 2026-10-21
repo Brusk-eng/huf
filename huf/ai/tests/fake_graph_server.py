@@ -7,7 +7,8 @@
 test makes genuine ``requests`` calls (nothing is patched). It implements the
 endpoints Huf and frappe_whatsapp use:
 
-* ``POST /{ver}/{phone_id}/messages``        text / template / media / read receipts
+* ``POST /{ver}/{phone_id}/messages``        text / template / media / sticker / location / contacts / reaction / interactive / read receipts
+* ``POST /{ver}/{phone_id}/media``           multipart media upload (mime + size caps per kind), returns ``{id}``
 * ``POST|GET|DELETE /{ver}/{waba}/message_templates``
 * ``POST /{ver}/{app_id}/uploads`` + ``POST /{ver}/upload:{id}``   resumable sample upload
 * ``GET /{ver}/{media_id}`` then ``GET /media/{media_id}``          inbound media download
@@ -55,6 +56,23 @@ _MESSAGE_TYPES = {
 }
 _MEDIA_TYPES = {"image", "document", "audio", "video", "sticker"}
 _UPLOAD_TYPES = {"image/jpeg", "image/png", "application/pdf", "video/mp4"}
+_KB = 1024
+_MB = 1024 * 1024
+# POST /{phone_id}/media: mime type -> (kind, max bytes). Verified: business-phone-numbers/media.
+_MEDIA_UPLOAD_RULES = {
+	"image/jpeg": ("image", 5 * _MB), "image/png": ("image", 5 * _MB),
+	"video/mp4": ("video", 16 * _MB), "video/3gpp": ("video", 16 * _MB),
+	"audio/aac": ("audio", 16 * _MB), "audio/amr": ("audio", 16 * _MB), "audio/mpeg": ("audio", 16 * _MB),
+	"audio/mp4": ("audio", 16 * _MB), "audio/ogg": ("audio", 16 * _MB),
+	"text/plain": ("document", 100 * _MB), "application/pdf": ("document", 100 * _MB),
+	"application/vnd.ms-excel": ("document", 100 * _MB),
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ("document", 100 * _MB),
+	"application/msword": ("document", 100 * _MB),
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ("document", 100 * _MB),
+	"application/vnd.ms-powerpoint": ("document", 100 * _MB),
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ("document", 100 * _MB),
+	"image/webp": ("sticker", 500 * _KB),  # static stickers are capped at 100 KB below
+}
 
 
 class SchemaViolation(Exception):
@@ -128,6 +146,7 @@ class FakeGraphServer:
 		self.media: dict[str, dict] = {}
 		self.files: dict[str, tuple[str, bytes]] = {}
 		self._uploads: dict[str, dict] = {}
+		self.uploaded_media: dict[str, dict] = {}  # POST /{phone_id}/media results: id -> {kind, mime, size, filename}
 		self._handles: set[str] = set()
 		self._counter = 0
 		# token-health state (debug_token / phone number / subscribed_apps)
@@ -339,6 +358,8 @@ class FakeGraphServer:
 		node, rest = parts[1], parts[2:]
 		if node == self.phone_id and rest == ["messages"] and method == "POST":
 			return self._post_message(rec)
+		if node == self.phone_id and rest == ["media"] and method == "POST":
+			return self._post_media(rec)
 		if node == self.waba_id and rest == ["message_templates"]:
 			if method == "POST":
 				return self._post_template(rec)
@@ -431,19 +452,25 @@ class FakeGraphServer:
 		_need(not extra, f"Unexpected field(s) {sorted(extra)} for message type {mtype}")
 		_need(mtype in body, f"'{mtype}' object is required for message type {mtype}")
 		obj = body[mtype]
-		_need(isinstance(obj, dict), f"'{mtype}' must be an object")
+		if mtype == "contacts":
+			self._check_contacts(obj)
+		else:
+			_need(isinstance(obj, dict), f"'{mtype}' must be an object")
 		if mtype == "text":
 			self._check_text(obj)
 		elif mtype in _MEDIA_TYPES:
 			self._check_media(mtype, obj)
+			if "id" in obj:
+				self._media_id_kind(obj["id"], mtype, voice=bool(obj.get("voice")))
 		elif mtype == "template":
 			self._check_template_send(obj)
 		elif mtype == "reaction":
-			_need(_is_str(obj.get("message_id")), "reaction.message_id is required")
-			_need(isinstance(obj.get("emoji"), str), "reaction.emoji must be a string")
+			self._check_reaction(obj)
+			_need("context" not in body, "context is not allowed on a reaction message")
+		elif mtype == "location":
+			self._check_location(obj)
 		elif mtype == "interactive":
-			_need(obj.get("type") in ("button", "list", "flow", "cta_url"), "interactive.type is invalid")
-			_need(isinstance(obj.get("action"), dict), "interactive.action is required")
+			self._check_interactive(obj)
 		wamid = f"wamid.FAKE{self._next():06d}"
 		with self.lock:
 			self.sent.append(dict(body, _wamid=wamid))
@@ -473,12 +500,191 @@ class FakeGraphServer:
 			allowed.add("caption")
 		if mtype == "document":
 			allowed.add("filename")
+		if mtype == "audio":
+			allowed.add("voice")
 		extra = set(obj) - allowed
 		_need(not extra, f"Field(s) {sorted(extra)} are not allowed in a {mtype} message")
 		if "caption" in obj:
 			_need(isinstance(obj["caption"], str) and len(obj["caption"]) <= 1024, f"{mtype}.caption must be a string of at most 1024 characters")
 		if "filename" in obj:
 			_need(_is_str(obj["filename"], max_len=240), "document.filename must be a non-empty string")
+		if "voice" in obj:
+			_need(isinstance(obj["voice"], bool), "audio.voice must be a boolean")
+
+	# ------------------------------------------------- non-text message types
+	def _media_id_kind(self, media_id: str, expected: str, voice: bool = False) -> None:
+		"""A media id we issued must be used for the kind it was uploaded as (Meta error 131053 otherwise)."""
+		item = self.uploaded_media.get(media_id)
+		if item is None:
+			return  # ids from other sources (inbound media, hand-made ids) are not tracked
+		_need(item["kind"] == expected, f"Media {media_id} is a {item['kind']} upload and cannot be sent as {expected}", code=131053)
+		if voice:
+			_need(item["mime"] == "audio/ogg", "A voice message must be audio/ogg (opus)", code=131053)
+
+	@staticmethod
+	def _check_location(obj: dict) -> None:
+		_need(set(obj) <= {"latitude", "longitude", "name", "address"}, "Unexpected field in location object")
+		for key, bound in (("latitude", 90), ("longitude", 180)):
+			value = obj.get(key)
+			ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+			if isinstance(value, str):
+				try:
+					value, ok = float(value), True
+				except ValueError:
+					ok = False
+			_need(ok, f"location.{key} is required (decimal degrees)")
+			_need(-bound <= value <= bound, f"location.{key} must be between -{bound} and {bound}")
+		for key in ("name", "address"):
+			if key in obj:
+				_need(isinstance(obj[key], str), f"location.{key} must be a string")
+
+	@staticmethod
+	def _check_contacts(contacts) -> None:
+		_need(isinstance(contacts, list) and 1 <= len(contacts) <= 257, "contacts must be a list of 1 to 257 contact objects")
+		allowed = {"addresses", "birthday", "emails", "name", "org", "phones", "urls"}
+		for i, c in enumerate(contacts):
+			f = f"contacts[{i}]"
+			_need(isinstance(c, dict), f"{f} must be an object")
+			_need(set(c) <= allowed, f"{f} has unsupported field(s) {sorted(set(c) - allowed)}")
+			name = c.get("name")
+			_need(isinstance(name, dict) and _is_str(name.get("formatted_name")), f"{f}.name.formatted_name is required")
+			_need(set(name) <= {"formatted_name", "first_name", "last_name", "middle_name", "suffix", "prefix"}, f"{f}.name has an unsupported field")
+			if "birthday" in c:
+				_need(isinstance(c["birthday"], str) and re.match(r"^\d{4}-\d{2}-\d{2}$", c["birthday"]) is not None, f"{f}.birthday must be YYYY-MM-DD")
+			for key, subs in (("addresses", {"street", "city", "state", "zip", "country", "country_code", "type"}),
+					("emails", {"email", "type"}), ("phones", {"phone", "type", "wa_id"}), ("urls", {"url", "type"})):
+				if key in c:
+					_need(isinstance(c[key], list), f"{f}.{key} must be a list")
+					for j, entry in enumerate(c[key]):
+						_need(isinstance(entry, dict) and set(entry) <= subs, f"{f}.{key}[{j}] has an unsupported field")
+						_need(all(isinstance(v, str) for v in entry.values()), f"{f}.{key}[{j}] values must be strings")
+			if "org" in c:
+				_need(isinstance(c["org"], dict) and set(c["org"]) <= {"company", "department", "title"}, f"{f}.org is invalid")
+
+	@staticmethod
+	def _check_reaction(obj: dict) -> None:
+		_need(set(obj) <= {"message_id", "emoji"}, "Unexpected field in reaction object")
+		_need(_is_str(obj.get("message_id")), "reaction.message_id is required")
+		_need(isinstance(obj.get("emoji"), str), "reaction.emoji must be a string")
+		_need(len(obj["emoji"]) <= 32, "reaction.emoji must be one emoji (or empty to remove)")
+
+	def _check_interactive(self, obj: dict) -> None:
+		itype = obj.get("type")
+		_need(itype in ("button", "list", "cta_url", "flow", "location_request_message"), "interactive.type is invalid")
+		_need(isinstance(obj.get("body"), dict) or itype == "flow" and obj.get("body") is None, "interactive.body is required")
+		allowed = {"type", "header", "body", "footer", "action"}
+		_need(set(obj) <= allowed, f"Unexpected field(s) {sorted(set(obj) - allowed)} in interactive")
+		body_max = {"button": 1024, "list": 4096, "cta_url": 1024, "flow": 1024, "location_request_message": 1024}[itype]
+		if obj.get("body") is not None:
+			_need(set(obj["body"]) == {"text"} and _is_str(obj["body"]["text"], max_len=body_max), f"interactive.body.text is required (1-{body_max} characters)")
+		if "footer" in obj:
+			_need(itype != "location_request_message", "footer is not allowed on a location request")
+			_need(set(obj["footer"]) == {"text"} and _is_str(obj["footer"]["text"], max_len=60), "interactive.footer.text must be 1-60 characters")
+		if "header" in obj:
+			_need(itype not in ("location_request_message",), "header is not allowed on a location request")
+			self._check_interactive_header(obj["header"], text_only=itype == "list")
+		action = obj.get("action")
+		_need(isinstance(action, dict), "interactive.action is required")
+		if itype == "button":
+			_need(set(action) == {"buttons"}, "action must hold exactly 'buttons'")
+			buttons = action["buttons"]
+			_need(isinstance(buttons, list) and 1 <= len(buttons) <= 3, "A reply-button message needs 1 to 3 buttons")
+			ids, titles = set(), set()
+			for i, b in enumerate(buttons):
+				_need(isinstance(b, dict) and b.get("type") == "reply" and set(b) == {"type", "reply"}, f"buttons[{i}] must be {{type: reply, reply: {{id, title}}}}")
+				r = b["reply"]
+				_need(isinstance(r, dict) and set(r) == {"id", "title"}, f"buttons[{i}].reply must hold exactly id and title")
+				_need(_is_str(r["id"], max_len=256), f"buttons[{i}].reply.id must be 1-256 characters")
+				_need(_is_str(r["title"], max_len=20), f"buttons[{i}].reply.title must be 1-20 characters")
+				_need(r["id"] not in ids and r["title"] not in titles, "Button ids and titles must be unique")
+				ids.add(r["id"])
+				titles.add(r["title"])
+		elif itype == "list":
+			_need(set(action) == {"button", "sections"}, "list action must hold exactly 'button' and 'sections'")
+			_need(_is_str(action["button"], max_len=20), "action.button must be 1-20 characters")
+			sections = action["sections"]
+			_need(isinstance(sections, list) and 1 <= len(sections) <= 10, "A list needs 1 to 10 sections")
+			total, row_ids = 0, set()
+			for i, sec in enumerate(sections):
+				_need(isinstance(sec, dict) and set(sec) <= {"title", "rows"}, f"sections[{i}] is invalid")
+				if len(sections) > 1:
+					_need(_is_str(sec.get("title"), max_len=24), f"sections[{i}].title is required (1-24 characters)")
+				elif "title" in sec:
+					_need(_is_str(sec["title"], max_len=24), "section title must be 1-24 characters")
+				rows = sec.get("rows")
+				_need(isinstance(rows, list) and rows, f"sections[{i}].rows must be a non-empty list")
+				for j, row in enumerate(rows):
+					total += 1
+					_need(isinstance(row, dict) and set(row) <= {"id", "title", "description"}, f"sections[{i}].rows[{j}] is invalid")
+					_need(_is_str(row.get("id"), max_len=200), "row id must be 1-200 characters")
+					_need(_is_str(row.get("title"), max_len=24), "row title must be 1-24 characters")
+					if "description" in row:
+						_need(_is_str(row["description"], max_len=72), "row description must be 1-72 characters")
+					_need(row["id"] not in row_ids, "Row ids must be unique")
+					row_ids.add(row["id"])
+			_need(total <= 10, "A list holds at most 10 rows in total")
+		elif itype == "cta_url":
+			_need(set(action) == {"name", "parameters"} and action["name"] == "cta_url", "cta_url action must be {name: cta_url, parameters}")
+			params = action["parameters"]
+			_need(isinstance(params, dict) and set(params) == {"display_text", "url"}, "parameters must hold exactly display_text and url")
+			_need(_is_str(params["display_text"], max_len=20), "display_text must be 1-20 characters")
+			_need(isinstance(params["url"], str) and params["url"].startswith("https://") and _is_http(params["url"]), "url must be an https URL")
+		elif itype == "location_request_message":
+			_need(action == {"name": "send_location"}, "action must be {name: send_location}")
+		else:  # flow
+			_need(action.get("name") == "flow" and isinstance(action.get("parameters"), dict), "flow action must be {name: flow, parameters}")
+			params = action["parameters"]
+			_need(bool(params.get("flow_id")) != bool(params.get("flow_name")), "flow needs exactly one of flow_id or flow_name")
+			_need(_is_str(params.get("flow_cta"), max_len=20), "flow_cta must be 1-20 characters")
+			_need(params.get("flow_action", "navigate") in ("navigate", "data_exchange"), "flow_action is invalid")
+
+	def _check_interactive_header(self, header: dict, text_only: bool = False) -> None:
+		_need(isinstance(header, dict), "interactive.header must be an object")
+		htype = header.get("type")
+		if htype == "text":
+			_need(set(header) == {"type", "text"} and _is_str(header["text"], max_len=60), "header.text must be 1-60 characters")
+			return
+		_need(not text_only, "A list supports a text header only")
+		_need(htype in ("image", "video", "document"), "header.type must be text, image, video or document")
+		_need(set(header) == {"type", htype} and isinstance(header[htype], dict), f"header must hold exactly type and {htype}")
+		self._check_media(htype, header[htype])
+		if "id" in header[htype]:
+			self._media_id_kind(header[htype]["id"], htype)
+
+	# ---------------------------------------------------------- /media upload
+	def _post_media(self, rec: dict):
+		"""Multipart ``POST /{phone_id}/media`` (file, type, messaging_product)."""
+		from email.parser import BytesParser
+		from email.policy import HTTP
+
+		ctype = rec["headers"].get("content-type", "")
+		_need(ctype.lower().startswith("multipart/form-data"), "Content-Type must be multipart/form-data")
+		msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + rec["raw"])
+		fields, file_part = {}, None
+		for part in msg.iter_parts():
+			name = part.get_param("name", header="content-disposition")
+			if part.get_filename():
+				file_part = {"filename": part.get_filename(), "content": part.get_payload(decode=True) or b"", "ctype": part.get_content_type()}
+			else:
+				fields[name] = (part.get_payload(decode=True) or b"").decode()
+		_need(fields.get("messaging_product") == "whatsapp", "messaging_product must be 'whatsapp'")
+		_need(file_part is not None, "file is required")
+		mime = fields.get("type", "")
+		_need(mime in _MEDIA_UPLOAD_RULES, f"type must be a supported mime type ({mime or 'missing'} is not)", code=131053)
+		_need(file_part["ctype"] == mime, f"File content type {file_part['ctype']} does not match type {mime}", code=131053)
+		kind, cap = _MEDIA_UPLOAD_RULES[mime]
+		size = len(file_part["content"])
+		_need(size > 0, "The file is empty")
+		if kind == "sticker":
+			head = file_part["content"][:21]
+			animated = len(head) >= 21 and head[12:16] == b"VP8X" and bool(head[20] & 0x02)
+			cap = 500 * _KB if animated else 100 * _KB
+		_need(size <= cap, f"File is {size} bytes; a {kind} is at most {cap} bytes", code=131053)
+		media_id = f"{self._next():016d}"
+		with self.lock:
+			self.uploaded_media[media_id] = {"kind": kind, "mime": mime, "size": size, "filename": file_part["filename"]}
+			self.media[media_id] = {"mime_type": mime, "content": file_part["content"]}
+		return 200, {"id": media_id}, "application/json"
 
 	def _check_template_send(self, obj: dict) -> None:
 		name, lang = obj.get("name"), obj.get("language")

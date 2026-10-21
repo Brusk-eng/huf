@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import functools
 import json
+import mimetypes
 import re
 from datetime import timedelta
 from typing import Any
@@ -29,6 +30,8 @@ from frappe.query_builder import Order
 from frappe.rate_limiter import rate_limit
 
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+from huf.ai.gateway_adapters import whatsapp_messages as wm
+from huf.ai.gateway_adapters import whatsapp_templates as wt
 from huf.ai.gateway_adapters.whatsapp_bridge import BridgeError
 
 ADMIN_ROLES = ("System Manager", "Huf Admin")
@@ -659,6 +662,75 @@ def _public_file_link(file_url: str) -> str | dict[str, Any]:
 	return frappe.utils.get_url() + quote(file_url, safe="/")
 
 
+def _opted_out(gateway_name: str, phone: str) -> bool:
+	"""True when ``phone`` sent STOP to this gateway (T2's consent gate). Fails closed on any error."""
+	try:
+		from huf.ai import gateway_service
+
+		return bool(gateway_service.is_opted_out(gateway_name, phone))
+	except Exception:
+		return True
+
+
+def _free_form_gate(gateway_name: str, phone: str) -> dict[str, Any] | None:
+	"""Refusal for a free-form (non-template) send: opted-out contact, or a closed 24h customer-service window."""
+	if _opted_out(gateway_name, phone):
+		return {
+			"success": False,
+			"error": "opted_out",
+			"message": "This contact opted out (STOP); no messages are sent until they opt back in (START).",
+		}
+	state = bridge.window_state(gateway_name, phone)
+	if not state.get("open"):
+		return {
+			"success": False,
+			"error": "window_closed",
+			"message": "The 24-hour customer-service window is closed for this number.",
+			"hint": "Send an approved template with send_template_message instead.",
+			"expires_at": state.get("expires_at"),
+		}
+	return None
+
+
+def _typed_send(gateway_name: str | None, to: Any, validate: Any, send: Any) -> dict[str, Any]:
+	"""Shared pipeline of every free-form non-text send.
+
+	bridge available -> write authority on the Gateway -> recipient -> payload validation (no network) ->
+	opt-out + 24h window -> the Gateway's own account -> ``send(account, phone)``.
+	"""
+	if not bridge.is_available():
+		return {"success": False, "error": "bridge_unavailable"}
+	refused = _send_authority(gateway_name)
+	if refused:
+		return refused
+	phone = _validate_recipient(to)
+	if isinstance(phone, dict):
+		return phone
+	errors = validate(phone)
+	if errors:
+		return wt.validation_error(errors)
+	gated = _free_form_gate(gateway_name, phone)
+	if gated:
+		return gated
+	account_name = _resolve_account_name(_gateway_whatsapp_account(gateway_name))
+	if isinstance(account_name, dict):
+		return account_name
+	return send(account_name, phone)
+
+
+def _read_uploaded_file(file_url: str) -> tuple[bytes, str, str] | dict[str, Any]:
+	"""``(content, file name, mime type)`` of a Frappe File the caller may read (public or private), or an error dict."""
+	file_url = str(file_url or "").strip()
+	name = frappe.db.get_value("File", {"file_url": file_url}, "name") if file_url else None
+	if not name:
+		return {"success": False, "error": "invalid_file", "message": "Uploaded file not found."}
+	doc = frappe.get_doc("File", name)
+	if not frappe.has_permission("File", "read", doc=doc):
+		raise frappe.PermissionError(_("Not permitted to read this file"))
+	mime = mimetypes.guess_type(doc.file_name or file_url)[0] or ""
+	return doc.get_content(), doc.file_name or file_url.rsplit("/", 1)[-1], mime
+
+
 @frappe.whitelist(methods=["POST"])
 @rate_limit(limit=60, seconds=60)
 @_bridge_guard
@@ -670,37 +742,206 @@ def send_media_message(
 	file_url: str | None = None,
 	caption: str | None = None,
 	filename: str | None = None,
+	media_id: str | None = None,
+	voice: Any = None,
+	reply_to: str | None = None,
 ) -> dict[str, Any]:
-	"""Send an image/document/audio/video, only while the 24h customer-service window is open.
+	"""Send an image/video/audio/document/sticker, only while the 24h window is open and the contact has not opted out.
 
-	Give a public ``link`` (https URL) or the ``file_url`` of a public uploaded File.
+	Give exactly one of: a public ``link`` (https URL), a ``media_id`` from :func:`upload_media_file`, or the
+	``file_url`` of an uploaded File (a public ``/files/...`` file is sent by link; a private one is uploaded to
+	Meta first and sent by id). ``caption`` is for image/video/document, ``filename`` for documents, ``voice``
+	sends audio as a voice note (Ogg/Opus). Limits: image 5 MB jpeg/png, video 16 MB mp4/3gp, audio 16 MB,
+	document 100 MB, sticker webp 100 KB (static) / 500 KB (animated).
+	"""
+	return _send_media_impl(gateway_name, to, kind, link, file_url, caption, filename, media_id, voice, reply_to)
+
+
+def _send_media_impl(gateway_name, to, kind, link, file_url, caption, filename, media_id, voice, reply_to) -> dict[str, Any]:
+	from_file = False
+	if file_url and not link and not media_id:
+		file_url = str(file_url).strip()
+		if file_url.startswith("/files/"):
+			resolved = _public_file_link(file_url)
+			if isinstance(resolved, dict):
+				return resolved
+			link = resolved
+		elif file_url.startswith("/private/files/"):
+			from_file = True  # uploaded to Meta after the gates pass; sent by id
+		else:
+			return {"success": False, "error": "invalid_file", "message": "Only uploaded files (/files/... or /private/files/...) can be sent."}
+
+	def validate(_phone: str) -> list[dict[str, str]]:
+		probe = "https://pending-upload.invalid/file" if from_file else link
+		return wt.validate_media_request(kind, probe, media_id, caption, filename, voice)[1]
+
+	def send(account_name: str, phone: str) -> dict[str, Any]:
+		use_id, use_name = media_id, filename
+		if from_file:
+			loaded = _read_uploaded_file(file_url)
+			if isinstance(loaded, dict):
+				return loaded
+			content, fname, mime = loaded
+			k = (kind or "").strip().lower()
+			use_id = bridge.upload_media(account_name, content, mime, fname, kind=k or None, voice=bool(voice))["media_id"]
+			use_name = filename or (fname if k == "document" else None)
+		return bridge.send_media(
+			account_name, phone, kind or "", link=link, media_id=use_id, caption=caption, filename=use_name,
+			reply_to=reply_to, voice=voice,
+		)
+
+	return _typed_send(gateway_name, to, validate, send)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+@_bridge_guard
+def upload_media_file(
+	gateway_name: str | None = None, file_url: str | None = None, kind: str | None = None, voice: Any = None
+) -> dict[str, Any]:
+	"""Upload an uploaded Frappe File to Meta (``POST /{phone_id}/media``); returns ``media_id`` (valid 30 days).
+
+	Not window-gated (nothing is sent to a contact). The file must pass the per-kind mime and size caps.
 	"""
 	if not bridge.is_available():
 		return {"success": False, "error": "bridge_unavailable"}
 	refused = _send_authority(gateway_name)
 	if refused:
 		return refused
-	phone = _validate_recipient(to)
-	if isinstance(phone, dict):
-		return phone
-	if file_url and not link:
-		resolved = _public_file_link(file_url)
-		if isinstance(resolved, dict):
-			return resolved
-		link = resolved
-	state = bridge.window_state(gateway_name, phone)
-	if not state.get("open"):
-		return {
-			"success": False,
-			"error": "window_closed",
-			"message": "The 24-hour customer-service window is closed for this number.",
-			"hint": "Send an approved template with send_template_message instead.",
-			"expires_at": state.get("expires_at"),
-		}
+	loaded = _read_uploaded_file(file_url or "")
+	if isinstance(loaded, dict):
+		return loaded
 	account_name = _resolve_account_name(_gateway_whatsapp_account(gateway_name))
 	if isinstance(account_name, dict):
 		return account_name
-	return bridge.send_media(account_name, phone, kind or "", link=link, caption=caption, filename=filename)
+	content, fname, mime = loaded
+	return bridge.upload_media(account_name, content, mime, fname, kind=(kind or "").strip().lower() or None, voice=bool(voice))
+
+
+def _json_or_error(value: Any, label: str) -> Any:
+	"""Parsed JSON argument; raises ``ValueError`` (caught by callers) on bad JSON."""
+	return _parse_json_arg(value, label)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+@_bridge_guard
+def send_sticker_message(
+	gateway_name: str | None = None, to: str | None = None, link: str | None = None,
+	media_id: str | None = None, file_url: str | None = None, reply_to: str | None = None,
+) -> dict[str, Any]:
+	"""Send a webp sticker (static <= 100 KB, animated <= 500 KB) by ``link``, ``media_id`` or uploaded ``file_url``."""
+	return _send_media_impl(gateway_name, to, "sticker", link, file_url, None, None, media_id, None, reply_to)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+@_bridge_guard
+def send_location_message(
+	gateway_name: str | None = None, to: str | None = None, latitude: Any = None, longitude: Any = None,
+	name: str | None = None, address: str | None = None, reply_to: str | None = None,
+) -> dict[str, Any]:
+	"""Send a map pin (latitude -90..90, longitude -180..180, optional name and address)."""
+	return _typed_send(
+		gateway_name,
+		to,
+		lambda p: wm.build_location_payload(p, latitude, longitude, name, address, reply_to)[1],
+		lambda acct, p: bridge.send_location(acct, p, latitude, longitude, name=name, address=address, reply_to=reply_to),
+	)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+@_bridge_guard
+def send_contacts_message(
+	gateway_name: str | None = None, to: str | None = None, contacts: Any = None, reply_to: str | None = None
+) -> dict[str, Any]:
+	"""Send contact card(s). ``contacts``: a list (or JSON) of ``{name: {formatted_name, ...}, phones, emails, urls, org, ...}``."""
+	try:
+		parsed = _json_or_error(contacts, "contacts")
+	except ValueError as exc:
+		return {"success": False, "error": "invalid_params", "message": str(exc)}
+	return _typed_send(
+		gateway_name,
+		to,
+		lambda p: wm.build_contacts_payload(p, parsed, reply_to)[1],
+		lambda acct, p: bridge.send_contacts(acct, p, parsed, reply_to=reply_to),
+	)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+@_bridge_guard
+def send_reaction_message(
+	gateway_name: str | None = None, to: str | None = None, message_id: str | None = None,
+	emoji: str | None = None, remove: Any = None,
+) -> dict[str, Any]:
+	"""React to an inbound message with one emoji; an empty ``emoji`` (or ``remove``) removes the reaction.
+
+	Meta delivers a reaction only for a message at most 30 days old that was not deleted and is not itself a reaction.
+	"""
+	rm = str(remove).strip().lower() in ("1", "true", "yes")
+	return _typed_send(
+		gateway_name,
+		to,
+		lambda p: wm.build_reaction_payload(p, message_id, emoji or "", rm)[1],
+		lambda acct, p: bridge.send_reaction(acct, p, message_id or "", emoji or "", remove=rm),
+	)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+@_bridge_guard
+def send_interactive_message(
+	gateway_name: str | None = None,
+	to: str | None = None,
+	kind: str | None = None,
+	body: str | None = None,
+	header: Any = None,
+	footer: str | None = None,
+	buttons: Any = None,
+	button_text: str | None = None,
+	sections: Any = None,
+	display_text: str | None = None,
+	url: str | None = None,
+	flow_id: str | None = None,
+	flow_name: str | None = None,
+	flow_cta: str | None = None,
+	flow_token: str | None = None,
+	flow_action: str | None = None,
+	screen: str | None = None,
+	flow_data: Any = None,
+	mode: str | None = None,
+	reply_to: str | None = None,
+) -> dict[str, Any]:
+	"""Send an interactive message; ``kind`` is buttons | list | cta_url | location_request | flow.
+
+	* buttons: ``body`` (<= 1024), ``buttons`` = 1-3 of ``{id (<= 256), title (<= 20)}``.
+	* list: ``body`` (<= 4096), ``button_text`` (<= 20), ``sections`` = ``[{title (<= 24), rows: [{id, title (<= 24),
+	  description (<= 72)}]}]`` (<= 10 rows in total).
+	* cta_url: ``body`` (<= 1024), ``display_text`` (<= 20), ``url`` (https).
+	* location_request: ``body`` (<= 1024); the contact answers with a location.
+	* flow: UNTESTED; needs ``flow_id`` (or ``flow_name``) and ``flow_cta`` or it fails with ``flow_id_required``.
+
+	``header`` is a text (<= 60) or ``{type: image|video|document, link | media_id}`` (text only for lists),
+	``footer`` <= 60.
+	"""
+	try:
+		spec = {
+			"body": body, "footer": footer, "button_text": button_text, "display_text": display_text, "url": url,
+			"header": _json_or_error(header, "header") if isinstance(header, str) and header.strip().startswith("{") else header,
+			"buttons": _json_or_error(buttons, "buttons"), "sections": _json_or_error(sections, "sections"),
+			"flow_id": flow_id, "flow_name": flow_name, "flow_cta": flow_cta, "flow_token": flow_token,
+			"flow_action": flow_action, "screen": screen, "flow_data": _json_or_error(flow_data, "flow_data"), "mode": mode,
+		}
+	except ValueError as exc:
+		return {"success": False, "error": "invalid_params", "message": str(exc)}
+	return _typed_send(
+		gateway_name,
+		to,
+		lambda p: wm.build_interactive_payload(p, kind, spec, reply_to)[1],
+		lambda acct, p: bridge.send_interactive(acct, p, kind or "", spec, reply_to=reply_to),
+	)
 
 
 @frappe.whitelist()

@@ -20,6 +20,8 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from huf.ai.gateway_adapters import whatsapp_messages as wm
+
 # verified: https://developers.facebook.com/documentation/business-messaging/whatsapp/templates/components/ (body 1024, header text 60 / 1 variable, footer 60)
 BODY_MAX = 1024
 HEADER_TEXT_MAX = 60
@@ -50,7 +52,8 @@ CATEGORIES = ("UTILITY", "MARKETING")
 HEADER_TYPES = ("TEXT", "IMAGE", "VIDEO", "DOCUMENT", "LOCATION")
 MEDIA_HEADER_TYPES = ("IMAGE", "VIDEO", "DOCUMENT")
 BUTTON_TYPES = ("QUICK_REPLY", "URL", "PHONE_NUMBER", "COPY_CODE")
-MEDIA_KINDS = ("image", "document", "audio", "video")
+# Outbound free-form media kinds (sticker added by T5; limits live in whatsapp_messages)
+MEDIA_KINDS = wm.MEDIA_KINDS
 PARAMETER_FORMATS = ("POSITIONAL", "NAMED")
 
 # API button type -> WhatsApp Button.button_type option
@@ -841,48 +844,28 @@ def build_send_components(
 
 
 def validate_media_request(
-	kind: Any, link: Any, media_id: Any, caption: Any, filename: Any
+	kind: Any, link: Any, media_id: Any, caption: Any, filename: Any, voice: Any = None
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
-	"""Validate an outbound media send; returns the normalised request and errors."""
-	errors: list[dict[str, str]] = []
-	kind = str(kind or "").strip().lower()
-	link = str(link or "").strip()
-	media_id = str(media_id or "").strip()
-	caption = str(caption or "")
-	filename = str(filename or "").strip()
-	if kind not in MEDIA_KINDS:
-		errors.append(_e("kind", "invalid_kind", f"Media kind must be one of {', '.join(MEDIA_KINDS)}."))
-	if bool(link) == bool(media_id):
-		errors.append(_e("link", "link_or_id", "Provide exactly one of link or media_id."))
-	elif link and not is_http_url(link):
-		errors.append(_e("link", "invalid_link", "Media link must be a public http(s) URL."))
-	if caption and kind == "audio":
-		errors.append(_e("caption", "not_allowed", "Audio messages cannot have a caption."))
-	if len(caption) > MAX_CAPTION:
-		errors.append(_e("caption", "too_long", f"Caption is longer than {MAX_CAPTION} characters."))
-	if filename and kind != "document":
-		filename = ""  # only documents carry a filename
-	return {"kind": kind, "link": link, "media_id": media_id, "caption": caption, "filename": filename}, errors
+	"""Validate an outbound media send; returns the normalised request and errors (see whatsapp_messages)."""
+	return wm.validate_media_message(kind, link, media_id, caption, filename, voice)
 
 
 def build_media_payload(to: str, media: dict[str, Any], reply_to: str | None = None) -> dict[str, Any]:
 	"""Graph ``/messages`` body for a validated media request (see :func:`validate_media_request`)."""
-	kind = media["kind"]
-	obj: dict[str, Any] = {"id": media["media_id"]} if media.get("media_id") else {"link": media["link"]}
-	if media.get("caption") and kind != "audio":
-		obj["caption"] = media["caption"]
-	if media.get("filename") and kind == "document":
-		obj["filename"] = media["filename"]
-	data: dict[str, Any] = {
-		"messaging_product": "whatsapp",
-		"recipient_type": "individual",
-		"to": to,
-		"type": kind,
-		kind: obj,
-	}
-	if reply_to:
-		data["context"] = {"message_id": reply_to}
-	return data
+	return wm.build_media_message_payload(to, media, reply_to)
+
+
+# Payload builders for the other outbound types: ``(payload, errors)``; implemented in whatsapp_messages.
+build_sticker_payload = wm.build_sticker_payload
+build_location_payload = wm.build_location_payload
+build_contacts_payload = wm.build_contacts_payload
+build_reaction_payload = wm.build_reaction_payload
+build_reply_buttons_payload = wm.build_reply_buttons_payload
+build_list_payload = wm.build_list_payload
+build_cta_url_payload = wm.build_cta_url_payload
+build_location_request_payload = wm.build_location_request_payload
+build_flow_payload = wm.build_flow_payload
+build_interactive_payload = wm.build_interactive_payload
 
 
 def validation_error(errors: list[dict[str, str]]) -> dict[str, Any]:

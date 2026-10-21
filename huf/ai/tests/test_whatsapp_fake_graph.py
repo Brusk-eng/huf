@@ -38,6 +38,10 @@ PNG = (
 	b"\x00\x00\x00\rIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xa7\x9a\xa0\xa0\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
+WEBP_STATIC = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 64
+WEBP_ANIMATED = b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x02" + b"\x00" * 64
+OGG = b"OggS" + b"\x00" * 64
+
 
 class FakeGraphCase(IntegrationTestCase):
 	"""Shared server + fixtures."""
@@ -351,9 +355,124 @@ class TestDirectMode(FakeGraphCase):
 		with patch.object(wa_tool, "_get_whatsapp_credentials", return_value=(self.server.phone_id, self.server.token)):
 			ok = json.loads(wa_tool.handle_action("send_media", **args))
 			self.assertTrue(ok["success"], ok)
-			bad = json.loads(wa_tool.handle_action("send_media", **{**args, "kind": "sticker"}))
+			bad = json.loads(wa_tool.handle_action("send_media", **{**args, "kind": "gif"}))
 		self.assertEqual(bad["error"], "validation_failed")
 		self.assertEqual(self.server.sent[-1]["image"]["link"], "https://cdn.example/a.png")
+
+	# ---------------------------------------------------- non-text types (T5)
+	def _each_typed_send(self, adapter):
+		"""One send of every non-text type through the adapter; returns the sent bodies in order."""
+		before = len(self.server.sent)
+		adapter.send_media(SENDER, "audio", media_id="MEDIA9", voice=True)
+		adapter.send_sticker(SENDER, link="https://cdn.example/s.webp")
+		adapter.send_location(SENDER, 12.97, 77.59, name="Office", address="MG Road")
+		adapter.send_contacts(SENDER, [{"name": {"formatted_name": "Ann Lee"}, "phones": [{"phone": "+15551230000", "wa_id": "15551230000"}]}])
+		adapter.send_reaction(SENDER, "wamid.IN1", "\U0001F44D")
+		adapter.send_reaction(SENDER, "wamid.IN1", "")
+		adapter.send_interactive(SENDER, "buttons", {"body": "Pick", "buttons": [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}], "header": "Hi", "footer": "Foot"})
+		adapter.send_interactive(
+			SENDER, "list",
+			{"body": "Menu", "button_text": "Open", "sections": [{"title": "S1", "rows": [{"id": "1", "title": "One", "description": "first"}]}, {"title": "S2", "rows": [{"id": "2", "title": "Two"}]}]},
+		)
+		adapter.send_interactive(SENDER, "cta_url", {"body": "See", "display_text": "Open", "url": "https://shop.example/x", "header": {"type": "image", "link": "https://cdn.example/h.png"}})
+		adapter.send_interactive(SENDER, "location_request", {"body": "Where are you?"})
+		return self.server.sent[before:]
+
+	def test_every_non_text_type_is_accepted_by_the_strict_fake(self):
+		adapter = gateway_webhook.get_gateway_adapter(self.direct_gateway)
+		self._inbound(self.direct_gateway)
+		sent = self._each_typed_send(adapter)
+		self.assertEqual(
+			[(m["type"], (m.get("interactive") or {}).get("type")) for m in sent],
+			[("audio", None), ("sticker", None), ("location", None), ("contacts", None), ("reaction", None), ("reaction", None),
+				("interactive", "button"), ("interactive", "list"), ("interactive", "cta_url"), ("interactive", "location_request_message")],
+		)
+		self.assertEqual(sent[0]["audio"], {"id": "MEDIA9", "voice": True})
+		self.assertEqual(sent[2]["location"]["name"], "Office")
+		self.assertEqual(sent[5]["reaction"], {"message_id": "wamid.IN1", "emoji": ""})
+		self.assertEqual(sent[6]["interactive"]["action"]["buttons"][0], {"type": "reply", "reply": {"id": "a", "title": "A"}})
+
+	def test_non_text_types_need_an_open_window_and_validate_before_sending(self):
+		adapter = gateway_webhook.get_gateway_adapter(self.direct_gateway)
+		calls = [
+			lambda: adapter.send_sticker(SENDER, media_id="1"),
+			lambda: adapter.send_location(SENDER, 1, 2),
+			lambda: adapter.send_contacts(SENDER, [{"name": "A"}]),
+			lambda: adapter.send_reaction(SENDER, "wamid.X", "\U0001F44D"),
+			lambda: adapter.send_interactive(SENDER, "buttons", {"body": "b", "buttons": ["A"]}),
+		]
+		for call in calls:
+			with self.assertRaises(WhatsAppWindowClosed):
+				call()
+		self.assertEqual(self.server.requests, [])
+		self._inbound(self.direct_gateway)
+		before = len(self.server.requests)
+		invalid = [
+			lambda: adapter.send_sticker(SENDER),
+			lambda: adapter.send_location(SENDER, 91, 2),
+			lambda: adapter.send_contacts(SENDER, []),
+			lambda: adapter.send_reaction(SENDER, "wamid.X", "not an emoji"),
+			lambda: adapter.send_interactive(SENDER, "buttons", {"body": "b", "buttons": ["1", "2", "3", "4"]}),
+			lambda: adapter.send_interactive(SENDER, "flow", {"body": "b", "flow_cta": "Go"}),
+		]
+		for call in invalid:
+			with self.assertRaises(bridge.BridgeError) as cm:
+				call()
+			self.assertEqual(cm.exception.payload["error"], "validation_failed")
+		self.assertEqual(len(self.server.requests), before)
+
+	def test_media_upload_then_send_by_id(self):
+		adapter = gateway_webhook.get_gateway_adapter(self.direct_gateway)
+		self._inbound(self.direct_gateway)
+		image_id = adapter.upload_media(PNG, "image/png", "p.png")
+		sticker_id = adapter.upload_media(WEBP_STATIC, "image/webp", "s.webp")
+		voice_id = adapter.upload_media(OGG, "audio/ogg; codecs=opus", "v.ogg", voice=True)
+		uploads = self.server.requests_to("POST", "/media")
+		self.assertEqual(len(uploads), 3)
+		self.assertEqual([self.server.uploaded_media[i]["kind"] for i in (image_id, sticker_id, voice_id)], ["image", "sticker", "audio"])
+		adapter.send_media(SENDER, "image", media_id=image_id, caption="by id")
+		adapter.send_sticker(SENDER, media_id=sticker_id)
+		adapter.send_media(SENDER, "audio", media_id=voice_id, voice=True)
+		self.assertEqual([m["type"] for m in self.server.sent[-3:]], ["image", "sticker", "audio"])
+
+	def test_upload_caps_are_enforced_before_meta_is_called(self):
+		adapter = gateway_webhook.get_gateway_adapter(self.direct_gateway)
+		for content, mime, kind, code in (
+			(WEBP_STATIC + b"\x00" * (100 * 1024), "image/webp", None, "too_large"),
+			(b"x" * (5 * 1024 * 1024 + 1), "image/png", None, "too_large"),
+			(b"GIF89a", "image/gif", None, "unsupported_mime"),
+		):
+			with self.assertRaises(bridge.BridgeError) as cm:
+				adapter.upload_media(content, mime, "f", kind=kind)
+			self.assertEqual(cm.exception.payload["errors"][0]["code"], code)
+		with self.assertRaises(bridge.BridgeError) as cm:
+			adapter.upload_media(OGG, "audio/mpeg", "v.mp3", voice=True)
+		self.assertEqual(cm.exception.payload["errors"][0]["code"], "voice_needs_ogg_opus")
+		self.assertEqual(self.server.requests_to("POST", "/media"), [])
+		# the largest animated sticker is accepted, the static cap does not apply to it
+		big_animated = WEBP_ANIMATED + b"\x00" * (500 * 1024 - len(WEBP_ANIMATED))
+		self.assertTrue(adapter.upload_media(big_animated, "image/webp", "a.webp"))
+
+	def test_typed_agent_tool_actions_direct(self):
+		args = {"to": SENDER, "gateway_name": self.direct_gateway.name}
+		closed = json.loads(wa_tool.handle_action("send_location", latitude=1, longitude=2, **args))
+		self.assertEqual(closed["error"], "proactive_send_not_permitted")
+		self.assertEqual(self.server.requests, [])
+		self._inbound(self.direct_gateway)
+		with patch.object(wa_tool, "_get_whatsapp_credentials", return_value=(self.server.phone_id, self.server.token)):
+			for action, extra, mtype in (
+				("send_location", {"latitude": 1, "longitude": 2}, "location"),
+				("send_contact", {"contact_name": "Ann", "contact_phone": "+15551230000"}, "contacts"),
+				("send_reaction", {"message_id": "wamid.IN1", "emoji": "\U0001F525"}, "reaction"),
+				("send_buttons", {"body": "b", "buttons": [{"id": "a", "title": "A"}]}, "interactive"),
+				("send_list", {"body": "b", "button_text": "Go", "sections": [{"id": "1", "title": "One"}]}, "interactive"),
+				("send_cta_url", {"body": "b", "display_text": "Go", "url": "https://shop.example"}, "interactive"),
+				("send_sticker", {"media_id": "42"}, "sticker"),
+				("send_image", {"link": "https://cdn.example/a.png"}, "image"),
+			):
+				res = json.loads(wa_tool.handle_action(action, **extra, **args))
+				self.assertTrue(res["success"], (action, res))
+				self.assertEqual(self.server.sent[-1]["type"], mtype)
 
 
 class TestBridgeMode(FakeGraphCase):
@@ -615,6 +734,119 @@ class TestBridgeMode(FakeGraphCase):
 		result = self._deliver_webhook(self.bridge_gateway, approved)
 		self.assertEqual(result["template_updates"], 1)
 		self.assertEqual(frappe.db.get_value("WhatsApp Templates", created["name"], "status"), "APPROVED")
+
+	# ---------------------------------------------------- non-text types (T5)
+	def _opt_out(self, gateway):
+		frappe.db.set_value("Gateway Access Entry", {"gateway": gateway.name, "external_id": SENDER}, "state", "Opted out")
+
+	def _typed_calls(self):
+		gw = self.bridge_gateway.name
+		contact = [{"name": {"formatted_name": "Ann Lee"}, "emails": [{"email": "ann@example.com", "type": "WORK"}]}]
+		return {
+			"send_location_message": (dict(latitude=12.97, longitude=77.59, name="Office"), "location", "location"),
+			"send_contacts_message": (dict(contacts=json.dumps(contact)), "contacts", "contact"),
+			"send_reaction_message": (dict(message_id="wamid.IN1", emoji="\U0001F44D"), "reaction", "reaction"),
+			"send_sticker_message": (dict(link="https://cdn.example/s.webp"), "sticker", "image"),
+			"send_interactive_message": (
+				dict(kind="buttons", body="Pick", buttons=json.dumps([{"id": "a", "title": "A"}]), footer="Foot"), "interactive", "interactive",
+			),
+			"send_media_message": (dict(kind="audio", media_id="MEDIA7", voice=True), "audio", "audio"),
+		}, gw
+
+	def test_management_type_endpoints_send_once_and_mirror_one_row(self):
+		self._inbound(self.bridge_gateway)
+		calls, gw = self._typed_calls()
+		for endpoint, (kwargs, mtype, content_type) in calls.items():
+			posts_before = len(self.server.requests_to("POST", "/messages"))
+			result = getattr(mgmt, endpoint)(gateway_name=gw, to=SENDER, **kwargs)
+			self.assertTrue(result["success"], (endpoint, result))
+			# exactly one Graph send, and frappe_whatsapp did not send the mirror row again
+			self.assertEqual(len(self.server.requests_to("POST", "/messages")) - posts_before, 1, endpoint)
+			self.assertEqual(self.server.sent[-1]["type"], mtype)
+			self.assertEqual(self.server.sent[-1]["_wamid"], result["message_id"])
+			rows = frappe.get_all("WhatsApp Message", filters={"message_id": result["message_id"]}, fields=["content_type", "type", "to", "status"])
+			self.assertEqual(len(rows), 1, endpoint)
+			self.assertEqual((rows[0].content_type, rows[0].type), (content_type, "Outgoing"))
+
+	def test_management_type_endpoints_window_and_opt_out(self):
+		calls, gw = self._typed_calls()
+		for endpoint, (kwargs, _m, _c) in calls.items():
+			self.assertEqual(getattr(mgmt, endpoint)(gateway_name=gw, to=SENDER, **kwargs)["error"], "window_closed", endpoint)
+		self.assertEqual(self.server.requests, [])
+		self._inbound(self.bridge_gateway)
+		self._opt_out(self.bridge_gateway)
+		for endpoint, (kwargs, _m, _c) in calls.items():
+			self.assertEqual(getattr(mgmt, endpoint)(gateway_name=gw, to=SENDER, **kwargs)["error"], "opted_out", endpoint)
+		self.assertEqual(self.server.requests_to("POST", "/messages"), [])
+
+	def test_management_type_endpoints_validate_without_calling_meta(self):
+		self._inbound(self.bridge_gateway)
+		gw = self.bridge_gateway.name
+		bad = [
+			mgmt.send_location_message(gateway_name=gw, to=SENDER, latitude=0, longitude=181),
+			mgmt.send_contacts_message(gateway_name=gw, to=SENDER, contacts=json.dumps([{"phones": []}])),
+			mgmt.send_reaction_message(gateway_name=gw, to=SENDER, message_id="", emoji="x"),
+			mgmt.send_interactive_message(gateway_name=gw, to=SENDER, kind="list", body="b", button_text="o" * 21, sections=json.dumps([{"id": "1", "title": "t"}])),
+			mgmt.send_interactive_message(gateway_name=gw, to=SENDER, kind="cta_url", body="b", display_text="go", url="http://insecure.example"),
+			mgmt.send_interactive_message(gateway_name=gw, to=SENDER, kind="flow", body="b", flow_cta="Start"),
+			mgmt.send_sticker_message(gateway_name=gw, to=SENDER),
+		]
+		for res in bad:
+			self.assertEqual(res["error"], "validation_failed", res)
+		self.assertIn("flow_id_required", [e["code"] for e in bad[5]["errors"]])
+		self.assertEqual(self.server.requests_to("POST", "/messages"), [])
+
+	def test_private_file_is_uploaded_then_sent_by_media_id(self):
+		self._inbound(self.bridge_gateway)
+		gw = self.bridge_gateway.name
+		suffix = frappe.generate_hash(length=6)
+		png = frappe.get_doc({"doctype": "File", "file_name": f"fg-{suffix}.png", "is_private": 1, "content": PNG}).insert(ignore_permissions=True)
+		res = mgmt.send_media_message(gateway_name=gw, to=SENDER, kind="image", file_url=png.file_url, caption="uploaded")
+		self.assertTrue(res["success"], res)
+		uploads = self.server.requests_to("POST", "/media")
+		self.assertEqual(len(uploads), 1)
+		media_id = next(iter(self.server.uploaded_media))
+		self.assertEqual(self.server.sent[-1]["image"], {"id": media_id, "caption": "uploaded"})
+		only = mgmt.upload_media_file(gateway_name=gw, file_url=png.file_url)
+		self.assertEqual((only["success"], only["kind"], only["mime_type"]), (True, "image", "image/png"))
+		self.assertIn(only["media_id"], self.server.uploaded_media)
+		# a sticker file over the static cap never reaches Meta
+		big = frappe.get_doc({"doctype": "File", "file_name": f"big-{suffix}.webp", "is_private": 1, "content": WEBP_STATIC + b"\x00" * (100 * 1024)}).insert(ignore_permissions=True)
+		uploads_before = len(self.server.requests_to("POST", "/media"))
+		refused = mgmt.send_sticker_message(gateway_name=gw, to=SENDER, file_url=big.file_url)
+		self.assertEqual(refused["error"], "validation_failed")
+		self.assertEqual(refused["errors"][0]["code"], "too_large")
+		self.assertEqual(len(self.server.requests_to("POST", "/media")), uploads_before)
+
+	def test_meta_rejection_is_structured_and_not_mirrored(self):
+		self._inbound(self.bridge_gateway)
+		before = frappe.db.count("WhatsApp Message")
+		with patch.object(self.server, "token", "revoked-token"):
+			res = mgmt.send_location_message(gateway_name=self.bridge_gateway.name, to=SENDER, latitude=1, longitude=2)
+		self.assertFalse(res["success"])
+		self.assertEqual(res["error"], "send_failed")
+		self.assertTrue(res.get("kind"))
+		self.assertEqual(frappe.db.count("WhatsApp Message"), before)
+		self.server.violations.clear()  # the rejected call is the point of this test
+
+	def test_typed_agent_tool_actions_via_bridge(self):
+		gw = self.bridge_gateway.name
+		args = {"to": SENDER, "gateway_name": gw, "latitude": 1, "longitude": 2}
+		self.assertEqual(json.loads(wa_tool.handle_action("send_location", **args))["error"], "proactive_send_not_permitted")
+		self._inbound(self.bridge_gateway)
+		for action, extra, mtype in (
+			("send_location", {"latitude": 1, "longitude": 2}, "location"),
+			("send_reaction", {"message_id": "wamid.IN1", "emoji": "\U0001F44D"}, "reaction"),
+			("send_buttons", {"body": "b", "buttons": [{"id": "a", "title": "A"}]}, "interactive"),
+			("send_sticker", {"media_id": "42"}, "sticker"),
+		):
+			posts = len(self.server.requests_to("POST", "/messages"))
+			res = json.loads(wa_tool.handle_action(action, to=SENDER, gateway_name=gw, **extra))
+			self.assertTrue(res["success"], (action, res))
+			self.assertEqual(len(self.server.requests_to("POST", "/messages")) - posts, 1)
+			self.assertTrue(frappe.db.exists("WhatsApp Message", {"message_id": res["data"]["message_id"]}))
+		self._opt_out(self.bridge_gateway)
+		self.assertEqual(json.loads(wa_tool.handle_action("send_location", **args))["error"], "opted_out")
 
 
 class TestTemplateWizard(FakeGraphCase):
@@ -972,3 +1204,115 @@ class TestFakeGraphServerEnforcesSchema(unittest.TestCase):
 		missing = self._msg(type="template", template={"name": "nope", "language": {"code": "en_US"}})
 		self.assertEqual(missing.json()["error"]["code"], 132001)
 		self.assertEqual(len(self.server.violations), 4)
+
+	def test_non_text_message_schema(self):
+		contact = {"name": {"formatted_name": "Ann"}, "phones": [{"phone": "+1555", "wa_id": "1555"}]}
+		button = lambda **kw: {"type": "button", "body": {"text": "b"}, "action": {"buttons": [{"type": "reply", "reply": {"id": "a", "title": "A"}}]}, **kw}  # noqa: E731
+		lst = lambda **kw: {"type": "list", "body": {"text": "b"}, "action": {"button": "Open", "sections": [{"title": "S", "rows": [{"id": "1", "title": "One"}]}]}, **kw}  # noqa: E731
+		cta = lambda **kw: {"type": "cta_url", "body": {"text": "b"}, "action": {"name": "cta_url", "parameters": {"display_text": "Go", "url": "https://a.example"}}, **kw}  # noqa: E731
+		ok = [
+			self._msg(type="sticker", sticker={"id": "1"}),
+			self._msg(type="audio", audio={"id": "1", "voice": True}),
+			self._msg(type="location", location={"latitude": 12.5, "longitude": -77.5, "name": "n", "address": "a"}),
+			self._msg(type="contacts", contacts=[contact]),
+			self._msg(type="reaction", reaction={"message_id": "wamid.X", "emoji": "\U0001F44D"}),
+			self._msg(type="reaction", reaction={"message_id": "wamid.X", "emoji": ""}),
+			self._msg(type="interactive", interactive=button(footer={"text": "f"}, header={"type": "text", "text": "h"})),
+			self._msg(type="interactive", interactive=lst()),
+			self._msg(type="interactive", interactive=cta(header={"type": "image", "image": {"link": "https://a.example/h.png"}})),
+			self._msg(type="interactive", interactive={"type": "location_request_message", "body": {"text": "where"}, "action": {"name": "send_location"}}),
+			self._msg(type="interactive", interactive={"type": "flow", "body": {"text": "b"}, "action": {"name": "flow", "parameters": {"flow_message_version": "3", "flow_id": "1", "flow_cta": "Go"}}}),
+		]
+		for resp in ok:
+			self.assertEqual(resp.status_code, 200, resp.text)
+		many_buttons = [{"type": "reply", "reply": {"id": str(i), "title": f"B{i}"}} for i in range(4)]
+		rows = lambda n: [{"title": "S", "rows": [{"id": str(i), "title": f"R{i}"} for i in range(n)]}]  # noqa: E731
+		bad = [
+			self._msg(type="sticker", sticker={"id": "1", "caption": "no"}),
+			self._msg(type="audio", audio={"id": "1", "voice": "yes"}),
+			self._msg(type="location", location={"latitude": 91, "longitude": 0}),
+			self._msg(type="location", location={"latitude": 1}),
+			self._msg(type="contacts", contacts=[]),
+			self._msg(type="contacts", contacts=[{"phones": []}]),
+			self._msg(type="contacts", contacts=[{**contact, "birthday": "1/1/90"}]),
+			self._msg(type="contacts", contacts=[{**contact, "nick": "x"}]),
+			self._msg(type="contacts", contacts={"name": {"formatted_name": "x"}}),
+			self._msg(type="reaction", reaction={"message_id": "", "emoji": "\U0001F44D"}),
+			self._msg(type="reaction", reaction={"message_id": "wamid.X"}),
+			self._msg(type="reaction", reaction={"message_id": "wamid.X", "emoji": "\U0001F44D"}, context={"message_id": "wamid.Y"}),
+			self._msg(type="interactive", interactive=button(action={"buttons": many_buttons})),
+			self._msg(type="interactive", interactive=button(action={"buttons": [{"type": "reply", "reply": {"id": "a", "title": "t" * 21}}]})),
+			self._msg(type="interactive", interactive=button(action={"buttons": [{"type": "reply", "reply": {"id": "a" * 257, "title": "t"}}]})),
+			self._msg(type="interactive", interactive=button(action={"buttons": [{"type": "reply", "reply": {"id": "a", "title": "t"}}, {"type": "reply", "reply": {"id": "b", "title": "t"}}]})),
+			self._msg(type="interactive", interactive=button(body={"text": "b" * 1025})),
+			self._msg(type="interactive", interactive=button(footer={"text": "f" * 61})),
+			self._msg(type="interactive", interactive=lst(action={"button": "Open", "sections": rows(11)})),
+			self._msg(type="interactive", interactive=lst(action={"button": "o" * 21, "sections": rows(1)})),
+			self._msg(type="interactive", interactive=lst(header={"type": "image", "image": {"link": "https://a.example/h.png"}})),
+			self._msg(type="interactive", interactive=lst(action={"button": "Open", "sections": [{"title": "t" * 25, "rows": rows(1)[0]["rows"]}]})),
+			self._msg(type="interactive", interactive=lst(action={"button": "Open", "sections": [{"title": "S", "rows": [{"id": "1", "title": "t" * 25}]}]})),
+			self._msg(type="interactive", interactive=lst(action={"button": "Open", "sections": [{"title": "S", "rows": [{"id": "1", "title": "t", "description": "d" * 73}]}]})),
+			self._msg(type="interactive", interactive=cta(action={"name": "cta_url", "parameters": {"display_text": "Go", "url": "http://a.example"}})),
+			self._msg(type="interactive", interactive=cta(action={"name": "cta_url", "parameters": {"display_text": "g" * 21, "url": "https://a.example"}})),
+			self._msg(type="interactive", interactive={"type": "location_request_message", "body": {"text": "w"}, "action": {"name": "send_location"}, "footer": {"text": "f"}}),
+			self._msg(type="interactive", interactive={"type": "flow", "body": {"text": "b"}, "action": {"name": "flow", "parameters": {"flow_cta": "Go"}}}),
+			self._msg(type="interactive", interactive={"type": "carousel", "body": {"text": "b"}, "action": {}}),
+		]
+		for resp in bad:
+			self.assertEqual(resp.status_code, 400, resp.text)
+		self.assertEqual(len(self.server.violations), len(bad))
+
+	def _upload(self, content, mime, field_type=None, token=None, **fields):
+		data = {"messaging_product": "whatsapp", "type": field_type if field_type is not None else mime, **fields}
+		data = {k: v for k, v in data.items() if v is not None}
+		return requests.post(
+			f"{self.server.url}/{self.server.version}/{self.server.phone_id}/media", data=data, files={"file": ("f", content, mime)},
+			headers={"Authorization": f"Bearer {token or self.server.token}"}, timeout=5,
+		)
+
+	def test_media_upload_schema(self):
+		kb = 1024
+		static = WEBP_STATIC
+		ok = [
+			self._upload(PNG, "image/png"),
+			self._upload(b"x" * (5 * 1024 * 1024), "image/jpeg"),
+			self._upload(OGG, "audio/ogg"),
+			self._upload(b"%PDF", "application/pdf"),
+			self._upload(static + b"\x00" * (100 * kb - len(static)), "image/webp"),
+			self._upload(WEBP_ANIMATED + b"\x00" * (500 * kb - len(WEBP_ANIMATED)), "image/webp"),
+		]
+		for resp in ok:
+			self.assertEqual(resp.status_code, 200, resp.text)
+			self.assertIn(resp.json()["id"], self.server.uploaded_media)
+		bad = [
+			self._upload(b"x" * (5 * 1024 * 1024 + 1), "image/png"),
+			self._upload(static + b"\x00" * (100 * kb), "image/webp"),
+			self._upload(WEBP_ANIMATED + b"\x00" * (500 * kb), "image/webp"),
+			self._upload(b"GIF89a", "image/gif"),
+			self._upload(PNG, "image/png", field_type="image/jpeg"),
+			self._upload(PNG, "image/png", field_type=""),
+			self._upload(b"", "image/png"),
+			self._upload(PNG, "image/png", messaging_product=None),
+			self._upload(PNG, "image/png", token="wrong"),
+		]
+		for resp in bad:
+			self.assertIn(resp.status_code, (400, 401), resp.text)
+		self.assertEqual(bad[0].json()["error"]["code"], 131053)
+		self.assertEqual(len(self.server.violations), len(bad))
+
+	def test_media_id_must_be_used_for_its_upload_kind(self):
+		image_id = self._upload(PNG, "image/png").json()["id"]
+		sticker_id = self._upload(WEBP_STATIC, "image/webp").json()["id"]
+		mp3_id = self._upload(b"ID3", "audio/mpeg").json()["id"]
+		self.assertEqual(self._msg(type="image", image={"id": image_id}).status_code, 200)
+		self.assertEqual(self._msg(type="sticker", sticker={"id": sticker_id}).status_code, 200)
+		bad = [
+			self._msg(type="sticker", sticker={"id": image_id}),
+			self._msg(type="image", image={"id": sticker_id}),
+			self._msg(type="audio", audio={"id": mp3_id, "voice": True}),
+		]
+		for resp in bad:
+			self.assertEqual(resp.status_code, 400, resp.text)
+			self.assertEqual(resp.json()["error"]["code"], 131053)
+		self.assertEqual(self._msg(type="audio", audio={"id": mp3_id}).status_code, 200)
+		self.assertEqual(len(self.server.violations), len(bad))

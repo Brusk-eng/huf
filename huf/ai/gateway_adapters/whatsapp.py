@@ -17,6 +17,8 @@ from typing import Any
 
 import frappe
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+from huf.ai.gateway_adapters import whatsapp_errors as we
+from huf.ai.gateway_adapters import whatsapp_format as wf
 from huf.ai.gateway_adapters import whatsapp_inbound as inbound
 from huf.ai.gateway_adapters import whatsapp_templates as wt
 from huf.ai.gateway_adapters.whatsapp_bridge import direct_send_components, send_error
@@ -48,6 +50,56 @@ class WhatsAppWindowClosed(frappe.ValidationError):
 
 
 @dataclass(frozen=True)
+class WhatsAppSendError(ValueError):
+	"""A Graph send failed. ``classification`` is the :func:`whatsapp_errors.classify` result."""
+
+	def __init__(self, message: str, classification: dict[str, Any] | None = None):
+		super().__init__(message)
+		self.classification = classification or we.classify(message)
+
+
+class WhatsAppPartsError(Exception):
+	"""A multi-part text reply stopped part-way.
+
+	``sent_ids`` are the wamids already accepted by Meta (in order), ``remaining`` the formatted
+	parts still to send, ``cause`` the original error. Retry the SEND with ``remaining`` only.
+	"""
+
+	def __init__(self, cause: BaseException, sent_ids: list[str], remaining: list[str]):
+		super().__init__(str(cause))
+		self.cause = cause
+		self.sent_ids = list(sent_ids)
+		self.remaining = list(remaining)
+
+
+def classify_send_exception(exc: BaseException) -> dict[str, Any]:
+	"""Classify whatever a WhatsApp send path raised (parts error, bridge error, Graph error, timeout)."""
+	if isinstance(exc, WhatsAppPartsError):
+		return classify_send_exception(exc.cause)
+	if isinstance(exc, WhatsAppWindowClosed):
+		return we.classify((None, {"error": {"code": 131047, "message": str(exc)}}))
+	if isinstance(exc, WhatsAppSendError):
+		return exc.classification
+	if isinstance(exc, bridge.BridgeError):
+		payload = exc.payload if isinstance(exc.payload, dict) else {}
+		code = payload.get("graph_code")
+		if code is not None or payload.get("kind"):
+			base = we.classify((None, {"error": {"code": code, "message": payload.get("message") or ""}})) if code is not None else {}
+			return {
+				"code": code,
+				"subcode": payload.get("subcode"),
+				"kind": payload.get("kind") or base.get("kind") or "unknown",
+				"retryable": bool(payload.get("retryable", base.get("retryable"))),
+				"retry_after_hint": base.get("retry_after_hint"),
+				"operator_text": payload.get("operator_text") or base.get("operator_text") or "",
+				"user_msg": payload.get("user_msg"),
+				"message": payload.get("message") or "",
+				"http_status": base.get("http_status"),
+			}
+		return we.classify(str(payload.get("message") or payload.get("error") or exc))
+	return we.classify(exc)
+
+
 class WhatsAppParsed:
 	"""Everything actionable in one Meta webhook delivery (batched payloads, A5/A14)."""
 
@@ -109,6 +161,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		self._fallback_template = str(ctx.get("fallback_template") or "").strip()
 		self._fallback_language = str(ctx.get("fallback_template_language") or "").strip() or DEFAULT_TEMPLATE_LANGUAGE
 
+		self._preview_url = str(ctx.get("preview_url") or "").strip().lower() == "on"
 	# ------------------------------------------------------------------ ingress
 	def verify_url(self, request: GatewayInboundRequest) -> str:
 		"""Return Meta hub.challenge if the verify token matches the GET request."""
@@ -327,27 +380,100 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			return self._send_reply_media(reply)
 
 		if self._bridge_mode():
-			result = bridge.send_text(
-				self._account,
-				reply.conversation_id,
-				reply.text,
-				reply_to=reply.reply_to_provider_message_id,
-				trusted=True,
-			)
-			return _delivery_from_bridge(result)
+		parts = wf.split_body(wf.to_whatsapp(reply.text)) or ([str(reply.text)] if str(reply.text or "").strip() else [])
+		if not parts:
+			raise ValueError("Cannot send an empty WhatsApp reply")
+		try:
+			return self._send_parts(reply.conversation_id, parts, reply.reply_to_provider_message_id)
+		except WhatsAppPartsError as exc:
+			raise exc.cause from exc  # callers of send_reply see the underlying send error
+
+	def send_text_parts(
+		self, conversation_id: str, parts: list[str], reply_to: str | None = None
+	) -> OutboundDelivery:
+		"""Send already formatted text parts in order; each part only after the previous was accepted.
+
+		The ``reply_to`` quote goes on the first part sent by this call only. On failure raises
+		:class:`WhatsAppPartsError` (what was sent, what remains). A 131047 (window closed) on the very first
+		part uses the Gateway's fallback template when one is configured.
+		"""
+		if self._gateway_name:
+			state = bridge.window_state(self._gateway_name, conversation_id)
+			if not state.get("open"):
+				if self._fallback_template:
+					return self._window_fallback(conversation_id)
+				raise WhatsAppWindowClosed(
+					f"WhatsApp 24-hour customer-service window is closed for {conversation_id}. "
+					"Free-form replies are not allowed; set a Fallback template on the Gateway "
+					"or wait for the customer to message again."
+				)
+		return self._send_parts(conversation_id, parts, reply_to)
+
+	def _send_parts(self, conversation_id: str, parts: list[str], reply_to: str | None) -> OutboundDelivery:
+		sent: list[str] = []
+		responses: list[Mapping[str, Any]] = []
+		for part in parts:
+			try:
+				delivery = self._send_text_part(conversation_id, part, reply_to if not sent else None)
+			except Exception as exc:
+				if not sent and self._fallback_template and classify_send_exception(exc).get("code") == 131047:
+					return self._window_fallback(conversation_id)
+				raise WhatsAppPartsError(exc, sent, list(parts[len(sent):])) from exc
+			sent.append(delivery.provider_message_id)
+			responses.append(delivery.provider_response)
+		if not sent:
+			raise ValueError("Cannot send an empty WhatsApp reply")
+		return OutboundDelivery(
+			provider_message_id=sent[0],
+			provider_response={**dict(responses[0]), "message_ids": sent, "parts": len(sent)},
+		)
+
+	def _window_fallback(self, to: str) -> OutboundDelivery:
+		language = self._fallback_language
+			language = bridge.template_language(self._account, self._fallback_template, language) or language
+		delivery = self.send_template(to, self._fallback_template, language, [], trusted=True)
+		return OutboundDelivery(
+			provider_message_id=delivery.provider_message_id,
+			provider_response={**dict(delivery.provider_response), "fallback_template_sent": True},
+		)
 
 		data: dict[str, Any] = {
+	def _send_text_part(self, to: str, text: str, reply_to: str | None) -> OutboundDelivery:
+		if self._bridge_mode():
+			return _delivery_from_bridge(
+				bridge.send_text(
+					self._account, to, text, reply_to=reply_to, trusted=True, preview_url=self._preview_url
+				)
+			)
 			"messaging_product": "whatsapp",
 			"recipient_type": "individual",
-			"to": bridge.normalize_phone(reply.conversation_id),
+			"to": bridge.normalize_phone(to),
 			"type": "text",
-			"text": {"preview_url": False, "body": reply.text},
+			"text": {"preview_url": self._preview_url, "body": text},
 		}
-		if reply.reply_to_provider_message_id:
-			data["context"] = {"message_id": reply.reply_to_provider_message_id}
+		if reply_to:
+			data["context"] = {"message_id": reply_to}
 		return self._graph_send(data)
 
 	def _send_reply_media(self, reply: GatewayReply) -> OutboundDelivery:
+	def mark_read_typing(self, message_id: str) -> bool:
+		"""Mark an inbound wamid read and show the typing indicator (<= 25 s). Best effort: never raises, no retry."""
+		try:
+			if not message_id:
+				return False
+			if self._bridge_mode():
+				return bridge.mark_read_typing(self._account, message_id)
+			response = self._http_post(
+				f"{self._graph_url}/{self._phone_number_id}/messages",
+				json=bridge.read_typing_payload(message_id),
+				headers={"Authorization": f"Bearer {self._access_token}", "Content-Type": "application/json"},
+				timeout=bridge.READ_TYPING_TIMEOUT,
+			)
+			status = getattr(response, "status_code", 200)
+			return not (isinstance(status, int) and status >= 400)
+		except Exception:
+			return False
+
 		"""Send the first attachment of a reply (caption = reply text), then audio's text separately."""
 		att = reply.attachments[0]
 		kind = (att.kind if att.kind in wt.MEDIA_KINDS else "") or _kind_from_mime(att.mime_type)
@@ -404,14 +530,14 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		reply_to: str | None = None,
 		trusted: bool = False,
 	) -> OutboundDelivery:
-		"""Send an image/document/audio/video (by public link or uploaded media id).
+		"""Send an image/document/audio/video/sticker (by public link or uploaded media id).
 
 		Free-form media is subject to the same 24h customer-service window as text:
 		a closed window raises :class:`WhatsAppWindowClosed` (there is no template
-		fallback for media). Bridge mode sends by link only.
+		fallback for media). ``voice=True`` sends audio as a voice note (Ogg/Opus).
 		"""
 		self._ensure_window(to)
-		return self._deliver_media(to, kind, link, media_id, caption, filename, reply_to, trusted)
+		return self._deliver_media(to, kind, link, media_id, caption, filename, reply_to, trusted, voice)
 
 	def _ensure_window(self, to: str) -> None:
 		if self._gateway_name and not bridge.window_state(self._gateway_name, to).get("open"):
@@ -421,16 +547,16 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			)
 
 	def _deliver_media(
-		self, to, kind, link=None, media_id=None, caption=None, filename=None, reply_to=None, trusted=False
+		self, to, kind, link=None, media_id=None, caption=None, filename=None, reply_to=None, trusted=False, voice=None
 	) -> OutboundDelivery:
 		if self._bridge_mode():
 			return _delivery_from_bridge(
 				bridge.send_media(
 					self._account, to, kind, link=link, media_id=media_id, caption=caption,
-					filename=filename, reply_to=reply_to, trusted=trusted,
+					filename=filename, reply_to=reply_to, trusted=trusted, voice=voice,
 				)
 			)
-		media, errors = wt.validate_media_request(kind, link, media_id, caption, filename)
+		media, errors = wt.validate_media_request(kind, link, media_id, caption, filename, voice)
 		if errors:
 			raise bridge.BridgeError(wt.validation_error(errors))
 		return self._graph_send(wt.build_media_payload(bridge.normalize_phone(to), media, reply_to))
@@ -514,6 +640,7 @@ def _as_list(value: Any) -> list:
 	return list(value) if isinstance(value, (list, tuple)) else []
 
 
+		voice: bool | None = None,
 def _contact_names(value: Mapping[str, Any]) -> dict[str, str]:
 	names: dict[str, str] = {}
 	for contact in _as_list(value.get("contacts")):
