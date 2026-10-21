@@ -72,6 +72,7 @@ export function SendPanel({
           <p role="alert" className="text-xs text-destructive">
             {errorText(sendError)}
             {sendError.error === 'window_closed' && ' Send an approved template instead.'}
+            {sendError.error.startsWith('media_link_') && ' Uploading the file is the reliable way to send media.'}
           </p>
         )}
       </CollapsibleContent>
