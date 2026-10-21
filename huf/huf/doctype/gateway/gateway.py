@@ -45,6 +45,7 @@ class Gateway(Document):
         self._validate_whatsapp()
         self._validate_fallback_template()
         self._validate_consent_settings()
+        self._validate_reply_settings()
 
         # ST-04.4: Validate required credentials are set
         if self.is_enabled and self.provider:
@@ -265,6 +266,16 @@ class Gateway(Document):
                     self.name, self.execution_user, self.default_agent
                 )
             )
+
+    def _validate_reply_settings(self):
+        attempts = self.get("retry_max_attempts")
+        if attempts is not None and not 0 <= int(attempts) <= 10:
+            frappe.throw(_("Reply send attempts must be between 1 and 10 (0 uses the default of 4)."))
+        text = (self.get("error_reply_text") or "").strip()
+        if len(text) > 1000:
+            frappe.throw(_("Error reply text must be 1000 characters or fewer."))
+        if self.get("preview_url") not in (None, "", "Default (off)", "On", "Off"):
+            frappe.throw(_("Link previews must be Default (off), On or Off."))
 
     def _validate_consent_settings(self):
         limit = self.get("inbound_sender_limit")

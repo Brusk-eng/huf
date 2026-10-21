@@ -1085,6 +1085,7 @@ class TestWhatsAppGatewayService(unittest.TestCase):
             conversation_id="1234567890",
             sender_id="1234567890",
             provider_event_id="wamid.in",
+            reply_message_id="",
             raw_payload={"message": {"type": "text", "text": {"body": "hello"}}, "quoted_message_id": "wamid.prev"},
         )
         values.update(overrides)
@@ -1097,8 +1098,10 @@ class TestWhatsAppGatewayService(unittest.TestCase):
         mock_frappe.get_doc.side_effect = [event, configured, MagicMock(allow_guest=True, owner="bot")]
         mock_run = MagicMock(return_value={"agent_run_id": "AR-1", "response": "hi back"})
         with patch.dict(sys.modules, {"huf.ai.agent_integration": SimpleNamespace(run_agent_sync=mock_run)}), patch(
-            "huf.ai.gateway_webhook.send_gateway_reply", side_effect=send_side_effect, return_value=send_return
-        ), patch("huf.ai.gateway_service._save_whatsapp_media", return_value=[]):
+            "huf.ai.gateway_webhook.send_gateway_parts", side_effect=send_side_effect, return_value=send_return
+        ), patch("huf.ai.gateway_service.is_opted_out", return_value=False), patch(
+            "huf.ai.gateway_service._save_whatsapp_media", return_value=[]
+        ):
             result = gateway_service.process_gateway_event(event.name)
         return result, mock_run
 

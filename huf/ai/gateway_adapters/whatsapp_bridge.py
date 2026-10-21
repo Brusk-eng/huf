@@ -258,6 +258,21 @@ def message_time(raw_payload: Any) -> datetime | None:
 	return frappe.utils.convert_utc_to_system_timezone(utc).replace(tzinfo=None)
 
 
+def is_reaction_payload(raw_payload: Any) -> bool:
+	"""True when a stored Gateway Event ``raw_payload`` describes an inbound reaction."""
+	if isinstance(raw_payload, (str, bytes)):
+		try:
+			raw_payload = json.loads(raw_payload)
+		except ValueError:
+			return False
+	if not isinstance(raw_payload, dict):
+		return False
+	if raw_payload.get("kind") == "reaction":
+		return True
+	message = raw_payload.get("message")
+	return isinstance(message, dict) and message.get("type") == "reaction"
+
+
 def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> dict[str, Any]:
 	"""Compute the 24h customer-service window from signed Gateway Events only (A3).
 
@@ -287,6 +302,8 @@ def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> 
 	for row in rows or []:
 		if not row.get("verified_sender"):
 			continue
+		if is_reaction_payload(row.get("raw_payload")):
+			continue  # a reaction never opens or extends the customer-service window
 		ts = row.get("received_at")
 		if not ts:
 			continue
@@ -302,8 +319,6 @@ def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> 
 
 
 def record_incoming(account_name: str, message: dict[str, Any], profile_name: str | None = None) -> str | None:
-		if is_reaction_payload(row.get("raw_payload")):
-			continue  # a reaction never opens or extends the customer-service window
 	"""Idempotently mirror a signed inbound message into ``WhatsApp Message``.
 
 	Returns the doc name, or None when unavailable / no message id. Does not
@@ -358,8 +373,14 @@ def send_text(
 	text: str,
 	reply_to: str | None = None,
 	trusted: bool = False,
+	preview_url: bool | None = None,
+	http_post: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
 	"""Send a free-form text via ``WhatsApp Message`` (it performs the one send, A1).
+
+	``preview_url`` (gateway reply path, ``trusted`` only): when not None the text is posted to Graph
+	directly with the account credentials (frappe_whatsapp hardcodes ``preview_url: true``) and the
+	outgoing row is mirrored afterwards without a second send. Management sends leave it None.
 
 	``trusted=True`` is only for the gateway-internal reply path and skips
 	permission checks; user-initiated calls must leave it False. Raises
@@ -380,10 +401,6 @@ def send_text(
 		values["is_reply"] = 1
 		values["reply_to_message_id"] = reply_to
 	try:
-	``preview_url`` (gateway reply path, ``trusted`` only): when not None the text is posted to Graph
-	directly with the account credentials (frappe_whatsapp hardcodes ``preview_url: true``) and the
-	outgoing row is mirrored afterwards without a second send. Management sends leave it None.
-
 		doc = frappe.get_doc(values)
 		doc.insert(ignore_permissions=bool(trusted))
 		if trusted:
@@ -397,23 +414,6 @@ def send_text(
 	return _readback(doc)
 
 
-def _template_docname(account_name: str, template_name: str, language_code: str | None = None) -> str:
-	"""Map a Meta template name to the ``WhatsApp Templates`` document name, within one account.
-
-	``WhatsApp Message.template`` is a Link to the document, whose name is
-	``<template_name>-<language_code>`` and not the bare Meta name. With several
-	languages for one template, ``language_code`` picks the matching row. Every lookup
-	is filtered by ``whatsapp_account``: another account's template of the same name is
-	never returned (an unmatched name is returned unchanged for the caller to reject).
-	"""
-	scoped = frappe.db.get_value(
-		"WhatsApp Templates", {"name": template_name, "whatsapp_account": account_name}, "name"
-	)
-	if scoped:
-		return scoped
-	for field in ("actual_name", "template_name"):
-		filters = {"whatsapp_account": account_name, field: template_name}
-		if language_code:
 def _text_payload(to: str, text: str, reply_to: str | None, preview_url: bool) -> dict[str, Any]:
 	data: dict[str, Any] = {
 		"messaging_product": "whatsapp",
@@ -489,6 +489,23 @@ def read_typing_payload(message_id: str) -> dict[str, Any]:
 	}
 
 
+def _template_docname(account_name: str, template_name: str, language_code: str | None = None) -> str:
+	"""Map a Meta template name to the ``WhatsApp Templates`` document name, within one account.
+
+	``WhatsApp Message.template`` is a Link to the document, whose name is
+	``<template_name>-<language_code>`` and not the bare Meta name. With several
+	languages for one template, ``language_code`` picks the matching row. Every lookup
+	is filtered by ``whatsapp_account``: another account's template of the same name is
+	never returned (an unmatched name is returned unchanged for the caller to reject).
+	"""
+	scoped = frappe.db.get_value(
+		"WhatsApp Templates", {"name": template_name, "whatsapp_account": account_name}, "name"
+	)
+	if scoped:
+		return scoped
+	for field in ("actual_name", "template_name"):
+		filters = {"whatsapp_account": account_name, field: template_name}
+		if language_code:
 			name = frappe.db.get_value("WhatsApp Templates", {**filters, "language_code": language_code}, "name")
 			if name:
 				return name
@@ -1020,6 +1037,8 @@ def send_media(
 	filename: str | None = None,
 	reply_to: str | None = None,
 	trusted: bool = False,
+	voice: bool | None = None,
+	http_post: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
 	"""Send an image/document/audio/video/sticker; exactly one Graph call.
 
@@ -1033,12 +1052,13 @@ def send_media(
 	media, errors = wt.validate_media_request(kind, link, media_id, caption, filename, voice)
 	if errors:
 		raise BridgeError(wt.validation_error(errors))
+	if media["media_id"] or media["kind"] == "sticker" or media["voice"] or media["filename"]:
+		payload = wt.build_media_payload(normalize_phone(to), media, reply_to)
+		return _send_payload(account_name, payload, trusted, http_post)
 	values = {
 		"doctype": "WhatsApp Message",
 		"type": "Outgoing",
 		"to": normalize_phone(to),
-	voice: bool | None = None,
-	http_post: Callable[..., Any] | None = None,
 		"message": media["caption"],
 		"content_type": media["kind"],
 		"attach": media["link"],
@@ -1059,111 +1079,6 @@ def send_media(
 	return _readback(doc)
 
 
-def list_templates(account_name: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
-	"""List one account's WhatsApp Templates (empty list when the bridge is unavailable).
-
-	An account is required: without one this raises ``gateway_required`` instead of
-	returning every account's templates.
-	"""
-	if not is_available():
-		return []
-	if not account_name:
-		raise BridgeError(_gateway_required())
-	filters: dict[str, Any] = {"whatsapp_account": account_name}
-	if status:
-		filters["status"] = status
-	rows = frappe.get_list(
-		"WhatsApp Templates",
-		filters=filters,
-		fields=[
-			"name", "template_name", "actual_name", "category", "language_code", "status", "id",
-			"whatsapp_account", "template", "header_type", "header", "footer", "sample_values",
-		],
-		order_by="modified desc",
-		limit_page_length=500,
-	)
-	_attach_state(rows)
-	for row in rows:
-		extra = _get_extra(row.get("whatsapp_account"), row["name"]) or {}
-		row["header_format"] = str(extra.get("header_format") or row.get("header_type") or "").upper()
-	return rows
-
-
-def _attach_state(rows: list[dict[str, Any]]) -> None:
-	"""Add review/quality state columns to listed template rows (best effort), matched per account."""
-	try:
-		states = {
-			(r.get("whatsapp_account") or "", r["template"]): r
-			for r in frappe.get_all(
-				STATE_DOCTYPE,
-				filters={"template": ["in", [r["name"] for r in rows] or [""]]},
-				fields=["template", "whatsapp_account", "rejected_reason", "quality_score", "correct_category", "last_meta_update"],
-			)
-		}
-	except Exception:
-		states = {}
-	for row in rows:
-		st = states.get((row.get("whatsapp_account") or "", row["name"])) or {}
-		row["rejected_reason"] = st.get("rejected_reason") or ""
-		row["quality_score"] = st.get("quality_score") or "UNKNOWN"
-		row["correct_category"] = st.get("correct_category") or ""
-		row["category_change_pending"] = bool(row["correct_category"] and row["correct_category"] != row.get("category"))
-		row["last_meta_update"] = str(st["last_meta_update"]) if st.get("last_meta_update") else None
-
-
-def _check_sample_reference(sample: str) -> dict[str, str] | None:
-	"""Media header sample must be fetchable by frappe_whatsapp: public http(s) URL or an existing File."""
-	if wt.is_http_url(sample):
-		parsed = urlparse(sample)
-		if getattr(frappe.flags, "in_test", False):
-			return None
-		if parsed.scheme != "https" or _is_private_host(parsed.hostname or ""):
-			return wt._e("sample", "invalid_sample", "Sample URL must be a public https URL.")
-		return None
-	if not frappe.db.exists("File", {"file_url": sample}):
-	voice: bool | None = None,
-	http_post: Callable[..., Any] | None = None,
-		return wt._e("sample", "sample_not_found", "No uploaded file matches this sample path.")
-	return None
-
-
-def _is_private_host(host: str) -> bool:
-	import ipaddress
-	import socket
-
-	host = host.strip("[]").lower()
-	if host in ("localhost", "") or host.endswith(".localhost") or host.endswith(".local"):
-		return True
-	try:
-		addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
-	except OSError:
-	if media["media_id"] or media["kind"] == "sticker" or media["voice"] or media["filename"]:
-		payload = wt.build_media_payload(normalize_phone(to), media, reply_to)
-		return _send_payload(account_name, payload, trusted, http_post)
-		return False  # unresolved here; the fetch will fail and be reported by frappe_whatsapp
-	for addr in addrs:
-		ip = ipaddress.ip_address(addr)
-		if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-			return True
-	return False
-
-
-def _language_link(language_code: str, given: Any) -> str | None:
-	"""``WhatsApp Templates.language`` (Link to Language) for a Meta language code."""
-	if given:
-		return str(given)
-	for candidate in (language_code.replace("_", "-"), language_code, language_code.split("_")[0]):
-		if frappe.db.exists("Language", candidate):
-			return candidate
-	return None
-
-
-_TEMPLATE_PASSTHROUGH = ("field_names", "for_doctype")
-
-
-def template_buttons(names: list[str]) -> dict[str, list[dict[str, Any]]]:
-	"""Button rows (``WhatsApp Button``) of the given templates, keyed by template name."""
-	if not names or not is_available():
 # ---------------------------------------------------------------------------
 # Non-text outbound types (T5). Each is validated by whatsapp_messages, posted to Graph directly with the
 # account credentials (frappe_whatsapp cannot build these bodies) and mirrored without a second send.
@@ -1342,6 +1257,106 @@ def upload_media(
 	return {"success": True, "media_id": media_id, "kind": kind, "mime_type": mime, "size": len(content)}
 
 
+def list_templates(account_name: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+	"""List one account's WhatsApp Templates (empty list when the bridge is unavailable).
+
+	An account is required: without one this raises ``gateway_required`` instead of
+	returning every account's templates.
+	"""
+	if not is_available():
+		return []
+	if not account_name:
+		raise BridgeError(_gateway_required())
+	filters: dict[str, Any] = {"whatsapp_account": account_name}
+	if status:
+		filters["status"] = status
+	rows = frappe.get_list(
+		"WhatsApp Templates",
+		filters=filters,
+		fields=[
+			"name", "template_name", "actual_name", "category", "language_code", "status", "id",
+			"whatsapp_account", "template", "header_type", "header", "footer", "sample_values",
+		],
+		order_by="modified desc",
+		limit_page_length=500,
+	)
+	_attach_state(rows)
+	for row in rows:
+		extra = _get_extra(row.get("whatsapp_account"), row["name"]) or {}
+		row["header_format"] = str(extra.get("header_format") or row.get("header_type") or "").upper()
+	return rows
+
+
+def _attach_state(rows: list[dict[str, Any]]) -> None:
+	"""Add review/quality state columns to listed template rows (best effort), matched per account."""
+	try:
+		states = {
+			(r.get("whatsapp_account") or "", r["template"]): r
+			for r in frappe.get_all(
+				STATE_DOCTYPE,
+				filters={"template": ["in", [r["name"] for r in rows] or [""]]},
+				fields=["template", "whatsapp_account", "rejected_reason", "quality_score", "correct_category", "last_meta_update"],
+			)
+		}
+	except Exception:
+		states = {}
+	for row in rows:
+		st = states.get((row.get("whatsapp_account") or "", row["name"])) or {}
+		row["rejected_reason"] = st.get("rejected_reason") or ""
+		row["quality_score"] = st.get("quality_score") or "UNKNOWN"
+		row["correct_category"] = st.get("correct_category") or ""
+		row["category_change_pending"] = bool(row["correct_category"] and row["correct_category"] != row.get("category"))
+		row["last_meta_update"] = str(st["last_meta_update"]) if st.get("last_meta_update") else None
+
+
+def _check_sample_reference(sample: str) -> dict[str, str] | None:
+	"""Media header sample must be fetchable by frappe_whatsapp: public http(s) URL or an existing File."""
+	if wt.is_http_url(sample):
+		parsed = urlparse(sample)
+		if getattr(frappe.flags, "in_test", False):
+			return None
+		if parsed.scheme != "https" or _is_private_host(parsed.hostname or ""):
+			return wt._e("sample", "invalid_sample", "Sample URL must be a public https URL.")
+		return None
+	if not frappe.db.exists("File", {"file_url": sample}):
+		return wt._e("sample", "sample_not_found", "No uploaded file matches this sample path.")
+	return None
+
+
+def _is_private_host(host: str) -> bool:
+	import ipaddress
+	import socket
+
+	host = host.strip("[]").lower()
+	if host in ("localhost", "") or host.endswith(".localhost") or host.endswith(".local"):
+		return True
+	try:
+		addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+	except OSError:
+		return False  # unresolved here; the fetch will fail and be reported by frappe_whatsapp
+	for addr in addrs:
+		ip = ipaddress.ip_address(addr)
+		if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+			return True
+	return False
+
+
+def _language_link(language_code: str, given: Any) -> str | None:
+	"""``WhatsApp Templates.language`` (Link to Language) for a Meta language code."""
+	if given:
+		return str(given)
+	for candidate in (language_code.replace("_", "-"), language_code, language_code.split("_")[0]):
+		if frappe.db.exists("Language", candidate):
+			return candidate
+	return None
+
+
+_TEMPLATE_PASSTHROUGH = ("field_names", "for_doctype")
+
+
+def template_buttons(names: list[str]) -> dict[str, list[dict[str, Any]]]:
+	"""Button rows (``WhatsApp Button``) of the given templates, keyed by template name."""
+	if not names or not is_available():
 		return {}
 	rows = frappe.get_all(
 		"WhatsApp Button",

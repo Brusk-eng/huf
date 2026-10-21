@@ -256,12 +256,12 @@ class TestGatewayRunAsUserEndToEnd(unittest.TestCase):
 
 		sent = []
 
-		def fake_send(gateway, event, text):
-			sent.append(text)
+		def fake_send(gateway, event, parts, quote=True):
+			sent.append("\n".join(parts))
 			return SimpleNamespace(provider_message_id="wamid.OUT1", provider_response={})
 
 		with (
-			patch("huf.ai.gateway_webhook.send_gateway_reply", side_effect=fake_send),
+			patch("huf.ai.gateway_webhook.send_gateway_parts", side_effect=fake_send),
 			patch("huf.ai.gateway_service._throttle_outbound_send", lambda *a, **k: None),
 		):
 			try:

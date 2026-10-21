@@ -75,7 +75,20 @@ class FakeMeta:
 		return self._record("POST", url, json)
 
 	def sends(self):
-		return [c for c in self.calls if c["method"] == "POST" and c["url"].endswith("/messages")]
+		"""Outbound messages only (read receipts / typing indicators are in ``reads``)."""
+		return [
+			c
+			for c in self.calls
+			if c["method"] == "POST" and c["url"].endswith("/messages") and not self._is_read(c)
+		]
+
+	def reads(self):
+		return [c for c in self.calls if self._is_read(c)]
+
+	@staticmethod
+	def _is_read(call):
+		body = call["body"]
+		return isinstance(body, dict) and body.get("status") == "read"
 
 
 def _signed_request(payload):
@@ -195,8 +208,8 @@ class _E2EMixin:
 		]
 		if self.USE_BRIDGE:
 			patches.append(("frappe.integrations.utils.get_request_session", lambda: self.meta))
-		else:
-			patches.append(("requests.post", self.meta.post))
+		# direct mode and the bridge-mode agent reply / typing calls post to Graph with requests.post
+		patches.append(("requests.post", self.meta.post))
 		for target, new in patches:
 			patcher = patch(target, new)
 			patcher.start()

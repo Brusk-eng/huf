@@ -192,6 +192,7 @@ def get_gateway_adapter(gateway):
 				"whatsapp_account": (gateway.get("whatsapp_account") or "").strip(),
 				"fallback_template": (gateway.get("fallback_template") or "").strip(),
 				"fallback_template_language": (gateway.get("fallback_template_language") or "").strip(),
+				"preview_url": (gateway.get("preview_url") or "").strip(),
 			},
 		)
 	return adapter_class(credentials)
@@ -320,8 +321,23 @@ def _record_failed_status(gateway_name: str, status: dict) -> None:
 		pass
 
 
-_REPLY_STATUSES = frozenset({"sent", "delivered", "read", "failed"})
-_REPLY_STATUS_RANK = {"sent": 1, "delivered": 2, "read": 3}
+_REPLY_STATUSES = frozenset({"sent", "delivered", "read", "played", "failed"})
+_REPLY_STATUS_RANK = {"sent": 1, "delivered": 2, "read": 3, "played": 4}
+_REPLY_DELIVERED = frozenset({"delivered", "read", "played"})
+
+
+def _reply_status_wins(current: str, state: str) -> bool:
+	"""Whether a Meta status may replace the stored ``reply_status``.
+
+	Order is sent < delivered < read < played. A ``failed`` never downgrades a message already
+	delivered/read/played, and a late ``sent`` never resurrects a ``failed`` one. Anything
+	delivered/read/played does overwrite ``failed`` (the message reached the phone after all).
+	"""
+	if state == "failed":
+		return current not in _REPLY_DELIVERED
+	if current == "failed":
+		return state in _REPLY_DELIVERED
+	return _REPLY_STATUS_RANK.get(state, 0) >= _REPLY_STATUS_RANK.get(current, 0)
 
 
 def _update_reply_status(gateway_name: str, status: dict) -> None:
@@ -340,8 +356,8 @@ def _update_reply_status(gateway_name: str, status: dict) -> None:
 		if not isinstance(row, dict):
 			return
 		current = row.get("reply_status") or ""
-		if state != "failed" and _REPLY_STATUS_RANK.get(state, 0) < _REPLY_STATUS_RANK.get(current, 0):
-			return  # out-of-order webhook: never regress delivered/read back to sent
+		if not _reply_status_wins(current, state):
+			return  # out-of-order webhook: never regress delivered/read, never resurrect failed with sent
 		values: dict[str, Any] = {"reply_status": state}
 		if state == "failed":
 			from huf.ai.gateway_service import _redact_error_text
@@ -351,7 +367,33 @@ def _update_reply_status(gateway_name: str, status: dict) -> None:
 			code = first.get("code") or "unknown"
 			title = first.get("title") or first.get("message") or "no detail"
 			values["delivery_error"] = _redact_error_text(f"error {code}: {title}")[:_GATEWAY_ERROR_MAX]
+		elif current == "failed":
+			values["delivery_error"] = ""
 		frappe.db.set_value("Gateway Event", row["name"], values, update_modified=False)
+	except Exception:
+		pass
+
+
+_LAST_EVENT_THROTTLE_SECONDS = 60
+
+
+def touch_last_event(gateway) -> None:
+	"""Stamp ``Gateway.last_event_at`` on a successful inbound ingest or reply, at most once a minute.
+
+	``gateway`` is a Gateway doc (its loaded value drives the throttle) or a name. Cheap ``db_set`` without
+	touching ``modified``; never raises and never commits.
+	"""
+	try:
+		now = frappe.utils.now_datetime()
+		name = gateway if isinstance(gateway, str) else gateway.name
+		last = frappe.db.get_value("Gateway", name, "last_event_at") if isinstance(gateway, str) else gateway.get("last_event_at")
+		if last:
+			last = frappe.utils.get_datetime(last)
+			if 0 <= (now - last).total_seconds() < _LAST_EVENT_THROTTLE_SECONDS:
+				return
+		frappe.db.set_value("Gateway", name, "last_event_at", now, update_modified=False)
+		if not isinstance(gateway, str):
+			gateway.set("last_event_at", now)
 	except Exception:
 		pass
 
@@ -514,6 +556,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			duplicates += 1
 			continue
 		ingested += 1
+		touch_last_event(gateway)
 		if result.get("status") == "Rejected":
 			continue
 		try:  # best-effort mirror into frappe_whatsapp (A4)
@@ -644,6 +687,8 @@ def handle_gateway_webhook() -> dict | None:
 		verified_sender=True,
 		raw_payload=dict(event.raw_payload),
 	)
+	if not result.get("duplicate"):
+		touch_last_event(gateway)
 	return {"success": True, **result}
 
 
@@ -671,3 +716,25 @@ def send_gateway_reply(gateway, event, text: str):
 			reply_to_provider_message_id=event.thread_id or None,
 		)
 	)
+
+
+def send_gateway_parts(gateway, event, parts: list[str], *, quote: bool = True):
+	"""Send already formatted WhatsApp text parts in order (reply send/retry path).
+
+	``quote`` puts the reply-to context on the first part only; pass False when an earlier part was
+	already delivered. Raises ``WhatsAppPartsError`` carrying what was sent and what remains.
+	"""
+	adapter = get_gateway_adapter(gateway)
+	return adapter.send_text_parts(
+		event.conversation_id, list(parts), (event.provider_event_id or None) if quote else None
+	)
+
+
+def mark_gateway_read_typing(gateway, event) -> bool:
+	"""Best-effort read receipt + typing indicator for the inbound message. Never raises."""
+	try:
+		if not _is_whatsapp(gateway) or not event.provider_event_id:
+			return False
+		return bool(get_gateway_adapter(gateway).mark_read_typing(event.provider_event_id))
+	except Exception:
+		return False

@@ -87,7 +87,12 @@ def _agent_run_failure(result) -> tuple[str, str] | None:
 
 def _gateway_fallback_reply_text(gateway) -> str:
     """Optional plain-text apology configured as an Integration Settings credential row
-    ``fallback_reply_text`` (default: none, i.e. stay silent)."""
+    ``fallback_reply_text`` (default: none, i.e. stay silent).
+
+    ``Gateway.error_reply_text`` takes precedence over that credential row when set."""
+    own = str(getattr(gateway, "error_reply_text", "") or "").strip()
+    if own:
+        return own
     try:
         if gateway.integration_settings:
             int_doc = frappe.get_doc("Integration Settings", gateway.integration_settings)
@@ -105,6 +110,8 @@ def _maybe_send_failure_fallback(event, gateway) -> bool:
     try:
         text = _gateway_fallback_reply_text(gateway)
         if not text:
+            return False
+        if event.sender_id and is_opted_out(gateway, event.sender_id):
             return False
         key = f"huf_gw_fallback_reply:{gateway.name}:{event.sender_id or event.conversation_id}"
         if not frappe.cache().set(key, 1, ex=_FALLBACK_REPLY_WINDOW_SECONDS, nx=True):
@@ -1297,6 +1304,11 @@ def process_gateway_event(event_name: str) -> dict:
     if event.status != "Queued":
         return {"event_name": event.name, "status": event.status}
 
+    if _is_reaction_event(event):
+        # A reaction is recorded on the event only: no admission side effects, no agent run, no reply.
+        event.db_set({"status": "Rejected", "error_message": REACTION_RECORDED_NOTE})
+        return {"event_name": event.name, "status": "Rejected", "reaction": True}
+
     gateway = frappe.get_doc("Gateway", event.gateway)
     if not gateway.is_enabled or not gateway.execution_user:
         event.db_set({"status": "Rejected", "error_message": "Gateway is disabled or has no Run as user"})
@@ -1365,6 +1377,7 @@ def process_gateway_event(event_name: str) -> dict:
             prompt = f"{attachment_note}\n{event.message_text}" if attachment_note else event.message_text
 
             fallback_note = ""
+            _maybe_mark_read_typing(event, gateway)
             result = run_agent_sync(
                 agent_name=event.target_agent,
                 prompt=prompt,
@@ -1376,6 +1389,10 @@ def process_gateway_event(event_name: str) -> dict:
             if failure:
                 return _fail_event_for_agent_run(event, gateway, result, *failure)
             response = result.get("response")
+            if _is_no_reply(response):
+                return _suppress_reply(event, result.get("agent_run_id"), NO_REPLY_NOTE)
+            if gateway.provider == "WhatsApp":
+                return _send_whatsapp_reply(event, gateway, result.get("agent_run_id"), str(response))
             try:
                 _throttle_outbound_send(gateway.name, _outbound_rate_cap(gateway.provider))
                 delivery = send_gateway_reply(gateway, event, str(response))
@@ -1454,6 +1471,228 @@ def process_gateway_event(event_name: str) -> dict:
         frappe.db.commit()
         frappe.log_error(message, "Gateway event failed")
         raise
+
+
+
+# -- WhatsApp reply pipeline ----------------------------------------------------
+
+REACTION_RECORDED_NOTE = "reaction_recorded: no run"
+NO_REPLY_SENTINEL = "<NO_REPLY>"
+NO_REPLY_NOTE = "Agent chose not to reply (<NO_REPLY>)"
+_RETRY_CLAIM_SECONDS = 600
+_RETRY_POLL_SECONDS = 1.0
+
+
+def _epoch() -> float:
+    return time.time()
+
+
+def _is_reaction_event(event) -> bool:
+    raw = event.get("raw_payload")
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return False
+    return isinstance(raw, dict) and raw.get("kind") == "reaction"
+
+
+def _is_no_reply(response) -> bool:
+    """The whole agent message is the ``<NO_REPLY>`` sentinel (case-insensitive): send nothing."""
+    return isinstance(response, str) and response.strip().upper() == NO_REPLY_SENTINEL
+
+
+def _suppress_reply(event, agent_run_id, note: str) -> dict:
+    values = {"status": "Succeeded", "reply_status": "suppressed", "error_message": note}
+    if agent_run_id:
+        values["agent_run"] = agent_run_id
+    event.db_set(values)
+    return {
+        "event_name": event.name,
+        "status": "Succeeded",
+        "agent_run_id": agent_run_id,
+        "reply_status": "suppressed",
+        "reply_suppressed": True,
+    }
+
+
+def _maybe_mark_read_typing(event, gateway) -> None:
+    """Read receipt + typing indicator when a run is about to start. Best effort, never raises."""
+    try:
+        if gateway.provider != "WhatsApp":
+            return
+        enabled = getattr(gateway, "typing_indicator", None)
+        if enabled is not None and not int(enabled):
+            return
+        from huf.ai.gateway_webhook import mark_gateway_read_typing
+
+        mark_gateway_read_typing(gateway, event)
+    except Exception:
+        pass
+
+
+def _reply_max_attempts(gateway) -> int:
+    try:
+        value = int(getattr(gateway, "retry_max_attempts", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else 4
+
+
+def _send_whatsapp_reply(event, gateway, agent_run_id, response: str) -> dict:
+    """Format, split and send the agent's reply. The run is finished and never rerun on a send error."""
+    from huf.ai.gateway_adapters import whatsapp_format as wf
+
+    if agent_run_id:
+        event.db_set("agent_run", agent_run_id)
+    if event.sender_id and is_opted_out(gateway, event.sender_id):
+        return _suppress_reply(event, agent_run_id, "Recipient opted out: reply not sent")
+    parts = wf.split_body(wf.to_whatsapp(response)) or [response]
+    return _attempt_reply_parts(event, gateway, parts, 1)
+
+
+def _attempt_reply_parts(event, gateway, parts: list[str], attempt: int) -> dict:
+    from huf.ai.gateway_webhook import send_gateway_parts, touch_last_event
+
+    try:
+        _throttle_outbound_send(gateway.name, _outbound_rate_cap(gateway.provider))
+        delivery = send_gateway_parts(gateway, event, parts, quote=not event.reply_message_id)
+    except Exception as exc:
+        return _handle_reply_send_failure(event, gateway, exc, parts, attempt)
+
+    if not event.reply_message_id:
+        _record_reply_sent(event, delivery.provider_message_id)
+    elif frappe.db.get_value("Gateway Event", event.name, "reply_status") == "retrying":
+        event.db_set("reply_status", "sent", update_modified=False)
+    note = WHATSAPP_FALLBACK_NOTE if (getattr(delivery, "provider_response", None) or {}).get("fallback_template_sent") else ""
+    final = {"status": "Succeeded"}
+    if note:
+        final["error_message"] = note
+    if attempt > 1:
+        final["delivery_error"] = ""
+    event.db_set(final)
+    touch_last_event(gateway)
+    return {
+        "event_name": event.name,
+        "status": "Succeeded",
+        "agent_run_id": event.agent_run,
+        "provider_message_id": delivery.provider_message_id,
+        "attempts": attempt,
+    }
+
+
+def _handle_reply_send_failure(event, gateway, exc: BaseException, parts: list[str], attempt: int) -> dict:
+    """Classify a failed send: schedule a send-only retry when transient, otherwise fail the event."""
+    from huf.ai.gateway_adapters import whatsapp as wa
+    from huf.ai.gateway_adapters import whatsapp_errors as we
+
+    cls = wa.classify_send_exception(exc)
+    cause = exc
+    remaining = parts
+    if isinstance(exc, wa.WhatsAppPartsError):
+        cause, remaining = exc.cause, exc.remaining
+        if exc.sent_ids and not event.reply_message_id:
+            _record_reply_sent(event, exc.sent_ids[0])
+    operator_text = cls.get("operator_text") or "WhatsApp delivery failed"
+    max_attempts = _reply_max_attempts(gateway)
+
+    if remaining and we.should_retry(cls, attempt, max_attempts):
+        delay = we.backoff_seconds(cls, attempt)
+        delay = we.BACKOFF_BASE_SECONDS if delay is None else delay
+        try:
+            event.db_set(
+                {
+                    "status": "Running",
+                    "reply_status": "retrying",
+                    "delivery_error": f"retrying ({attempt}/{max_attempts}) in {delay:.0f}s: {operator_text}"[:500],
+                }
+            )
+            frappe.enqueue(
+                "huf.ai.gateway_service.retry_gateway_reply",
+                queue="default",
+                timeout=300,
+                enqueue_after_commit=True,
+                event_name=event.name,
+                parts_remaining=list(remaining),
+                attempt=attempt + 1,
+                not_before=_epoch() + delay,
+            )
+            return {
+                "event_name": event.name,
+                "status": "Running",
+                "reply_status": "retrying",
+                "retry_in_seconds": delay,
+                "attempt": attempt,
+                "agent_run_id": event.agent_run,
+            }
+        except Exception:
+            frappe.logger("huf").warning("Gateway reply retry could not be scheduled")
+
+    if isinstance(cause, _whatsapp_send_errors("WhatsApp")):
+        error_text = _whatsapp_error_text(cause)
+    else:
+        error_text = _redact_error_text(str(cause)) or operator_text
+    delivery_error = f"gave up after {attempt} attempts: {operator_text}" if cls.get("retryable") else operator_text
+    event.db_set(
+        {
+            "status": "Failed",
+            "reply_status": "sent" if event.reply_message_id else "failed",
+            "error_message": error_text[-500:],
+            "delivery_error": delivery_error[:500],
+        }
+    )
+    frappe.log_error(f"{delivery_error}\n{error_text}", "Gateway WhatsApp delivery failed")
+    try:
+        from huf.ai.gateway_webhook import _set_gateway_error
+
+        _set_gateway_error(gateway.name, f"Reply to {event.name} failed: {delivery_error}")
+    except Exception:
+        pass
+    return {
+        "event_name": event.name,
+        "status": "Failed",
+        "error": error_text,
+        "error_code": cls.get("code"),
+        "agent_run_id": event.agent_run,
+        "attempts": attempt,
+    }
+
+
+def retry_gateway_reply(event_name: str, parts_remaining: list[str], attempt: int = 2, not_before: float | None = None) -> dict:
+    """Queued job: re-send the unsent reply parts. Never reruns the agent. Idempotent per (event, attempt)."""
+    event = frappe.get_doc("Gateway Event", event_name)
+    if event.reply_status != "retrying" or event.status != "Running" or not parts_remaining:
+        return {"event_name": event_name, "skipped": True}
+    wait = (not_before or 0) - _epoch()
+    if wait > 0:
+        # Not due yet: hop back onto the queue instead of holding a worker for the whole backoff.
+        _sleep(min(wait, _RETRY_POLL_SECONDS))
+        frappe.enqueue(
+            "huf.ai.gateway_service.retry_gateway_reply",
+            queue="default",
+            timeout=300,
+            enqueue_after_commit=True,
+            event_name=event_name,
+            parts_remaining=list(parts_remaining),
+            attempt=attempt,
+            not_before=not_before,
+        )
+        return {"event_name": event_name, "deferred": True}
+    if not frappe.cache().set(f"huf_gw_reply_retry:{event_name}:{attempt}", 1, ex=_RETRY_CLAIM_SECONDS, nx=True):
+        return {"event_name": event_name, "skipped": True}
+
+    gateway = frappe.get_doc("Gateway", event.gateway)
+    try:
+        if gateway.execution_user:
+            frappe.set_user(gateway.execution_user)
+        if event.sender_id and is_opted_out(gateway, event.sender_id):
+            return _suppress_reply(event, event.agent_run, "Recipient opted out: reply not sent")
+        return _attempt_reply_parts(event, gateway, list(parts_remaining), int(attempt))
+    except Exception:
+        message = _redact_error_text(frappe.get_traceback())
+        event.db_set({"status": "Failed", "reply_status": "failed", "error_message": message[-500:]})
+        frappe.log_error(message, "Gateway reply retry failed")
+        return {"event_name": event_name, "status": "Failed"}
 
 
 @frappe.whitelist(methods=["POST"])

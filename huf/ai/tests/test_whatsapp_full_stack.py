@@ -649,7 +649,11 @@ class TestWhatsAppMultiGateway(IntegrationTestCase):
 			self.assertTrue(self._post(gateway, self._inbound_payload(phone, waba, wamid), secret)["success"])
 			process_gateway_event(self._events(gateway, wamid)[0])
 			frappe.set_user("Administrator")
-		posts = self.meta.posts("/messages")
+		all_posts = self.meta.posts("/messages")
+		is_read = lambda p: isinstance(p["body"], dict) and p["body"].get("status") == "read"  # noqa: E731
+		reads = [p for p in all_posts if is_read(p)]
+		posts = [p for p in all_posts if not is_read(p)]
+		self.assertEqual(sorted(p["url"].split("/")[-2] for p in reads), sorted([self.PHONE_A, self.PHONE_B]))
 		self.assertEqual(len(posts), 2, self.meta.calls)
 		urls = [p["url"] for p in posts]
 		self.assertEqual(sum(u.endswith(f"/{self.PHONE_A}/messages") for u in urls), 1, urls)

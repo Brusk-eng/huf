@@ -506,7 +506,7 @@ class TestReplyDeliveryTracking(_Base):
 				provider_message_id=f"wamid.OUT.{wamid}",
 				provider_response={"fallback_template_sent": True} if fallback else {},
 			)
-			with patch("huf.ai.gateway_webhook.send_gateway_reply", return_value=delivery):
+			with patch("huf.ai.gateway_webhook.send_gateway_parts", return_value=delivery):
 				result = process_gateway_event(event)
 			frappe.set_user("Administrator")
 			self.assertEqual(result["status"], "Succeeded", result)
