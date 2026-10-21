@@ -226,7 +226,6 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
             </TabsTrigger>
           </TabsList>
           <div className="flex flex-wrap items-center gap-2">
-            <ManagerLink url={manager.url} businessId={manager.businessId} />
             <Button variant="outline" size="sm" onClick={sync} disabled={syncing || !gateway}>
               {syncing ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
               Sync
@@ -236,6 +235,9 @@ export function TemplatesTab({ gateway }: { gateway?: string }) {
             </Button>
           </div>
         </div>
+        {manager.url && (
+          <div className="pt-2 text-xs"><ManagerLink url={manager.url} businessId={manager.businessId} /></div>
+        )}
         {!gateway && <p className="pt-2 text-xs text-steel">Choose a WhatsApp gateway above to see and sync its templates.</p>}
 
         <TabsContent value="templates" className="pt-4">
