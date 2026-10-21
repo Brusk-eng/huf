@@ -209,3 +209,58 @@ SIP facts: enable with `settings.calling.sip = {status: ENABLED, servers: [{host
 | Realtime (Gemini Live) | aiortc track to PCM bridge in Python; fine for a few calls | SIP server or Pipecat/LiveKit bridges audio to the model; scales better |
 
 Recommendation. Greeting-only with audio-file playback: stay on webhook + WebRTC for the first live test (no settings change beyond Calling, reuses Huf admission/Events, already coded and simulated). If aiortc fails against Meta's SDP/ICE (spike exit criteria in section 12) or capacity matters, switch to SIP with Asterisk or FreeSWITCH playing the files: it is the lowest-risk playback path, with SDES for simple media. Realtime (Gemini Live) later: prefer SIP into a media framework (Pipecat or LiveKit SIP, or FreeSWITCH with a streaming module) over growing aiortc, because codec/jitter/scale work is already solved there; keep the `CallAudioSource`/`CallAudioSink` interfaces as the Huf-side contract either way. Do not enable SIP on the test number until the WebRTC route has been tried: enabling it disables the Graph call endpoints this implementation uses.
+
+## 16. Media path from a NAT'd Mac: Meta docs findings and ICE strategy (2026-10-21)
+
+Legend as above. Sources fetched today: https://developers.facebook.com/docs/whatsapp/cloud-api/calling/user-initiated-calls and https://developers.facebook.com/docs/whatsapp/cloud-api/calling/reference.
+
+| Topic | Finding |
+|---|---|
+| Connect webhook | `calls[]` with `id`, `from`, `to`, `event: "connect"`, `timestamp`, `session {sdp_type: "offer", sdp}`; optional `deeplink_payload`, `cta_payload`, `from_user_id` [V] |
+| SDP rules | "compliant with RFC 8866". Answer is sent in `pre_accept` and again in `accept`; accept errors if the answer differs from the pre_accept one [V]. Docs table says `sdp_type` "offer" but all samples use "answer" (doc inconsistency; Huf sends "answer") [V] |
+| Timing | Answer window "about 30 to 60 seconds" after connect; otherwise "Not Answered" + terminate webhook [V]. `pre_accept` recommended to connect media early and avoid clipped audio; start sending media only after its 200 OK; with pre_accept, media flows right after accept [V]. Other timeouts (ICE, DTLS, media) not stated [U] |
+| ICE-lite | Sample user-initiated OFFER contains `a=ice-lite` [V as sample only]; docs do not say it is required or promise it always holds [U]. Samples also show `ice-options:trickle`, `ice-ufrag/pwd` |
+| Candidates | Samples show only `typ host` candidates [V as sample]. Nothing on srflx/relay/tcp/IPv6 support [U]. STUN/TURN: not stated anywhere [U] |
+| DTLS role | Not mandated. Sample offers `a=setup:actpass`, sample answers `a=setup:active`, `sha-256` fingerprints [V as sample]. aiortc answers `active` to `actpass` (same as sample) |
+| Codecs | No codec mandated. Sample offers Opus 48000/2 (pt 111, `minptime=10;useinbandfec=1`), G722, PCMU, PCMA, telephone-event (8000), sometimes red [V as sample]. aiortc answers with Opus. Docs: user-initiated offer uses 8000 clock rate for DTMF (RFC 4733) |
+
+Consequence: if Meta's offer is ice-lite with public host candidates, the full-ICE side (aiortc on the Mac) does the checks outbound. An outbound-only NAT is enough, no inbound port forward, and even a symmetric-like NAT is fine because replies come from the exact address we probed. This is the primary plan and is UNPROVEN until a live call shows the offer's candidates.
+
+### Strategy (in this order)
+1. Default: direct UDP, STUN only (`IceConfig` defaults: Google + Cloudflare STUN; aiortc uses the first). No config needed.
+2. Fallback: TURN over TCP/TLS 443 with `relay_only` (below). Needed only if the offer has no usable public UDP candidate or outbound UDP to Meta's media IPs is blocked.
+3. Last resort: SIP (section 15) or a host with a public IP.
+
+### Config keys (site_config.json or env; env wins; the credential is never a DocType field and is never logged)
+| Site config key | Env var | Meaning |
+|---|---|---|
+| `huf_wa_call_stun_urls` | `HUF_WA_CALL_STUN_URLS` | comma list `stun:host:port` (default Google + Cloudflare) |
+| `huf_wa_call_turn_urls` | `HUF_WA_CALL_TURN_URLS` | e.g. `turns:turn.example.com:443?transport=tcp` or `turn:host:443?transport=tcp` (aiortc supports tcp transport only for turns) |
+| `huf_wa_call_turn_username` / `_credential` | `HUF_WA_CALL_TURN_USERNAME` / `_CREDENTIAL` | TURN auth |
+| `huf_wa_call_relay_only` | `HUF_WA_CALL_RELAY_ONLY` | `1` = force relay candidates only (like `iceTransportPolicy: relay`). Needs TURN. aiortc has no such option; Huf sets aioice's RELAY policy on the gatherers and fails closed if it cannot |
+
+aiortc limits: one STUN and one TURN server are used (first of each).
+
+### Measured today [L] (this Mac, home NAT, `tools/wa_call_ice_probe.py`)
+- Outbound UDP and replies work. Public STUN returned srflx `103.94.138.221`.
+- Mapping is address/port dependent: Google saw port 50715, Cloudflare 50716 for the same local socket (symmetric-like). Fine vs an ice-lite public peer, bad for hole-punching to a full-ICE peer.
+- Public Open Relay (`openrelay.metered.ca`) is dead: DNS now resolves to 192.0.2.1 (TEST-NET), TCP 80/443/3478 time out. You need your own TURN (coturn, or a metered/Twilio/Cloudflare account) if the fallback is required.
+- Loopback proof `tools/wa_call_loopback_test.py` [L]: Huf's real `AiortcMediaSession` + `run_call` answered an aiortc "Meta" peer; action order pre_accept, accept, terminate; Opus greeting decoded on the peer (97 frames, 95 non-silent), silent before accept.
+
+## 17. Ops: running a live call test (needs the owner)
+
+Prereqs: Calling enabled on the test number (already done by the owner, do not change from here), webhook `calls` field subscribed, ngrok HTTP tunnel to the bench webhook, aiortc + ffmpeg in the bench Python (`pip install aiortc`; `brew`/apt ffmpeg), Gateway: `calling_enabled=1`, an allowed caller, greeting audio uploaded (private File, Opus/ogg/wav ok).
+1. Probe the network first: `python tools/wa_call_ice_probe.py` (add `--turn-test --turn-url host:443` with `TURN_USER`/`TURN_PASS` env to test your own TURN). Expect "outbound UDP: OK".
+2. Optional env/site config for TURN (above); leave unset for the first attempt.
+3. Start the bench with the ngrok override already used for WhatsApp webhooks; confirm the `connect` webhook arrives (Gateway Event "Received").
+4. From the admitted phone, call the business number. Watch: Event goes Answering, pre_accepted, connected, accepted, completed; you hear the greeting; the call hangs up.
+5. Do not log SDP. To see candidates, inspect only the offer's `a=candidate` and `a=ice-lite` lines locally (they reveal Meta IPs, not secrets).
+
+If ICE fails (Event `ice_failed`, terminate after 20 s):
+- Check the offer: no `a=candidate ... typ host/srflx` public UDP lines or no `a=ice-lite` means plan 1 is wrong; go to TURN relay-only.
+- Re-run the probe; NO_UDP means outbound UDP is blocked (hotspot, firewall): use `turns:...:443?transport=tcp` + `relay_only=1`.
+- ICE completes but no DTLS: compare `a=setup`/fingerprint in the answer; Meta may require `a=setup:active` in the answer (aiortc does this) and the SAME SDP in accept.
+- No audio after accept: confirm the gate opened only after accept 200, ffmpeg can decode the clip, and the clip is not empty.
+- Accept error about SDP mismatch: pre_accept and accept must send the identical answer (the flow does).
+- Slow answer (>10 s): ICE gathering with many interfaces (measured 5 s); reduce STUN servers/interfaces.
+- Last resort: SIP, section 15.

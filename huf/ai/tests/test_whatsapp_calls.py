@@ -526,3 +526,59 @@ class TestGatewayDoctypeDefaults(unittest.TestCase):
 		fields = {f["fieldname"]: f for f in json.loads(path.read_text())["fields"]}
 		self.assertEqual(fields["calling_enabled"]["default"], "0")
 		self.assertEqual(fields["calling_enabled"]["fieldtype"], "Check")
+
+
+class TestIceConfig(unittest.TestCase):
+	SECRET = "s3cr3t-turn-credential"
+
+	def test_default_is_stun_only_direct(self):
+		cfg = flow.build_ice_config({}, env={})
+		self.assertEqual(cfg.stun_urls, flow.DEFAULT_STUN_URLS)
+		self.assertEqual(cfg.turn_urls, ())
+		self.assertFalse(cfg.relay_only)
+
+	def test_site_config_and_env_override(self):
+		site = {"huf_wa_call_stun_urls": "stun:a:1, stun:b:2", "huf_wa_call_turn_urls": ["turn:t:443?transport=tcp"],
+			"huf_wa_call_turn_username": "u", "huf_wa_call_turn_credential": self.SECRET}
+		cfg = flow.build_ice_config(site, env={})
+		self.assertEqual(cfg.stun_urls, ("stun:a:1", "stun:b:2"))
+		self.assertEqual(cfg.turn_urls, ("turn:t:443?transport=tcp",))
+		cfg = flow.build_ice_config(site, env={"HUF_WA_CALL_TURN_URLS": "turns:x:443", "HUF_WA_CALL_RELAY_ONLY": "true"})
+		self.assertEqual(cfg.turn_urls, ("turns:x:443",))
+		self.assertTrue(cfg.relay_only)
+
+	def test_validation(self):
+		with self.assertRaises(ValueError):
+			flow.build_ice_config({}, env={"HUF_WA_CALL_RELAY_ONLY": "1"})  # relay without TURN
+		with self.assertRaises(ValueError):
+			flow.build_ice_config({}, env={"HUF_WA_CALL_TURN_URLS": "http://nope"})
+		with self.assertRaises(ValueError):
+			flow.build_ice_config({}, env={"HUF_WA_CALL_STUN_URLS": "turn:nope"})
+
+	def test_secret_never_in_repr_or_summary_or_logs(self):
+		cfg = flow.build_ice_config({}, env={"HUF_WA_CALL_TURN_URLS": "turns:x:443", "HUF_WA_CALL_TURN_USERNAME": "user1",
+			"HUF_WA_CALL_TURN_CREDENTIAL": self.SECRET})
+		with self.assertLogs(level="DEBUG") as logs:
+			import logging
+
+			logging.getLogger("t").info("ice %s %r %s", cfg, cfg, cfg.safe_summary())
+		blob = repr(cfg) + str(cfg) + json.dumps(cfg.safe_summary()) + "".join(logs.output)
+		self.assertNotIn(self.SECRET, blob)
+		self.assertNotIn("user1", blob)
+		self.assertTrue(cfg.safe_summary()["turn_auth"])
+
+	def test_rtc_configuration_uses_first_stun_and_turn(self):
+		fake = MagicMock()
+		fake.RTCIceServer = lambda **kw: SimpleNamespace(**kw)
+		fake.RTCConfiguration = lambda iceServers: SimpleNamespace(iceServers=iceServers)
+		cfg = flow.IceConfig(stun_urls=("stun:a:1", "stun:b:2"), turn_urls=("turns:t:443",), turn_username="u", turn_credential="c")
+		with patch.dict("sys.modules", {"aiortc": fake}):
+			rtc = flow.to_rtc_configuration(cfg)
+		self.assertEqual([s.urls for s in rtc.iceServers], ["stun:a:1", "turns:t:443"])
+		self.assertEqual(rtc.iceServers[1].credential, "c")
+
+	def test_relay_policy_fails_closed(self):
+		pc = SimpleNamespace(getTransceivers=lambda: [])
+		with patch.dict("sys.modules", {"aioice": MagicMock()}):
+			with self.assertRaises(RuntimeError):
+				flow._force_relay_policy(pc)
