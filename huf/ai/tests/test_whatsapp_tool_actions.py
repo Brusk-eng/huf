@@ -37,12 +37,12 @@ class _Row:
 
 
 def _settings(**flags):
-	"""Patch the active WhatsApp Integration Settings to carry these credential rows."""
-	doc = SimpleNamespace(credentials=[_Row(key, value) for key, value in flags.items()])
+	"""Bind the run to gateway GW-1 with write authority and these per-gateway flags set."""
 	return patch.multiple(
-		whatsapp.frappe,
-		get_all=MagicMock(return_value=[SimpleNamespace(name="IS-1")]),
-		get_doc=MagicMock(return_value=doc),
+		whatsapp,
+		_run_gateway=MagicMock(return_value="GW-1"),
+		_authorize=MagicMock(return_value=None),
+		_server_flag=MagicMock(side_effect=lambda gateway, name: whatsapp._is_truthy(flags.get(name))),
 	)
 
 
@@ -116,7 +116,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		self.assertTrue(result["success"])
 
 	def test_settings_read_failure_fails_closed(self):
-		with patch.object(whatsapp.frappe, "get_all", side_effect=RuntimeError("db down")):
+		with patch.object(whatsapp.frappe.db, "get_value", side_effect=RuntimeError("db down")):
 			result = self._send(allow_proactive=True)
 		self.assertEqual(result["error"], "proactive_send_not_permitted")
 		self.post.assert_not_called()
