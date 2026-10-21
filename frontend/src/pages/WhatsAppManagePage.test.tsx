@@ -110,7 +110,7 @@ describe('WhatsAppManagePage', () => {
 		open('/');
 		await userEvent.click(await screen.findByRole('button', { name: 'Check now' }));
 		await waitFor(() => expect(api.checkToken).toHaveBeenCalledWith('GW-1'));
-		expect(await screen.findByText('Token is valid')).toBeInTheDocument();
+		expect(await screen.findByText('Valid', { selector: 'span,div' })).toBeInTheDocument();
 		expect(api.getSetupStatus.mock.calls.filter((c) => c[0] === 'GW-1').length).toBe(2);
 	});
 

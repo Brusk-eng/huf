@@ -54,6 +54,11 @@ describe('TokenCard', () => {
 		expect(screen.getByText('Subscribed')).toBeInTheDocument();
 	});
 
+	it('tolerates a partial server result with no scopes or webhook field', () => {
+		render(<TokenCard check={{ valid: true, checked_at: null } as unknown as TokenCheckSummary} />);
+		expect(screen.getByText('Valid')).toBeInTheDocument();
+	});
+
 	it('formats the expiry and check times', () => {
 		render(<TokenCard check={check({ expires_at: '2030-01-02T03:04:05Z', checked_at: '2026-10-21T10:00:00Z' })} />);
 		expect(screen.getByText('Checked')).toBeInTheDocument();

@@ -32,7 +32,7 @@ export function TokenCard({ check }: { check: TokenCheckSummary | null | undefin
 						)}
 						{check.checked_at && <Row label="Checked">{new Date(check.checked_at).toLocaleString()}</Row>}
 						<Row label="Expires">{check.expires_at ? new Date(check.expires_at).toLocaleString() : 'Never'}</Row>
-						{check.missing_scopes.length > 0 && <Row label="Missing permissions">{check.missing_scopes.join(', ')}</Row>}
+						{(check.missing_scopes?.length ?? 0) > 0 && <Row label="Missing permissions">{check.missing_scopes.join(', ')}</Row>}
 						{check.webhook_subscribed !== null && (
 							<Row label="Webhook">{check.webhook_subscribed ? 'Subscribed' : 'Not subscribed'}</Row>
 						)}
