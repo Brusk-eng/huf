@@ -213,7 +213,19 @@ def _inbound_request():
 
 
 def _event_context(event) -> dict[str, Any]:
+	raw = getattr(event, "raw_payload", None)
+	raw = raw if isinstance(raw, dict) else {}
+	message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
+	codes = [
+		e.get("code")
+		for e in (message.get("errors") if isinstance(message.get("errors"), list) else [])
+		if isinstance(e, dict) and e.get("code") is not None
+	]
+	kind = getattr(event, "kind", "message")
 	return {
+		"kind": kind if isinstance(kind, str) and kind else "message",
+		"original_message_id": str(raw.get("original_message_id") or ""),
+		"provider_error_codes": codes,
 		"sender_id": event.sender_id,
 		"conversation_id": event.conversation_id,
 		"thread_id": event.thread_id,
@@ -598,8 +610,8 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			continue
 		ingested += 1
 		touch_last_event(gateway)
-		if result.get("status") == "Rejected":
-			continue
+		if result.get("status") in ("Rejected", "Recorded"):
+			continue  # rejected or record-only (reaction/edit/revoke/system/unknown/unsupported): not mirrored
 		try:  # best-effort mirror into frappe_whatsapp (A4)
 			if account_name is None:
 				# the Gateway's own account only: never a default or first-Active guess

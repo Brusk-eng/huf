@@ -1508,6 +1508,62 @@ def _run_agent_with_retry(run_fn, **kwargs):
             time.sleep(_busy_delay(busy_attempts))
 
 
+UNSUPPORTED_REPLY = (
+    "Sorry, I can't read this type of message. Please send text, a photo, a document, audio or a location."
+)
+_SILENT_UNSUPPORTED_CODES = (131060,)
+_RECORD_ONLY_KINDS = ("edit", "revoke", "system", "unknown")
+
+
+def _record_event(event, reason: str, **extra) -> dict:
+    """Mark an event Recorded (kept for audit, never routed or run) and log why."""
+    event.db_set({"status": "Recorded", "error_message": reason})
+    frappe.logger("huf").info(f"Gateway event {event.name} recorded: {reason}")
+    return {"event_name": event.name, "status": "Recorded", **extra}
+
+
+def _mark_original_event(gateway_name: str, context: dict[str, Any], kind: str, new_event_id: str) -> None:
+    """edit -> original superseded; revoke -> original revoked (a not-yet-run Queued run is neutralised).
+
+    Only the original's own sender can touch it; anything else is ignored.
+    """
+    original_id = str(context.get("original_message_id") or "")
+    if not original_id:
+        return
+    row = frappe.db.get_value(
+        "Gateway Event",
+        {"idempotency_key": _idempotency_key(gateway_name, original_id)},
+        ["name", "status", "sender_id", "raw_payload"],
+        as_dict=True,
+    )
+    if not row or str(row.get("sender_id") or "") != str(context.get("sender_id") or ""):
+        return
+    raw = row.get("raw_payload")
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = {}
+    raw = dict(raw) if isinstance(raw, dict) else {}
+    values: dict[str, Any] = {}
+    if kind == "revoke":
+        raw["revoked"] = True
+        values["message_text"] = "[deleted by sender]"
+        if row.get("status") in ("Received", "Queued"):
+            values["status"] = "Rejected"
+            values["error_message"] = "revoked_by_sender: deleted before it was processed; no run"
+    else:
+        raw["superseded_by"] = new_event_id
+    values["raw_payload"] = json.dumps(raw)
+    frappe.db.set_value("Gateway Event", row["name"], values)
+
+
+def _handle_record_only(event, gateway_name: str, context: dict[str, Any], kind: str, provider_event_id: str) -> dict:
+    if kind in ("edit", "revoke"):
+        _mark_original_event(gateway_name, context, kind, provider_event_id)
+    return _record_event(event, f"{kind}_recorded: no run")
+
+
 def ingest_gateway_event(
     gateway_name: str,
     provider_event_id: str,
@@ -1557,10 +1613,22 @@ def ingest_gateway_event(
         event.db_set({"status": "Rejected", "error_message": "Provider did not verify sender"})
         return {"event_name": event.name, "status": "Rejected"}
 
+    kind = str(context.get("kind") or "message")
+    if kind == "reaction":
+        # Short-circuit: no consent, pairing, admission, rate bucket or run for a reaction.
+        return _record_event(event, REACTION_RECORDED_NOTE, reaction=True)
+    if kind in _RECORD_ONLY_KINDS:
+        # edit/revoke/system/unknown never reach an agent or LLM; edit/revoke only mark the original.
+        return _handle_record_only(event, gateway_name, context, kind, provider_event_id)
+
     gateway = frappe.get_doc("Gateway", gateway_name)
     if not gateway.is_enabled:
         event.db_set({"status": "Rejected", "error_message": "Gateway is disabled"})
         return {"event_name": event.name, "status": "Rejected"}
+    # Rate limit first so a STOP/START or pairing flood cannot bypass the per-sender bucket.
+    limited = _sender_rate_limit_reason(gateway, context)
+    if limited:
+        return _reject_event(event, limited)
     consent = _handle_consent_event(event, gateway, context)
     if consent is not None:
         return consent
@@ -1568,9 +1636,17 @@ def ingest_gateway_event(
     if not admitted:
         event.db_set({"status": "Rejected", "error_message": reason})
         return {"event_name": event.name, "status": "Rejected"}
-    limited = _sender_rate_limit_reason(gateway, context)
-    if limited:
-        return _reject_event(event, limited)
+    if kind == "unsupported":
+        # Fixed reply (or silence for the expected 131060), never an LLM turn.
+        codes = {str(c) for c in (context.get("provider_error_codes") or [])}
+        if not codes & {str(c) for c in _SILENT_UNSUPPORTED_CODES}:
+            _send_plain_reply(
+                gateway,
+                str(context.get("sender_id") or ""),
+                str(context.get("conversation_id") or "") or None,
+                UNSUPPORTED_REPLY,
+            )
+        return _record_event(event, "unsupported_recorded: fixed reply, no run")
 
     route = resolve_gateway_route(gateway_name, context)
     if route["status"] != "Queued":
