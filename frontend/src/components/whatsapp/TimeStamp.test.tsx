@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { TimeStamp, relativeTime } from './TimeStamp';
+import { TimeStamp, TimeWhen, relativeTime } from './TimeStamp';
 
 const NOW = new Date('2026-10-14T12:00:00');
 
@@ -16,6 +16,12 @@ describe('TimeStamp', () => {
     const el = screen.getByText(/ago|just now/);
     expect(el.getAttribute('title')).toMatch(/2026/);
     expect(el.textContent).not.toMatch(/\.\d{6}/);
+  });
+
+  it('TimeWhen reads naturally after a verb', () => {
+    const recent = new Date(Date.now() - 4 * 60_000).toISOString();
+    const { container } = render(<><TimeWhen value={recent} /> <TimeWhen value="2020-01-02 10:00:00" /></>);
+    expect(container.textContent).toMatch(/^4 min ago on /);
   });
 
   it('shows a dash for missing values', () => {

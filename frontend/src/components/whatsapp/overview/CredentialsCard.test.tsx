@@ -60,7 +60,7 @@ describe('CredentialsCard', () => {
 		expect(screen.getByText('Send and receive messages')).toBeInTheDocument();
 		expect(screen.getByText('Manage templates and account')).toBeInTheDocument();
 		expect(screen.getByText(/User token\. Expires/)).toBeInTheDocument();
-		expect(screen.getByText('Webhook subscribed: Unknown')).toBeInTheDocument();
+		expect(screen.getByText('Webhook subscribed: Not checked yet')).toBeInTheDocument();
 	});
 
 	it('shows a friendly rate-limit message', async () => {

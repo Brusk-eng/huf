@@ -24,3 +24,16 @@ export function TimeStamp({ value, className }: { value?: string | null; classNa
     </time>
   );
 }
+
+/** Like TimeStamp, but reads naturally after a verb: "3 min ago" or "on 12 Oct 2026". */
+export function TimeWhen({ value, className }: { value?: string | null; className?: string }) {
+  const date = parseServerTime(value);
+  if (!date) return null;
+  const text = relativeTime(value);
+  const relative = /ago$|^just now$/.test(text);
+  return (
+    <time dateTime={date.toISOString()} title={fullTime(value)} className={className}>
+      {relative ? text : `on ${text}`}
+    </time>
+  );
+}

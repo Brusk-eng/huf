@@ -5,7 +5,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
-import { TimeStamp, fullTime } from '../TimeStamp';
+import { TimeWhen, fullTime } from '../TimeStamp';
 import type { GatewayHealthStatus, TokenCheckSummary } from '@/services/whatsappHealthApi';
 
 export interface CredentialsCardProps {
@@ -74,7 +74,7 @@ function Row({ label, present, rejected }: { label: string; present: boolean; re
 function CheckResult({ check }: { check: TokenCheckSummary }) {
 	const typeText = tokenTypeText(check);
 	const subscribed =
-		check.webhook_subscribed === null ? 'Unknown' : check.webhook_subscribed ? 'Yes' : 'No';
+		check.webhook_subscribed === null ? 'Not checked yet' : check.webhook_subscribed ? 'Yes' : 'No';
 	return (
 		<div className="space-y-2 rounded border border-line p-3 text-sm" data-testid="token-check-result">
 			<div className="flex items-center gap-2">
@@ -93,7 +93,7 @@ function CheckResult({ check }: { check: TokenCheckSummary }) {
 				</div>
 			)}
 			<p className="text-steel">Webhook subscribed: {subscribed}</p>
-			{check.checked_at && <p className="text-xs text-steel">Checked <TimeStamp value={check.checked_at} /></p>}
+			{check.checked_at && <p className="text-xs text-steel">Checked <TimeWhen value={check.checked_at} /></p>}
 		</div>
 	);
 }

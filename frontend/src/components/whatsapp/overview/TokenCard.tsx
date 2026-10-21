@@ -1,6 +1,6 @@
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { TimeStamp } from '../TimeStamp';
+import { TimeStamp, TimeWhen } from '../TimeStamp';
 import type { TokenCheckSummary } from '@/services/whatsappHealthApi';
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -27,7 +27,7 @@ export function TokenCard({ check }: { check: TokenCheckSummary | null | undefin
 					<dl className="space-y-2">
 						{!check.valid && (
 							<div role="note" className="rounded border border-destructive/40 bg-destructive-tint px-3 py-2 text-sm text-ink">
-								Meta rejected this token{check.checked_at ? <> on <TimeStamp value={check.checked_at} /></> : null}.{' '}
+								Meta rejected this token{check.checked_at ? <> <TimeWhen value={check.checked_at} /></> : null}.{' '}
 								<a href="#credentials" className="text-signal-ink underline">Replace it in Settings</a>.
 							</div>
 						)}
