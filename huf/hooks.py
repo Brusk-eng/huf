@@ -339,6 +339,9 @@ scheduler_events = {
             "huf.ai.orchestration.scheduler.process_orchestrations",
             "huf.ai.agent_integration.recover_stalled_agent_runs",
         ],
+        "*/10 * * * *": [
+            "huf.ai.gateway_service.reap_stuck_gateway_events",
+        ],
         "*/5 * * * *": [
             "huf.ai.agent_run_analytics.refresh_rollups",
         ],

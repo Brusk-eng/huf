@@ -245,6 +245,7 @@ class TestTerminalStatePersistence(unittest.TestCase):
 		):
 			self.assertEqual(gateway_service.reap_stuck_gateway_events(), 2)
 		self.assertEqual(get_all.call_args.kwargs["filters"]["status"], "Running")
+		self.assertEqual(get_all.call_args.kwargs["filters"]["reply_status"], ["!=", "retrying"])
 		self.assertEqual(set_value.call_count, 2)
 		self.assertEqual(set_value.call_args.args[2]["status"], "Failed")
 
@@ -307,3 +308,13 @@ class TestPairingFixes(unittest.TestCase):
 			gateway_service._create_pairing_request(gw, "1")
 		cooldown = [f for f in captured if f and "pairing_sent_at" in f][0]
 		self.assertEqual(cooldown["state"], ["!=", gateway_service.ENTRY_STATE_EXPIRED])
+
+
+class TestReaperScheduled(unittest.TestCase):
+	def test_reaper_is_in_scheduler_events(self):
+		from huf import hooks
+
+		self.assertIn(
+			"huf.ai.gateway_service.reap_stuck_gateway_events",
+			hooks.scheduler_events["cron"]["*/10 * * * *"],
+		)

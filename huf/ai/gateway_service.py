@@ -1386,7 +1386,12 @@ def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int =
         cutoff = add_to_date(now_datetime(), minutes=-minutes)
         stuck = frappe.get_all(
             "Gateway Event",
-            filters={"status": "Running", "modified": ["<", cutoff]},
+            filters={
+                "status": "Running",
+                "modified": ["<", cutoff],
+                # a pending send-only reply retry is legitimately Running; never drop it
+                "reply_status": ["!=", "retrying"],
+            },
             pluck="name",
             limit_page_length=limit,
         )

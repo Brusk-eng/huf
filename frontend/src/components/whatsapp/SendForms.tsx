@@ -204,7 +204,16 @@ function InteractiveForm({ kind, gateway, to, run, sending, setError }: FormProp
     };
     const problem = validateInteractive(msg);
     if (problem) return setError(bad(problem));
-    void run(() => sendInteractiveMessage(gateway, to, msg), 'Message sent', () => setBody(''));
+    void run(() => sendInteractiveMessage(gateway, to, msg), 'Message sent', () => {
+      setBody('');
+      setHeader('');
+      setFooter('');
+      setButtons([{ id: 'btn_1', title: '' }]);
+      setButtonText('');
+      setRows([{ title: '', description: '' }]);
+      setDisplayText('');
+      setUrl('');
+    });
   };
   return (
     <div className="space-y-2">
