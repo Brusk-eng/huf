@@ -292,6 +292,36 @@ class TestSignatureFailure(unittest.TestCase):
 		none = wh.evaluate(facts(last_event_at=None, events_ever=0, replied_ever=False), NOW)
 		self.assertEqual(states(none)["webhook"], "todo")
 
+	def test_cached_token_check_drops_transport_keys_and_ignores_unknown(self):
+		cache = MagicMock()
+		cache.get_value.return_value = {"success": True, "valid": False, "error_code": 190, "cached": True}
+		with patch.object(wh.frappe, "cache", return_value=cache):
+			self.assertEqual(wh._cached_token_check("GW"), {"valid": False, "error_code": 190})
+			cache.get_value.return_value = {"success": True, "valid": None}
+			self.assertIsNone(wh._cached_token_check("GW"))
+			cache.get_value.return_value = None
+			self.assertIsNone(wh._cached_token_check("GW"))
+
+	def test_build_health_includes_cached_token_check(self):
+		gw = {"name": "GW", "is_enabled": 1, "integration_settings": "IS", "last_event_at": NOW - timedelta(hours=1)}
+		presence = {"access_token": True, "phone_number_id": True, "webhook_verify_token": True, "app_secret": True}
+		bad = {"success": True, "valid": False, "message": "expired", "error_code": 190, "checked_at": "2026-10-14T11:00:00Z", "cached": True}
+		quiet = {"events_24h": {"received": 1, "failed": 0, "unrouted": 0, "rejected": 0},
+			"events_ever": 3, "replied_ever": True, "last_failed_event": None}
+		for cached, expect_health in ((bad, "blocked"), (None, "healthy")):
+			with patch.object(wh, "read_events", return_value=quiet), patch.object(
+				wh, "read_unrouted_phone_ids", return_value=[]
+			), patch.object(wh, "read_fallback_template", return_value={"approved": None, "status": ""}), patch.object(
+				wh, "_cached_token_check", return_value=cached
+			):
+				out = wh.build_health(gw, presence, connector_available=False, mismatch=False, app_id="1", now=NOW)
+			self.assertEqual(out["health"], expect_health)
+			if cached:
+				self.assertEqual(out["token_check"]["error_code"], 190)
+				self.assertEqual(states(out)["credentials"], "blocked")
+			else:
+				self.assertIsNone(out["token_check"])
+
 	def test_build_health_payload_and_no_secret(self):
 		gw = {
 			"name": "GW",

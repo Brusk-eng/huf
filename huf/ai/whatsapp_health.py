@@ -265,7 +265,7 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	if mismatch:
 		next_step = {"code": "fix_account_link", "label": "Link the WhatsApp account that owns this number", "action_url": "#credentials"}
 	elif token_invalid:
-		next_step = {"code": "fix_access_token", "label": "Replace the expired access token", "action_url": "#credentials"}
+		next_step = {"code": "fix_access_token", "label": "Replace access token", "action_url": "#credentials"}
 	else:
 		for key, code, label, url in _STEPS:
 			if steps_state[key] != "done":
@@ -431,8 +431,8 @@ def _gateway_stamp(gateway: dict[str, Any], field: str) -> datetime | None:
 		return None
 
 
-def _cached_token_valid(gateway_name: str) -> bool | None:
-	"""Outcome of the last live token check, from cache only (no network). None when unknown."""
+def _cached_token_check(gateway_name: str) -> dict[str, Any] | None:
+	"""The last live token check, from cache only (no network, no secrets). None when never checked."""
 	try:
 		from huf.ai.whatsapp_token_check import _result_key
 
@@ -440,7 +440,7 @@ def _cached_token_valid(gateway_name: str) -> bool | None:
 	except Exception:
 		return None
 	if isinstance(cached, dict) and cached.get("valid") in (True, False):
-		return bool(cached["valid"])
+		return {k: v for k, v in cached.items() if k not in ("cached", "success")}
 	return None
 
 
@@ -467,8 +467,9 @@ def build_health(
 	verify_ok_at = _gateway_stamp(gateway, "last_verify_ok_at")
 	last_error = redact(gateway.get("last_error") or "")
 	phone_present = bool(presence.get("phone_number_id") or own_phone)
+	token_check = _cached_token_check(name)
 	facts = {
-		"token_valid": _cached_token_valid(name),
+		"token_valid": token_check["valid"] if token_check else None,
 		"enabled": gateway.get("is_enabled"),
 		"has_integration": bool(gateway.get("integration_settings")),
 		"access_token_present": presence.get("access_token"),
@@ -503,6 +504,7 @@ def build_health(
 			"app_id_present": bool(app_id),
 			"app_secret_present": bool(presence.get("app_secret")),
 			"verify_token_present": bool(presence.get("webhook_verify_token")),
+			"token_check": token_check,
 			"events_24h": events["events_24h"],
 			"last_failed_event": events["last_failed_event"],
 			"unrouted_phone_ids": read_unrouted_phone_ids(name, own_phone, now),
