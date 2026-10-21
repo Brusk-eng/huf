@@ -256,6 +256,8 @@ def _idempotent_send(action: str, kwargs: dict, gateway_name: str) -> str:
 	except send_keys.InvalidKey as e:
 		return _refused("invalid_idempotency_key", str(e))
 	run_id = getattr(frappe.flags, "huf_current_agent_run_id", None)
+	if not run_id and not explicit:
+		return _dispatch(action, kwargs)  # no run and no caller key: nothing to scope an automatic key to
 	key = send_keys.derive_key(gateway_name, run_id, kwargs.get("call_id"), action, kwargs, explicit)
 	return send_keys.run_once(gateway_name, key, action, lambda: _dispatch(action, kwargs))
 

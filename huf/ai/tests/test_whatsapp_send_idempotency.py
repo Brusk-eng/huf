@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -43,8 +42,7 @@ class _Base(unittest.TestCase):
 		kw.setdefault("to", "15551234567")
 		if action == "send_message":
 			kw.setdefault("message", "hello")
-		flags = SimpleNamespace(huf_current_agent_run_id=run)
-		with patch.object(whatsapp.frappe, "flags", flags):
+		with patch.dict(frappe.flags, {"huf_current_agent_run_id": run}):
 			return json.loads(whatsapp.handle_action(action, **kw))
 
 
@@ -79,6 +77,19 @@ class TestSameCallIsOneMessage(_Base):
 	def test_recipient_formatting_does_not_defeat_the_key(self):
 		self.call(call_id="c", to="+1 (555) 123-4567")
 		self.call(call_id="c", to="15551234567")
+		self.assertEqual(self.sent.call_count, 1)
+
+
+class TestNoRunNoAutoKey(_Base):
+	def test_without_a_run_or_explicit_key_nothing_is_deduplicated(self):
+		self.call(run=None)
+		self.call(run=None)
+		self.assertEqual(self.sent.call_count, 2)
+		self.assertEqual(frappe.db.count("WhatsApp Send Key", {"gateway": GW}), 0)
+
+	def test_explicit_key_works_without_a_run(self):
+		self.call(run=None, idempotency_key="flow-1")
+		self.call(run=None, idempotency_key="flow-1")
 		self.assertEqual(self.sent.call_count, 1)
 
 
