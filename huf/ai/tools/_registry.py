@@ -220,7 +220,8 @@ WHATSAPP_TOOLS = [
 	{
 		"tool_name": "whatsapp",
 		"description": (
-			"Manage WhatsApp Business messaging via the Meta Cloud API. Actions: "
+			"Manage WhatsApp Business messaging via the Meta Cloud API, always through the gateway this conversation belongs to "
+			"(it cannot be chosen). Actions: "
 			"send_message (to/recipient/phone_number, message/text; free-form sends outside the "
 			"24h window may be refused), "
 			"send_media (to, kind image|document|audio|video|sticker, link or media_id, caption, filename; same 24h window rules as send_message), "
@@ -231,10 +232,10 @@ WHATSAPP_TOOLS = [
 			"send_buttons (to, body, buttons [{id, title}] up to 3, optional header and footer), "
 			"send_list (to, body, button_text, sections [{title, rows: [{id, title, description}]}] up to 10 rows, optional header and footer), "
 			"send_cta_url (to, body, display_text, url, optional header and footer). "
-			"All send_* media, location, contact, reaction and interactive actions are free-form: they need an open 24h window (or the server-side allow_proactive flag), are refused for contacts who opted out, and are validated against Meta's limits before sending; "
+			"All send_* media, location, contact, reaction and interactive actions are free-form: they need an open 24h window (or the gateway's proactive-send setting), are refused for contacts who opted out, and are validated against Meta's limits before sending; "
 			"send_template (to/recipient, template_name, language_code, parameters, header_params, button_params), "
-			"list_messages (to, from, limit), get_account_info, "
-			"list_templates (whatsapp_account, status; rows include review status and rejection reason), "
+			"list_messages (to: the contact, limit, cursor; newest first, each item has the wamid in message_id), get_account_info, "
+			"list_templates (status; rows include review status and rejection reason), "
 			"create_template (template_name, category, language_code, body, sample_values, optional header_type/header/sample, "
 			"footer, buttons; saves a DRAFT that a human must approve before it is submitted to Meta - returns "
 			"status pending_review and the draft name; may be refused by server policy), "
@@ -296,13 +297,9 @@ WHATSAPP_TOOLS = [
 			_p("display_text", description="send_cta_url: button label (max 20 characters)."),
 			_p("url", description="send_cta_url: the https:// address the button opens. Alias of link for media actions."),
 			_p("reply_to", description="Optional wamid of a message to quote in the reply (not for reactions)."),
-			_p("limit", type="integer", description="Max messages to return for list_messages (default 20)."),
-			_p("whatsapp_account", description="WhatsApp Account name to use for list_templates, create_template or send_message."),
+			_p("limit", type="integer", description="Max messages to return for list_messages (default 20, at most 50)."),
+			_p("cursor", description="list_messages: pass the next_cursor of the previous page to get older messages."),
 			_p("status", description="Filter for list_templates by approval status, e.g. APPROVED or PENDING."),
-			_p(
-				"gateway_name",
-				description="Gateway name for send_message; when the 24h customer-service window is open, free-form sends are allowed.",
-			),
 		],
 	},
 ]

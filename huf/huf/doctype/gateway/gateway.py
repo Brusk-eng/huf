@@ -103,8 +103,33 @@ class Gateway(Document):
             return  # frappe_whatsapp absent: the link is inert, nothing to validate against
         if not frappe.db.exists("WhatsApp Account", account):
             frappe.throw(_("WhatsApp Account {0} does not exist.").format(account))
+
+        # One account (and so one token) per enabled gateway: gateway B must not send with A's token.
+        shared = frappe.db.get_value(
+            "Gateway",
+            {
+                "provider": "WhatsApp",
+                "is_enabled": 1,
+                "whatsapp_account": account,
+                "name": ["!=", self.name or ""],
+            },
+            "name",
+        )
+        if shared:
+            frappe.throw(
+                _("WhatsApp Account {0} is already linked to the enabled gateway {1}. Each enabled gateway needs its own account.").format(
+                    account, shared
+                )
+            )
+
         account_phone = str(frappe.db.get_value("WhatsApp Account", account, "phone_id") or "").strip()
-        if self.phone_number_id and account_phone != self.phone_number_id:
+        if not self.phone_number_id:
+            frappe.throw(
+                _("Add the phone_number_id credential to this gateway's integration before linking WhatsApp Account {0}.").format(
+                    account
+                )
+            )
+        if account_phone != self.phone_number_id:
             frappe.throw(
                 _(
                     "WhatsApp Account {0} uses phone number ID {1}, but this gateway's integration uses {2}. "

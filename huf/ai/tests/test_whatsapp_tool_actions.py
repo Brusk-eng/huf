@@ -37,12 +37,12 @@ class _Row:
 
 
 def _settings(**flags):
-	"""Patch the active WhatsApp Integration Settings to carry these credential rows."""
-	doc = SimpleNamespace(credentials=[_Row(key, value) for key, value in flags.items()])
+	"""Bind the run to gateway GW-1 with write authority and these per-gateway flags set."""
 	return patch.multiple(
-		whatsapp.frappe,
-		get_all=MagicMock(return_value=[SimpleNamespace(name="IS-1")]),
-		get_doc=MagicMock(return_value=doc),
+		whatsapp,
+		_run_gateway=MagicMock(return_value="GW-1"),
+		_authorize=MagicMock(return_value=None),
+		_server_flag=MagicMock(side_effect=lambda gateway, name: whatsapp._is_truthy(flags.get(name))),
 	)
 
 
@@ -64,6 +64,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 			_settings(),
 			_creds(),
 			patch.object(whatsapp, "_gateway_account_name", return_value="WA-1"),
+			patch.object(whatsapp, "_is_opted_out", return_value=False),
 		]
 		self.mock_available, self.mock_resolve, _default, self.mock_window, *_ = (p.start() for p in self._patches)
 		self.post = patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.9"}]})).start()
@@ -110,13 +111,13 @@ class TestWhatsAppToolGating(unittest.TestCase):
 				self.assertEqual(result.get("success", False), allowed)
 				self.assertEqual(self.post.called, allowed)
 
-	def test_server_management_setting_also_allows_proactive_send(self):
+	def test_management_setting_does_not_allow_proactive_send(self):
 		with _settings(allow_whatsapp_management="yes"):
 			result = self._send()
-		self.assertTrue(result["success"])
+		self.assertEqual(result["error"], "proactive_send_not_permitted")
 
 	def test_settings_read_failure_fails_closed(self):
-		with patch.object(whatsapp.frappe, "get_all", side_effect=RuntimeError("db down")):
+		with patch.object(whatsapp.frappe.db, "get_value", side_effect=RuntimeError("db down")):
 			result = self._send(allow_proactive=True)
 		self.assertEqual(result["error"], "proactive_send_not_permitted")
 		self.post.assert_not_called()
@@ -172,7 +173,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		with patch.object(whatsapp, "_get_whatsapp_credentials", return_value=("SERVER", "server-tok")) as creds:
 			with patch.object(whatsapp.requests, "get", return_value=FakeResponse(body={"id": "x"})) as mock_get:
 				whatsapp.handle_action("get_account_info", phone_number_id="EVIL", access_token="evil-tok")
-		creds.assert_called_once_with()
+		creds.assert_called_once()
 		self.assertIn("/SERVER", mock_get.call_args.args[0])
 		self.assertEqual(mock_get.call_args.kwargs["headers"]["Authorization"], "Bearer server-tok")
 
@@ -194,13 +195,6 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		self.assertTrue(result["success"])
 		mock_resolve.assert_called_with("WA-1")
 		self.assertEqual(mock_send.call_args.args[0], "WA-1")
-
-	def test_unknown_gateway_is_treated_as_proactive(self):
-		self.mock_window.return_value = {"open": True}
-		with patch.object(whatsapp, "_gateway_account_name", return_value=None):
-			result = self._send(gateway_name="NOPE")
-		self.assertEqual(result["error"], "proactive_send_not_permitted")
-		self.mock_window.assert_not_called()
 
 	def test_send_template_routes_through_bridge(self):
 		with (
@@ -255,6 +249,8 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 		self._settings.start()
 		self.addCleanup(self._settings.stop)
 		_creds().start()
+		patch.object(whatsapp, "_is_opted_out", return_value=False).start()
+		patch.object(whatsapp, "_gateway_account_name", return_value="WA-1").start()
 		self.addCleanup(patch.stopall)
 
 	def test_send_message_uses_bridge_send_text_when_account_resolvable(self):
@@ -319,6 +315,12 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 
 
 class TestWhatsAppToolTemplateActions(unittest.TestCase):
+	def setUp(self):
+		_settings().start()
+		patch.object(whatsapp, "_gateway_account_name", return_value="WA-1").start()
+		patch.object(whatsapp, "_is_opted_out", return_value=False).start()
+		self.addCleanup(patch.stopall)
+
 	def test_list_templates_returns_bridge_rows(self):
 		rows = [{"name": "TPL-1", "template_name": "promo", "status": "APPROVED"}]
 		with (
@@ -350,7 +352,7 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 			patch.object(bridge, "list_templates") as mock_list,
 		):
 			result = json.loads(whatsapp.handle_action("list_templates", gateway_name="GW-1"))
-		self.assertEqual(result["error"], "gateway_required")
+		self.assertEqual(result["error"], "no_account")
 		default.assert_not_called()
 		mock_list.assert_not_called()
 
@@ -481,7 +483,7 @@ class TestWhatsAppToolTypedSends(unittest.TestCase):
 		):
 			self.assertTrue(whatsapp._is_opted_out({"gateway_name": "GW-1"}, "15551234567"))
 			service.assert_called_once_with("GW-1", "15551234567")
-			self.assertFalse(whatsapp._is_opted_out({}, "15551234567"))  # no gateway: nothing to check
+			self.assertTrue(whatsapp._is_opted_out({}, "15551234567"))  # no gateway: fails closed
 		with (
 			patch.object(whatsapp.frappe.db, "exists", return_value=True),
 			patch("huf.ai.gateway_service.is_opted_out", side_effect=RuntimeError("db")),

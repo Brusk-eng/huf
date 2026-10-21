@@ -298,7 +298,7 @@ class TestDrafts(LifecycleCase):
 	def test_agent_create_template_only_drafts(self):
 		self._need_bridge()
 		frappe.flags.huf_current_agent_run_id = "RUN-LC-1"
-		with patch.object(wa_tool, "_server_flag", side_effect=lambda n: n == "allow_whatsapp_management"):
+		with patch.object(wa_tool, "_server_flag", side_effect=lambda g, n: n == "allow_whatsapp_management"):
 			out = json.loads(wa_tool.handle_action(
 				"create_template", auto_submit_templates=True, allow_whatsapp_management=True, **_payload(),
 			))  # LLM-supplied flags are discarded
