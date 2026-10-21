@@ -147,7 +147,7 @@ class TestRunBoundSendAuthority(unittest.TestCase):
 				self.assertTrue(bridge._send_payload("WA-1", {"type": "text"})["success"])
 			with self.assertRaises(frappe.PermissionError):  # scope ended
 				bridge._send_payload("WA-1", {"type": "text"})
-		self.assertTrue(mirror.call_args.args[3])
+		mirror.assert_called_once()
 
 
 class TestUserPreferencesWaba(unittest.TestCase):

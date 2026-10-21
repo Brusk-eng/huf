@@ -15,6 +15,7 @@ or no name is given: there is no default-account guess on gateway paths.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import hashlib
 import importlib
@@ -23,6 +24,7 @@ import mimetypes
 import os
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
@@ -235,6 +237,31 @@ def accounts_for_waba(waba_id: Any) -> list[str]:
 		return []
 
 
+_run_bound: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_run_bound_send", default=False)
+
+
+@contextmanager
+def run_bound_send():
+	"""Server-side scope for the agent tool: the run's own gateway authorised the send, so the run user
+	needs no WhatsApp Message create permission. Skips permission checks only (``trusted`` also commits)."""
+	token = _run_bound.set(True)
+	try:
+		yield
+	finally:
+		_run_bound.reset(token)
+
+
+def _may_bypass(trusted: bool) -> bool:
+	return bool(trusted) or _run_bound.get()
+
+
+def _refuse_if_disconnected(acct: dict[str, Any]) -> None:
+	from huf.ai import whatsapp_account_events as _ae
+
+	if (refusal := _ae.send_refusal(acct.get("phone_id"))):
+		raise BridgeError(refusal)
+
+
 def _account_or_error(account_name: str | None) -> dict[str, Any]:
 	if not is_available():
 		raise BridgeError(_err("bridge_unavailable"))
@@ -437,6 +464,7 @@ def send_text(
 	:class:`BridgeError` (``.payload`` is the error dict) on failure.
 	"""
 	acct = _account_or_error(account_name)
+	_refuse_if_disconnected(acct)
 	if preview_url is not None and trusted:
 		return _send_text_direct(acct, to, text, reply_to, bool(preview_url), http_post)
 	values = {
@@ -452,7 +480,7 @@ def send_text(
 		values["reply_to_message_id"] = reply_to
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			# Gateway reply path runs in a background job: persist the outgoing row
 			# now so Meta's status webhook can match its wamid straight away.
@@ -769,7 +797,7 @@ def _mirror_template_send(acct: dict[str, Any], docname: str, to: str, wamid: st
 	}
 	try:
 		doc = frappe.get_doc(doc_values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			frappe.db.commit()
 		return {"success": True, "name": doc.name, "message_id": wamid, "status": doc.get("status")}
@@ -918,6 +946,7 @@ def send_template(
 	for NAMED mismatches, with the full ``errors`` list).
 	"""
 	acct = _account_or_error(account_name)
+	_refuse_if_disconnected(acct)
 	docname = _template_docname(account_name, template_name, language_code)
 	tpl = _template_row(docname)
 	if tpl and (tpl.get("whatsapp_account") or "") != (account_name or ""):
@@ -963,7 +992,7 @@ def send_template(
 		body_map = {str(i + 1): p for i, p in enumerate(params)}
 
 	if named or any(c.get("type") in ("header", "button") for c in components) or (tpl and _has_dynamic_url(tpl)):
-		if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+		if not _may_bypass(trusted) and not frappe.has_permission("WhatsApp Message", "create"):
 			raise frappe.PermissionError("Not permitted to send WhatsApp messages")
 		template_payload: dict[str, Any] = {
 			"name": (tpl or {}).get("actual_name") or (tpl or {}).get("template_name") or template_name,
@@ -1010,7 +1039,7 @@ def send_template(
 	}
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			# Gateway reply path runs in a background job: persist the outgoing row
 			# now so Meta's status webhook can match its wamid straight away.
@@ -1143,7 +1172,7 @@ def send_media(
 		values["reply_to_message_id"] = reply_to
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			frappe.db.commit()
 	except frappe.PermissionError:
@@ -1213,7 +1242,7 @@ def _mirror_direct_send(acct: dict[str, Any], payload: dict[str, Any], wamid: st
 		values["reply_to_message_id"] = payload["context"]["message_id"]
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			frappe.db.commit()
 		return {"success": True, "name": doc.name, "message_id": wamid, "status": doc.get("status")}
@@ -1226,7 +1255,7 @@ def _send_payload(
 	account_name: str, payload: dict[str, Any], trusted: bool = False, http_post: Callable[..., Any] | None = None
 ) -> dict[str, Any]:
 	acct = _account_or_error(account_name)
-	if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+	if not _may_bypass(trusted) and not frappe.has_permission("WhatsApp Message", "create"):
 		raise frappe.PermissionError("Not permitted to send WhatsApp messages")
 	wamid = _post_typed_message(acct, payload, http_post)
 	return _mirror_direct_send(acct, payload, wamid, trusted)
@@ -1347,7 +1376,7 @@ def upload_media(
 	16 MB, document 100 MB, sticker webp 100 KB static / 500 KB animated); a failing file never reaches Meta.
 	"""
 	acct = _account_or_error(account_name)
-	if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+	if not _may_bypass(trusted) and not frappe.has_permission("WhatsApp Message", "create"):
 		raise frappe.PermissionError("Not permitted to send WhatsApp messages")
 	mime = wm.normalize_mime(mime_type)
 	kind, errors = wm.validate_upload(mime_type, content, kind, bool(voice))

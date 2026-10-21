@@ -106,7 +106,7 @@ def apply_account_event(event: dict, gateway: str) -> list[str]:
 
 	Fail closed: account_update needs the payload WABA to equal the gateway's own WABA (and the
 	phone id, when the payload names one, to equal its number); user_preferences needs the payload
-	phone id to equal the gateway's number. Anything else is dropped.
+	phone id to equal the gateway's number and, when the gateway's WABA is known, entry id to equal it. Anything else is dropped.
 	"""
 	field = event.get("field")
 	waba_id = str(event.get("waba_id") or "").strip()
@@ -125,6 +125,8 @@ def apply_account_event(event: dict, gateway: str) -> list[str]:
 		_audit(gateway, f"WhatsApp account event {verdict['event']}: connection is now {verdict['state']}.")
 		return [gateway]
 	if not phone_id or phone_id != own.get("phone_number_id"):
+		return []
+	if own.get("waba_id") and waba_id != own["waba_id"]:
 		return []
 	record_user_preferences(gateway, value.get("user_preferences"))
 	return [gateway]
