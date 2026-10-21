@@ -1,14 +1,27 @@
 // @vitest-environment jsdom
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 
 import { GatewaySwitcher } from './GatewaySwitcher';
 
+// Radix Select's popper (floating-ui) calls `element.matches(':modal')` while
+// walking ancestors on open. In jsdom's nwsapi that selector is very slow, so
+// opening the select could blow the 5s test timeout. jsdom has no top layer,
+// so answering `false` for it is exact and makes it instant.
+const originalMatches = Element.prototype.matches;
+
 beforeAll(() => {
 	Element.prototype.hasPointerCapture = () => false;
 	Element.prototype.scrollIntoView = () => {};
+	Element.prototype.matches = function (this: Element, selector: string) {
+		return selector === ':modal' ? false : originalMatches.call(this, selector);
+	};
+});
+
+afterAll(() => {
+	Element.prototype.matches = originalMatches;
 });
 
 const gateways = [
