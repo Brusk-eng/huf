@@ -48,6 +48,7 @@ class Gateway(Document):
         self._validate_fallback_template()
         self._validate_consent_settings()
         self._validate_reply_settings()
+        self._validate_send_scope()
 
         # ST-04.4: Validate required credentials are set
         if self.is_enabled and self.provider:
@@ -319,6 +320,27 @@ class Gateway(Document):
             frappe.throw(_("Error reply text must be 1000 characters or fewer."))
         if self.get("preview_url") not in (None, "", "Default (off)", "On", "Off"):
             frappe.throw(_("Link previews must be Default (off), On or Off."))
+
+    def _validate_send_scope(self):
+        """Agent send scope (WhatsApp): a known scope, a real allow-list when chosen, non-negative caps."""
+        if self.provider != "WhatsApp":
+            return
+        from huf.ai import whatsapp_send_scope as send_scope
+
+        scope = self.get("agent_recipient_scope") or send_scope.DEFAULT_SCOPE
+        if scope not in send_scope.SCOPES:
+            frappe.throw(_("Agent recipient scope must be one of: {0}.").format(", ".join(send_scope.SCOPES)))
+        raw = self.get("agent_recipient_allowlist") or ""
+        if str(raw).strip():
+            bad = send_scope.invalid_allowlist_entries(raw)
+            if bad:
+                frappe.throw(_("Not a phone number in the allowed recipients: {0}").format(", ".join(bad)))
+        if scope == "Allow-list" and not send_scope.parse_allowlist(raw):
+            frappe.throw(_("Add at least one number to the allowed recipients, or choose another recipient scope."))
+        for field, label in (("agent_send_cap_per_run", _("Agent sends per run")), ("agent_send_cap_per_day", _("Agent sends per day"))):
+            value = self.get(field)
+            if value is not None and int(value) < 0:
+                frappe.throw(_("{0} must be 0 (no limit) or more.").format(label))
 
     def _validate_consent_settings(self):
         limit = self.get("inbound_sender_limit")

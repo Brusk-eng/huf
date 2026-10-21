@@ -243,8 +243,32 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		return refusal
 
 	if action in _SEND_ACTIONS and action != "create_template":
+		refusal = _scope_refusal(kwargs, gateway_name)
+		if refusal:
+			return refusal
 		return _idempotent_send(action, kwargs, gateway_name)
 	return _dispatch(action, kwargs)
+
+
+def _scope_refusal(kwargs: dict, gateway_name: str) -> Optional[str]:
+	"""Recipient scope (WP-10): default recipient is the run's conversation contact; wider scope is gateway config.
+
+	A trusted deterministic caller (Flow tool.call) is configured by an admin, not by a model, so it is
+	not bound to a conversation. Fills ``to`` with the current contact when the model left it out.
+	"""
+	if _trusted_gateway.get():
+		return None
+	from huf.ai import whatsapp_send_scope as send_scope
+
+	run_id = getattr(frappe.flags, "huf_current_agent_run_id", None)
+	if not _recipient(kwargs):
+		contact = send_scope.current_contact(run_id)
+		if contact:
+			kwargs["to"] = contact
+	recipient = _recipient(kwargs)
+	if not recipient:
+		return None  # the send itself reports the missing recipient
+	return send_scope.check_recipient(gateway_name, run_id, recipient)
 
 
 def _idempotent_send(action: str, kwargs: dict, gateway_name: str) -> str:
@@ -259,7 +283,21 @@ def _idempotent_send(action: str, kwargs: dict, gateway_name: str) -> str:
 	if not run_id and not explicit:
 		return _dispatch(action, kwargs)  # no run and no caller key: nothing to scope an automatic key to
 	key = send_keys.derive_key(gateway_name, run_id, kwargs.get("call_id"), action, kwargs, explicit)
-	return send_keys.run_once(gateway_name, key, action, lambda: _dispatch(action, kwargs))
+	return send_keys.run_once(
+		gateway_name, key, action, lambda: _capped_dispatch(action, kwargs, gateway_name, run_id),
+		run=run_id or "", recipient=_recipient(kwargs),
+	)
+
+
+def _capped_dispatch(action: str, kwargs: dict, gateway_name: str, run_id: Optional[str]) -> str:
+	"""Run the send unless it would exceed the gateway's per-run / per-day cap (checked after the claim)."""
+	if not _trusted_gateway.get():
+		from huf.ai import whatsapp_send_scope as send_scope
+
+		refusal = send_scope.check_caps(gateway_name, run_id)
+		if refusal:
+			return refusal
+	return _dispatch(action, kwargs)
 
 
 def _dispatch(action: str, kwargs: dict) -> str:
