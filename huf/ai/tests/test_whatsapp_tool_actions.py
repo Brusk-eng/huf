@@ -207,7 +207,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 				whatsapp.handle_action("send_template", to="15551234567", template_name="t", parameters=["a"])
 			)
 		self.assertTrue(result["success"])
-		mock_tpl.assert_called_once_with("WA-1", "15551234567", "t", ["a"])
+		mock_tpl.assert_called_once_with("WA-1", "15551234567", "t", ["a"], gateway_name="GW-1")
 
 	def test_create_template_ignores_llm_supplied_management_flag(self):
 		with (

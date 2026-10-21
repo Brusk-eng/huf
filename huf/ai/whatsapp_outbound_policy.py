@@ -105,9 +105,14 @@ def record_template_outreach(gateway: str, recipient: Any) -> None:
 	from huf.ai import whatsapp_account_events as events
 
 	key = events._norm_sender(recipient)
-	if not gateway or not key or events._latest_consent(gateway, key, OUTREACH) is not None:
+	if not gateway or not key or not frappe.db.exists("Gateway", gateway):
 		return
-	events._insert_consent(gateway, key, OUTREACH, "resume", "proactive template sent")
+	if events._latest_consent(gateway, key, OUTREACH) is not None:
+		return
+	try:
+		events._insert_consent(gateway, key, OUTREACH, "resume", "proactive template sent")
+	except Exception:  # the template was already delivered; a lost marker must not fail the send
+		frappe.log_error(title="WhatsApp template outreach marker not recorded")
 
 
 def note_template_sent(account: str, recipient: Any, gateway: str | None = None) -> None:
