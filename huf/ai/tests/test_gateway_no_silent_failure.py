@@ -24,6 +24,7 @@ def _event(**kw):
 		name="GEV-1",
 		sender_id="1555",
 		conversation_id="1555",
+		reply_message_id="",
 		raw_payload={"message": {"type": "text"}},
 	)
 	values.update(kw)
@@ -117,7 +118,7 @@ class TestPaths(unittest.TestCase):
 		event = _event(status="Queued", gateway="GW", target_type="Agent", target_agent="A", message_text="hi", thread_id="")
 		gw = _gw(is_enabled=1, execution_user="bot")
 		with (
-			patch.object(gs.frappe, "get_doc", side_effect=[event, gw, MagicMock(owner="bot")]),
+			patch.object(gs.frappe, "get_doc", side_effect=[event, gw, MagicMock(owner="bot"), gw]),
 			patch.object(gs, "_process_time_block_reason", return_value=""),
 			patch.object(gs, "_is_reaction_event", return_value=False),
 			patch("huf.ai.agent_access.resolve_run_identity_and_authorize", return_value=SimpleNamespace(authorized=True)),
