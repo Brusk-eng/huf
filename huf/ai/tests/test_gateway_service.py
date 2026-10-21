@@ -1199,3 +1199,28 @@ class TestWhatsAppGatewayService(unittest.TestCase):
             result = gateway_service.test_gateway_send("WA", "1234567890")
         assert result["success"] is False
         assert "window closed" in result["message"]
+
+
+class TestAgentRunFailureClassification(unittest.TestCase):
+    """FIX-E: failed/errored/empty agent runs are never sendable replies."""
+
+    def test_success_with_text_is_not_a_failure(self):
+        self.assertIsNone(gateway_service._agent_run_failure({"success": True, "response": "hi"}))
+        self.assertIsNone(gateway_service._agent_run_failure({"response": "hi", "agent_run_id": "r"}))
+
+    def test_failed_run_with_kind(self):
+        code, reason = gateway_service._agent_run_failure(
+            {"success": False, "error": "x ?key=abcSECRET123", "error_kind": "quota_exceeded"}
+        )
+        self.assertEqual(code, "provider_quota_exceeded")
+        self.assertNotIn("abcSECRET123", reason)
+
+    def test_failed_run_unknown_or_missing_kind(self):
+        self.assertEqual(gateway_service._agent_run_failure({"success": False, "error": "e"})[0], "agent_run_failed")
+        self.assertEqual(
+            gateway_service._agent_run_failure({"success": False, "error_kind": "unknown"})[0], "agent_run_failed"
+        )
+
+    def test_empty_or_non_dict_result(self):
+        self.assertEqual(gateway_service._agent_run_failure({"response": " "})[0], "agent_run_failed")
+        self.assertEqual(gateway_service._agent_run_failure(None)[0], "agent_run_failed")

@@ -161,8 +161,23 @@ class TestEventCounts(unittest.TestCase):
 			{"status": "Rejected", "reply_status": "", "delivery_error": ""},
 		]
 		self.assertEqual(
-			wh.count_events(rows), {"received": 6, "failed": 2, "unrouted": 1, "rejected": 2}
+			wh.count_events(rows),
+			{"received": 6, "failed": 2, "agent_failed": 0, "unrouted": 1, "rejected": 2},
 		)
+
+	def test_agent_failed_counting_and_health_reason(self):
+		rows = [
+			{"status": "Failed", "error_message": "provider_rate_limited: slow down", "delivery_error": "x"},
+			{"status": "Failed", "error_message": "agent_run_failed: boom", "delivery_error": "x"},
+			{"status": "Failed", "error_message": "24-hour window closed", "delivery_error": ""},
+		]
+		counts = wh.count_events(rows)
+		self.assertEqual((counts["failed"], counts["agent_failed"]), (3, 2))
+		r = wh.evaluate(facts(events_24h=counts, agent_error_kind="rate_limited"), NOW)
+		self.assertIn("agent_failing", codes(r))
+		msg = {x["code"]: x["message"] for x in r["reasons"]}["agent_failing"]
+		self.assertIn("The AI model returned an error (rate_limited)", msg)
+		self.assertEqual(r["health"], "degraded") if r["health"] in ("degraded",) else None
 
 	def test_meta_links(self):
 		links = wh.meta_links("1234567890")

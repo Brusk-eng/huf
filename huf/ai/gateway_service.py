@@ -62,6 +62,84 @@ SENSITIVE_PAYLOAD_KEYS = {
 }
 
 
+_FALLBACK_REPLY_WINDOW_SECONDS = 600
+
+
+def _agent_run_failure(result) -> tuple[str, str] | None:
+    """Return ``(error_code, short_reason)`` when an agent run did not produce a sendable reply.
+
+    A failed run (``success`` False / ``error`` set), a non-dict result or an empty response
+    must never reach the customer. ``error_code`` is ``provider_<kind>`` when the provider
+    failure was classified, otherwise ``agent_run_failed``.
+    """
+    if not isinstance(result, dict):
+        return "agent_run_failed", "The agent run returned no result."
+    if result.get("success") is False or (result.get("error") and not result.get("response")):
+        kind = str(result.get("error_kind") or "")
+        code = f"provider_{kind}" if kind and kind != "unknown" else "agent_run_failed"
+        reason = _redact_error_text(str(result.get("error") or "The agent run failed."))
+        return code, reason
+    response = result.get("response")
+    if not response or not str(response).strip():
+        return "agent_run_failed", "Gateway agent run completed without a text response."
+    return None
+
+
+def _gateway_fallback_reply_text(gateway) -> str:
+    """Optional plain-text apology configured as an Integration Settings credential row
+    ``fallback_reply_text`` (default: none, i.e. stay silent)."""
+    try:
+        if gateway.integration_settings:
+            int_doc = frappe.get_doc("Integration Settings", gateway.integration_settings)
+            for row in getattr(int_doc, "credentials", []) or []:
+                if row.key == "fallback_reply_text":
+                    value = row.get_password("value") if hasattr(row, "get_password") else row.value
+                    return str(value or "").strip()
+    except Exception:
+        frappe.logger("huf").warning("Gateway fallback_reply_text could not be read")
+    return ""
+
+
+def _maybe_send_failure_fallback(event, gateway) -> bool:
+    """Send the configured fallback text at most once per sender per 10 minutes. Never raises."""
+    try:
+        text = _gateway_fallback_reply_text(gateway)
+        if not text:
+            return False
+        key = f"huf_gw_fallback_reply:{gateway.name}:{event.sender_id or event.conversation_id}"
+        if not frappe.cache().set(key, 1, ex=_FALLBACK_REPLY_WINDOW_SECONDS, nx=True):
+            return False
+        from huf.ai.gateway_webhook import send_gateway_reply
+
+        delivery = send_gateway_reply(gateway, event, text)
+        _record_reply_sent(event, getattr(delivery, "provider_message_id", None))
+        return True
+    except Exception:
+        frappe.logger("huf").warning("Gateway fallback reply failed to send")
+        return False
+
+
+def _fail_event_for_agent_run(event, gateway, result, error_code: str, reason: str) -> dict:
+    """Mark the event Failed for a failed agent run and send nothing (bar the optional fallback)."""
+    agent_run_id = result.get("agent_run_id") if isinstance(result, dict) else None
+    message = f"{error_code}: {reason}"[:500]
+    values = {"status": "Failed", "error_message": message, "delivery_error": message[:140]}
+    if agent_run_id:
+        values["agent_run"] = agent_run_id
+    event.db_set(values)
+    frappe.log_error(message, "Gateway agent run failed")
+    fallback_sent = _maybe_send_failure_fallback(event, gateway)
+    return {
+        "event_name": event.name,
+        "status": "Failed",
+        "error": reason,
+        "error_code": error_code,
+        "agent_run_id": agent_run_id,
+        "fallback_sent": fallback_sent,
+    }
+
+
+
 def _idempotency_key(gateway_name: str, provider_event_id: str) -> str:
     value = f"{gateway_name}:{provider_event_id}".encode()
     return hashlib.sha256(value).hexdigest()
@@ -840,9 +918,10 @@ def process_gateway_event(event_name: str) -> dict:
                 external_id=event.thread_id or event.conversation_id or event.sender_id,
                 now=True,
             )
-            response = result.get("response") if isinstance(result, dict) else None
-            if not response or not str(response).strip():
-                raise frappe.ValidationError(_("Gateway agent run completed without a text response."))
+            failure = _agent_run_failure(result)
+            if failure:
+                return _fail_event_for_agent_run(event, gateway, result, *failure)
+            response = result.get("response")
             try:
                 _throttle_outbound_send(gateway.name, _outbound_rate_cap(gateway.provider))
                 delivery = send_gateway_reply(gateway, event, str(response))
