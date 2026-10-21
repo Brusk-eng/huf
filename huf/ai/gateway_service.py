@@ -106,29 +106,100 @@ def _gateway_fallback_reply_text(gateway) -> str:
     return ""
 
 
-def _maybe_send_failure_fallback(event, gateway) -> bool:
-    """Send the configured fallback text at most once per sender per 10 minutes. Never raises."""
+_FALLBACK_TEXTS = {
+    "en": {
+        "error": "Sorry, something went wrong on our side and I could not answer. Please try again in a moment.",
+        "attachment": "Sorry, I could not open the file you sent. Please send it again or describe it in a message.",
+    },
+    "es": {
+        "error": "Lo sentimos, algo salio mal y no pude responder. Por favor intentalo de nuevo en un momento.",
+        "attachment": "Lo sentimos, no pude abrir el archivo que enviaste. Envialo de nuevo o descríbelo en un mensaje.",
+    },
+    "fr": {
+        "error": "Désolé, un problème est survenu et je n'ai pas pu répondre. Veuillez réessayer dans un instant.",
+        "attachment": "Désolé, je n'ai pas pu ouvrir le fichier envoyé. Renvoyez-le ou décrivez-le dans un message.",
+    },
+    "pt": {
+        "error": "Desculpe, algo deu errado e nao consegui responder. Tente novamente em instantes.",
+        "attachment": "Desculpe, nao consegui abrir o arquivo enviado. Envie novamente ou descreva em uma mensagem.",
+    },
+    "de": {
+        "error": "Entschuldigung, es ist ein Fehler aufgetreten und ich konnte nicht antworten. Bitte versuchen Sie es gleich noch einmal.",
+        "attachment": "Entschuldigung, ich konnte die gesendete Datei nicht öffnen. Bitte senden Sie sie erneut oder beschreiben Sie sie kurz.",
+    },
+    "ar": {
+        "error": "عذرا، حدث خطأ ولم أتمكن من الرد. يرجى المحاولة مرة أخرى بعد قليل.",
+        "attachment": "عذرا، لم أتمكن من فتح الملف الذي أرسلته. يرجى إرساله مرة أخرى أو وصفه في رسالة.",
+    },
+}
+ATTACHMENT_UNAVAILABLE_NOTE = "[Attachment unavailable: the file the user sent could not be downloaded]"
+
+
+def _lang_code(value: Any) -> str:
+    return str(value or "").strip().replace("-", "_").split("_")[0].lower()
+
+
+def _contact_language(event) -> str:
+    raw = getattr(event, "raw_payload", None)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if isinstance(raw, dict):
+        return _lang_code(raw.get("language") or raw.get("locale"))
+    return ""
+
+
+def _default_fallback_text(gateway, event, kind: str) -> str:
+    """Plain, localized text: contact language > gateway default language > English."""
+    if kind == "error":
+        custom = _gateway_fallback_reply_text(gateway)
+        if custom:
+            return custom
+    for code in (_contact_language(event), _lang_code(getattr(gateway, "fallback_template_language", ""))):
+        if code in _FALLBACK_TEXTS:
+            return _FALLBACK_TEXTS[code][kind]
+    return _FALLBACK_TEXTS["en"][kind]
+
+
+def _send_fallback_once(event, gateway, kind: str = "error") -> bool:
+    """Send the default fallback reply at most once per event and kind, through the normal reply
+    pipeline (opt-out and window rules apply). Never raises."""
     try:
-        text = _gateway_fallback_reply_text(gateway)
-        if not text:
-            return False
         if event.sender_id and is_opted_out(gateway, event.sender_id):
             return False
-        key = f"huf_gw_fallback_reply:{gateway.name}:{event.sender_id or event.conversation_id}"
-        if not frappe.cache().set(key, 1, ex=_FALLBACK_REPLY_WINDOW_SECONDS, nx=True):
+        key = f"huf_gw_fallback_reply:{event.name}:{kind}"
+        if not frappe.cache().set(key, 1, ex=86400, nx=True):
             return False
         from huf.ai.gateway_webhook import send_gateway_reply
 
-        delivery = send_gateway_reply(gateway, event, text)
-        _record_reply_sent(event, getattr(delivery, "provider_message_id", None))
+        delivery = send_gateway_reply(gateway, event, _default_fallback_text(gateway, event, kind))
+        if kind == "error":
+            _record_reply_sent(event, getattr(delivery, "provider_message_id", None))
         return True
     except Exception:
         frappe.logger("huf").warning("Gateway fallback reply failed to send")
         return False
 
 
+def _inbound_media_type(event) -> str | None:
+    """Media message type of the inbound WhatsApp message, when it carries a downloadable id."""
+    raw = getattr(event, "raw_payload", None)
+    try:
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        message = raw.get("message") if isinstance(raw, dict) else None
+        msg_type = message.get("type") if isinstance(message, dict) else None
+        if msg_type in ("image", "document", "audio", "video", "sticker") and (message.get(msg_type) or {}).get("id"):
+            return msg_type
+    except Exception:
+        pass
+    return None
+
+
 def _fail_event_for_agent_run(event, gateway, result, error_code: str, reason: str) -> dict:
-    """Mark the event Failed for a failed agent run and send nothing (bar the optional fallback)."""
+    """Mark the event Failed for a failed agent run and send nothing (bar the default fallback reply)."""
     agent_run_id = result.get("agent_run_id") if isinstance(result, dict) else None
     message = f"{error_code}: {reason}"[:500]
     values = {"status": "Failed", "error_message": message, "delivery_error": message[:140]}
@@ -136,7 +207,7 @@ def _fail_event_for_agent_run(event, gateway, result, error_code: str, reason: s
         values["agent_run"] = agent_run_id
     event.db_set(values)
     frappe.log_error(message, "Gateway agent run failed")
-    fallback_sent = _maybe_send_failure_fallback(event, gateway)
+    fallback_sent = _send_fallback_once(event, gateway, "error")
     return {
         "event_name": event.name,
         "status": "Failed",
@@ -1414,8 +1485,9 @@ _BUSY_BASE_DELAY = 2.0
 _BUSY_MAX_DELAY = 20.0
 _CONVERSATION_LOCK_WAIT = 90
 _CONVERSATION_LOCK_TTL = 330
-_REQUEUE_MAX = 5
-_REQUEUE_TTL = 3600
+_REQUEUE_MAX = 25
+_PROCESS_JOB_TIMEOUT = 300
+_REQUEUE_TTL = 7200
 
 
 class ConversationBusy(Exception):
@@ -1458,6 +1530,11 @@ def _requeue_busy_event(event, error: str) -> dict:
     if count > _REQUEUE_MAX:
         event.db_set({"status": "Failed", "error_message": f"Conversation stayed busy: {error}"[-500:]})
         _commit_unless_testing()
+        try:
+            _send_fallback_once(event, frappe.get_doc("Gateway", event.gateway), "error")
+            _commit_unless_testing()
+        except Exception:
+            frappe.logger("huf").warning("Busy fallback reply skipped")
         return {"event_name": event.name, "status": "Failed", "error": "conversation_busy"}
     frappe.cache.set_value(key, count, expires_in_sec=_REQUEUE_TTL)
     event.db_set({"status": "Queued", "error_message": f"Conversation busy; retry {count}/{_REQUEUE_MAX}"})
@@ -1465,7 +1542,7 @@ def _requeue_busy_event(event, error: str) -> dict:
     frappe.enqueue(
         "huf.ai.gateway_service.process_gateway_event",
         queue="default",
-        timeout=300,
+        timeout=_PROCESS_JOB_TIMEOUT,
         event_name=event.name,
         enqueue_after_commit=True,
     )
@@ -1811,6 +1888,7 @@ def _process_gateway_event(event_name: str) -> dict:
             from huf.ai.gateway_webhook import send_gateway_reply
 
             attachment_note = _describe_attachments(event.raw_payload)
+            saved_files: list[str] = []
             if gateway.provider == "WhatsApp":
                 saved_files = _save_whatsapp_media(event, gateway)
                 if saved_files:
@@ -1818,6 +1896,10 @@ def _process_gateway_event(event_name: str) -> dict:
                         [attachment_note] * bool(attachment_note)
                         + [f"[Attachment saved: {file_url}]" for file_url in saved_files]
                     )
+            media_type = _inbound_media_type(event) if gateway.provider == "WhatsApp" else None
+            if media_type and not saved_files:
+                attachment_note = "\n".join([attachment_note] * bool(attachment_note) + [ATTACHMENT_UNAVAILABLE_NOTE])
+                _send_fallback_once(event, gateway, "attachment")
             prompt = f"{attachment_note}\n{event.message_text}" if attachment_note else event.message_text
 
             fallback_note = ""
@@ -1920,6 +2002,12 @@ def _process_gateway_event(event_name: str) -> dict:
         event.db_set({"status": "Failed", "error_message": message[-500:]})
         frappe.db.commit()
         frappe.log_error(message, "Gateway event failed")
+        if not getattr(event, "reply_message_id", ""):
+            try:
+                if _send_fallback_once(event, frappe.get_doc("Gateway", event.gateway), "error"):
+                    frappe.db.commit()
+            except Exception:
+                pass
         raise
 
 
