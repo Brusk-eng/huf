@@ -17,6 +17,7 @@ from huf.ai.gateway_adapters.whatsapp import (
 	WhatsAppFallbackUnavailable,
 	WhatsAppGatewayAdapter,
 )
+from huf.ai.gateway_webhook import get_gateway_adapter as real_get_gateway_adapter  # fixture patches the module attr
 from huf.ai.tests.test_gateway_pairing_hardening import _GatewayFixture
 
 PHONE = "15551230001"
@@ -246,14 +247,15 @@ class TestFallbackContext(_Fixture, IntegrationTestCase):
 		with patch.object(webhook, "_adapter_class_for_provider", return_value=Fake), patch.object(
 			webhook, "_gateway_credentials", return_value={}
 		):
-			webhook.get_gateway_adapter(doc, contact_name="Ann")
+			real_get_gateway_adapter(doc, contact_name="Ann")
 		self.assertEqual(captured["contact_name"], "Ann")
 		self.assertEqual(captured["fallback_template_params"], ["Ann", "Acme"])
 
 
 class TestFallbackValidator(_Fixture, IntegrationTestCase):
 	def _validate(self, row, params=""):
-		gateway = self.make_gateway("P", policy="Allow list")
+		self.n = getattr(self, "n", 0) + 1
+		gateway = self.make_gateway(f"V{self.n}", policy="Allow list")
 		doc = self.gw(gateway)
 		doc.whatsapp_account = "acct"
 		doc.fallback_template = "reopen"

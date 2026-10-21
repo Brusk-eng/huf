@@ -22,6 +22,7 @@ from frappe import _
 from frappe.rate_limiter import rate_limit
 from frappe.utils import add_to_date, now_datetime
 
+from huf.ai import whatsapp_outbound_policy as policy
 from huf.ai.gateway_adapters.provider_ids import provider_to_service_id
 
 
@@ -937,6 +938,14 @@ def _handle_consent_event(event, gateway, context: dict[str, Any]) -> dict | Non
         return None
     if not _sender_is_known(gateway, sender_id):
         text = context.get("message_text")
+        if _text_matches_keywords(
+            gateway, text, "opt_out_keywords", DEFAULT_OPT_OUT_KEYWORDS
+        ) and policy.has_received_template(gateway.name, sender_id):
+            # We messaged this contact first (proactive template): their STOP must be honoured.
+            _record_opt_out(gateway, sender_id, str(context.get("display_name") or "") or None)
+            reply = getattr(gateway, "opt_out_reply_text", None) or DEFAULT_OPT_OUT_REPLY
+            _send_plain_reply(gateway, sender_id, str(context.get("conversation_id") or "") or sender_id, reply)
+            return _reject_event(event, "Sender opted out (STOP) after a proactive template; no agent run")
         if _text_matches_keywords(gateway, text, "opt_out_keywords", DEFAULT_OPT_OUT_KEYWORDS) or _text_matches_keywords(
             gateway, text, "opt_in_keywords", DEFAULT_OPT_IN_KEYWORDS
         ):
