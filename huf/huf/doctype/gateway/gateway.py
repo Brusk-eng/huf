@@ -1,3 +1,5 @@
+import json
+
 import frappe
 from frappe import _
 from frappe.model.document import Document
@@ -138,10 +140,12 @@ class Gateway(Document):
             )
 
     def _validate_fallback_template(self):
-        """The fallback template is sent with no parameters, so it must have no variables.
+        """The fallback template may have body variables but no media/location header.
 
-        Checked only when frappe_whatsapp is installed, an account is linked and the template row
-        is already known; otherwise it cannot be verified here (health warns about it instead).
+        Body variables are filled from ``fallback_template_params`` (or the contact name by default); when
+        params are configured their count must match the template's variables. Checked only when
+        frappe_whatsapp is installed, an account is linked and the template row is already known;
+        otherwise it cannot be verified here (health warns about it instead).
         """
         if self.provider != "WhatsApp":
             return
@@ -162,22 +166,36 @@ class Gateway(Document):
             return  # not found yet / ambiguous language: nothing to verify
         if not row or row.get("whatsapp_account") != account:
             return
-        texts = [row.get("template"), row.get("header")] + [
-            b.get("website_url") for b in row.get("buttons") or []
-        ]
         media_header = str(row.get("header_format") or row.get("header_type") or "").upper() in {
             "IMAGE",
             "VIDEO",
             "DOCUMENT",
             "LOCATION",
         }
-        if media_header or any(variables(t or "") for t in texts):
+        header_vars = variables(row.get("header") or "")
+        url_vars = any(variables(b.get("website_url") or "") for b in row.get("buttons") or [])
+        if media_header or header_vars or url_vars:
             frappe.throw(
                 _(
-                    "The fallback template can't have variables (it is sent without values). "
-                    "Pick a template with plain text."
+                    "The fallback template can't have a media, location or variable header, or a button URL "
+                    "variable (only body variables are filled). Pick a template with a plain header."
                 )
             )
+        params = (self.get("fallback_template_params") or "").strip()
+        if params:
+            try:
+                parsed = json.loads(params)
+            except ValueError:
+                parsed = None
+            if not isinstance(parsed, (list, dict)):
+                frappe.throw(_("Fallback template params must be a JSON list or a {name: value} map."))
+            expected = len(variables(row.get("template") or ""))
+            if len(parsed) != expected:
+                frappe.throw(
+                    _("The fallback template has {0} body variable(s) but {1} param(s) are configured.").format(
+                        expected, len(parsed)
+                    )
+                )
 
     def _validate_required_credentials(self):
         """Verify that required credentials per the adapter schema are configured.

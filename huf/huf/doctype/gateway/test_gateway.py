@@ -186,17 +186,17 @@ class TestFallbackTemplateValidation(IntegrationTestCase):
 	def test_plain_template_passes(self):
 		self._check(self._row())
 
-	def test_variables_rejected_in_body_header_and_url_button(self):
+	def test_body_variables_allowed_header_and_url_variables_rejected(self):
+		self._check(self._row(template="Hi {{1}}"))  # WP-6 (C-011): body variables are filled at send time
+		self._check(self._row(template="Hi {{name}}"))
 		for over in (
-			{"template": "Hi {{1}}"},
-			{"template": "Hi {{name}}"},
 			{"header": "Order {{1}}", "header_type": "TEXT"},
 			{"buttons": [{"button_type": "Visit Website", "website_url": "https://x.test/{{1}}"}]},
 			{"header_type": "IMAGE"},
 		):
 			with self.assertRaises(frappe.ValidationError, msg=str(over)) as ctx:
 				self._check(self._row(**over))
-			self.assertIn("can't have variables", str(ctx.exception))
+			self.assertIn("can't have a media", str(ctx.exception))
 
 	def test_skips_silently_when_unverifiable(self):
 		self._check(self._row(template="Hi {{1}}"), available=False)  # no connector

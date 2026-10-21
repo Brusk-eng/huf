@@ -8,6 +8,7 @@ adapter package or required credentials are unavailable.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import frappe
@@ -180,7 +181,27 @@ def _gateway_credentials(gateway) -> dict[str, str]:
 	return credentials
 
 
-def get_gateway_adapter(gateway):
+def _fallback_params(gateway, contact_name: str):
+	"""The Gateway's ``fallback_template_params`` (a JSON list or map; ``{{contact_name}}`` is substituted)."""
+	raw = str(gateway.get("fallback_template_params") or "").strip()
+	if not raw:
+		return None
+	try:
+		value = json.loads(raw)
+	except ValueError:
+		return None
+
+	def fill(item):
+		return str(item).replace("{{contact_name}}", contact_name or "there")
+
+	if isinstance(value, dict):
+		return {str(k): fill(v) for k, v in value.items()}
+	if isinstance(value, list):
+		return [fill(v) for v in value]
+	return None
+
+
+def get_gateway_adapter(gateway, contact_name: str = ""):
 	"""Instantiate the configured adapter without exposing stored credentials."""
 	adapter_class = _adapter_class_for_provider(gateway.provider)
 	credentials = _gateway_credentials(gateway)
@@ -192,6 +213,8 @@ def get_gateway_adapter(gateway):
 				"whatsapp_account": (gateway.get("whatsapp_account") or "").strip(),
 				"fallback_template": (gateway.get("fallback_template") or "").strip(),
 				"fallback_template_language": (gateway.get("fallback_template_language") or "").strip(),
+				"fallback_template_params": _fallback_params(gateway, contact_name),
+				"contact_name": contact_name,
 				"preview_url": (gateway.get("preview_url") or "").strip(),
 			},
 		)
@@ -815,11 +838,22 @@ def handle_gateway_webhook() -> dict | None:
 	return {"success": True, **result}
 
 
+def event_contact_name(event) -> str:
+	"""The sender's profile name recorded on the inbound event (empty when unknown)."""
+	raw = getattr(event, "raw_payload", None)
+	if isinstance(raw, str):
+		try:
+			raw = json.loads(raw)
+		except ValueError:
+			raw = None
+	return str(raw.get("contact_name") or "").strip() if isinstance(raw, dict) else ""
+
+
 def send_gateway_reply(gateway, event, text: str):
 	"""Deliver one completed Agent response through the same verified gateway."""
 	from huf.ai.gateway_adapters.types import GatewayReply
 
-	adapter = get_gateway_adapter(gateway)
+	adapter = get_gateway_adapter(gateway, event_contact_name(event))
 	if gateway.provider == "WhatsApp":
 		# A2: WhatsApp never fragments conversations by thread; the reply quotes
 		# the inbound wamid, which is the event's provider_event_id.
@@ -847,7 +881,7 @@ def send_gateway_parts(gateway, event, parts: list[str], *, quote: bool = True):
 	``quote`` puts the reply-to context on the first part only; pass False when an earlier part was
 	already delivered. Raises ``WhatsAppPartsError`` carrying what was sent and what remains.
 	"""
-	adapter = get_gateway_adapter(gateway)
+	adapter = get_gateway_adapter(gateway, event_contact_name(event))
 	return adapter.send_text_parts(
 		event.conversation_id, list(parts), (event.provider_event_id or None) if quote else None
 	)
