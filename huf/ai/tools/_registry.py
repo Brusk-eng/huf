@@ -297,6 +297,7 @@ WHATSAPP_TOOLS = [
 			_p("display_text", description="send_cta_url: button label (max 20 characters)."),
 			_p("url", description="send_cta_url: the https:// address the button opens. Alias of link for media actions."),
 			_p("reply_to", description="Optional wamid of a message to quote in the reply (not for reactions)."),
+			_p("idempotency_key", description="Optional, any send action: the same key sends once (for 24h) and a repeat returns the original result with deduplicated=true. Without it, a retry of the same tool call is deduplicated automatically."),
 			_p("limit", type="integer", description="Max messages to return for list_messages (default 20, at most 50)."),
 			_p("cursor", description="list_messages: pass the next_cursor of the previous page to get older messages."),
 			_p("status", description="Filter for list_templates by approval status, e.g. APPROVED or PENDING."),
