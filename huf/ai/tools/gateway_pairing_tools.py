@@ -177,7 +177,7 @@ def list_pairing_requests(gateway_name: str | None = None) -> list[dict[str, Any
 	Returns:
 		List of pending pairing request dictionaries
 	"""
-	from huf.ai.gateway_service import _require_gateway_admin
+	from huf.ai.gateway_service import _mask_code, _require_gateway_admin
 
 	_require_gateway_admin()
 	filters: dict[str, Any] = {"state": "Pending"}
@@ -214,7 +214,7 @@ def list_pairing_requests(gateway_name: str | None = None) -> list[dict[str, Any
 				"provider": entry["provider"],
 				"entry_type": entry["entry_type"],
 				"external_id": entry["external_id"],
-				"pairing_code": entry.get("pairing_code") or "N/A",
+				"pairing_code": _mask_code(entry["pairing_code"]) if entry.get("pairing_code") else "N/A",
 				"expires_at": str(entry.get("expires_at") or ""),
 				"created_at": str(entry["creation"]),
 			}
