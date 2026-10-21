@@ -8,6 +8,7 @@ import frappe
 
 
 def execute():
+	frappe.reload_doc("huf", "doctype", "mcp_server_tool")
 	frappe.db.sql(
 		"""
 		UPDATE `tabMCP Server Tool`
