@@ -124,7 +124,8 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	last_event_at = facts.get("last_event_at")
 	last_error = str(facts.get("last_error") or "").strip()
 	events_ever = int(facts.get("events_ever") or 0)
-	failed = int((facts.get("events_24h") or {}).get("failed") or 0)
+	agent_failed = int((facts.get("events_24h") or {}).get("agent_failed") or 0)
+	failed = max(int((facts.get("events_24h") or {}).get("failed") or 0) - agent_failed, 0)
 	replied = bool(facts.get("replied_ever"))
 	never_seen = not last_event_at and events_ever == 0
 	sig_at = facts.get("signature_failure_at")
@@ -156,12 +157,31 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 				"This number belongs to a different WhatsApp account than the one linked.",
 			)
 		)
+	unauthorized = int(facts.get("execution_unauthorized") or 0)
+	if unauthorized > 0:
+		reasons.append(
+			_reason(
+				"execution_user_not_authorized",
+				"error",
+				f"The gateway's Run-as user is not allowed to run the agent ({_count_text(unauthorized)}). "
+				"Give that user the Huf Gateway User role.",
+			)
+		)
 	if failed > 0:
 		reasons.append(_reason("delivery_failures", "warning", f"Replies are failing: {_count_text(failed)}."))
+	if agent_failed > 0:
+		kind = str(facts.get("agent_error_kind") or "unknown")
+		reasons.append(
+			_reason(
+				"agent_failing",
+				"warning",
+				f"The AI model returned an error ({kind}); customers got no reply: {_count_text(agent_failed)}.",
+			)
+		)
 	recent_error = False
 	if last_error:
 		recent_error = not last_event_at or (now - last_event_at) <= WINDOW
-		if recent_error and failed == 0:
+		if recent_error and failed == 0 and agent_failed == 0:
 			reasons.append(_reason("recent_error", "warning", f"The last problem was: {last_error}"))
 	if facts.get("fallback_template_approved") is False:
 		status = str(facts.get("fallback_template_status") or "").upper()
@@ -255,11 +275,25 @@ def _is_failed(row: dict[str, Any]) -> bool:
 	)
 
 
+_AGENT_ERROR_RE = re.compile(r"^(?:provider_([a-z_]+)|agent_run_failed):")
+
+
+def _agent_error_kind(row: dict[str, Any]) -> str | None:
+	"""Kind of a failed-agent-run event (``unknown`` for a plain agent_run_failed), else None."""
+	if str(row.get("status") or "") != "Failed":
+		return None
+	match = _AGENT_ERROR_RE.match(str(row.get("error_message") or ""))
+	if not match:
+		return None
+	return match.group(1) or "unknown"
+
+
 def count_events(rows: list[dict[str, Any]]) -> dict[str, int]:
 	"""Pure: events_24h counters from event rows already limited to the last 24 hours."""
 	return {
 		"received": len(rows),
 		"failed": sum(1 for r in rows if _is_failed(r)),
+		"agent_failed": sum(1 for r in rows if _agent_error_kind(r) is not None),
 		"unrouted": sum(1 for r in rows if str(r.get("status") or "") == "Unrouted"),
 		"rejected": sum(1 for r in rows if str(r.get("status") or "") == "Rejected"),
 	}
@@ -270,12 +304,27 @@ def read_events(gateway_name: str, now: datetime) -> dict[str, Any]:
 	rows = frappe.get_all(
 		"Gateway Event",
 		filters={"gateway": gateway_name, "received_at": [">=", since]},
-		fields=["name", "status", "reply_status", "delivery_error"],
+		fields=["name", "status", "reply_status", "delivery_error", "error_message"],
 		limit_page_length=_MAX_EVENTS,
 	)
 	events_ever = frappe.db.count("Gateway Event", {"gateway": gateway_name})
 	replied = bool(
 		frappe.db.exists("Gateway Event", {"gateway": gateway_name, "reply_status": ["in", list(_REPLIED)]})
+	)
+	unauthorized = frappe.db.count(
+		"Gateway Event",
+		{
+			"gateway": gateway_name,
+			"received_at": [">=", since],
+			"error_message": ["like", "%not authorized to use this agent%"],
+		},
+	) + frappe.db.count(
+		"Gateway Event",
+		{
+			"gateway": gateway_name,
+			"received_at": [">=", since],
+			"error_message": ["like", "%Not permitted to create%"],
+		},
 	)
 	last_failed = None
 	failed_rows = frappe.get_all(
@@ -293,10 +342,14 @@ def read_events(gateway_name: str, now: datetime) -> dict[str, Any]:
 			"at": _iso(row.get("received_at")),
 			"error": redact(row.get("delivery_error") or row.get("error_message") or ""),
 		}
+	event_rows = [dict(r) for r in rows or []]
+	agent_error_kind = next((k for k in (_agent_error_kind(r) for r in event_rows) if k), "")
 	return {
-		"events_24h": count_events([dict(r) for r in rows or []]),
+		"agent_error_kind": agent_error_kind,
+		"events_24h": count_events(event_rows),
 		"events_ever": int(events_ever or 0),
 		"replied_ever": replied,
+		"execution_unauthorized": int(unauthorized or 0),
 		"last_failed_event": last_failed,
 	}
 
@@ -405,6 +458,8 @@ def build_health(
 		"events_ever": events["events_ever"],
 		"replied_ever": events["replied_ever"],
 		"events_24h": events["events_24h"],
+		"agent_error_kind": events.get("agent_error_kind", ""),
+		"execution_unauthorized": events.get("execution_unauthorized", 0),
 		"fallback_template_approved": tpl["approved"],
 		"fallback_template_status": tpl["status"],
 	}

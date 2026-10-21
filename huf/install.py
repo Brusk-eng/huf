@@ -1135,12 +1135,12 @@ def create_huf_roles():
 	from huf.permissions import DEFAULT_ROLE_CAPABILITIES, HUF_ROLE_FRAPPE_ROLE_MAP
 
 	# 1. Ensure Frappe Role records exist for Huf-managed roles.
-	for frappe_role_name in ["Huf Manager", "Huf User", "Huf Viewer"]:
+	for frappe_role_name in ["Huf Manager", "Huf User", "Huf Viewer", "Huf Gateway User"]:
 		if not frappe.db.exists("Role", frappe_role_name):
 			frappe.get_doc({
 				"doctype": "Role",
 				"role_name": frappe_role_name,
-				"desk_access": 1,
+				"desk_access": 0 if frappe_role_name == "Huf Gateway User" else 1,
 			}).insert(ignore_permissions=True)
 
 
@@ -1173,6 +1173,13 @@ def create_huf_roles():
 			"is_system_role": 1,
 			"frappe_role": "Huf Viewer",
 			"role_weight": 10,
+		},
+		{
+			"role_name": "Huf Gateway User",
+			"description": "Service role for gateway execution users. Can run agents only; cannot create or configure anything.",
+			"is_system_role": 1,
+			"frappe_role": "Huf Gateway User",
+			"role_weight": 5,
 		},
 	]
 

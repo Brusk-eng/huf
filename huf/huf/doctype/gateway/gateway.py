@@ -244,6 +244,15 @@ class Gateway(Document):
                 )
             )
 
+        from huf.permissions import has_capability
+
+        if not has_capability(self.execution_user, "agent.use"):
+            frappe.throw(
+                _(
+                    "Execution user {0} lacks the agent.use capability; give the user the Huf Gateway User role."
+                ).format(self.execution_user)
+            )
+
     def _validate_agent_access(self):
         """Verify execution_user has access to the default_agent."""
         from huf.ai.agent_access import check_agent_access
