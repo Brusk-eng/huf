@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import threading
@@ -319,6 +320,50 @@ def _normalize_sender_for_provider(provider: str | None, entry_type: str, extern
 _MEDIA_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 
 
+_MIME_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "audio/ogg": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "audio/aac": "aac",
+    "audio/amr": "amr",
+    "video/mp4": "mp4",
+    "video/3gpp": "3gp",
+    "application/pdf": "pdf",
+    "text/plain": "txt",
+    "text/csv": "csv",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+}
+
+
+def _media_file_name(msg_type: str, media: dict, media_id: str, downloaded: dict) -> str:
+    """A readable file name: the sender's own filename for documents, else ``<type>-<id>.<ext>``."""
+    mime = str(downloaded.get("mime_type") or (media or {}).get("mime_type") or "").split(";")[0].strip().lower()
+    ext = _MIME_EXTENSIONS.get(mime) or (mime.split("/")[-1] if "/" in mime and mime.split("/")[-1].isalnum() else "")
+    original = os.path.basename(str((media or {}).get("filename") or ""))
+    if not original:
+        # Meta's media metadata sometimes names the file; the bridge falls back to the raw id.
+        provided = os.path.basename(str(downloaded.get("filename") or ""))
+        if provided and _MEDIA_SAFE_NAME.sub("_", media_id) not in (provided, provided.rsplit(".", 1)[0]):
+            original = provided
+    if original:
+        name = original
+    else:
+        name = f"{msg_type}-{media_id}"
+    name = _MEDIA_SAFE_NAME.sub("_", name).lstrip(".")[:100] or f"{msg_type}-{media_id}"
+    if ext and "." not in os.path.basename(name):
+        name = f"{name}.{ext}"[:100]
+    return name
+
+
 def _save_whatsapp_media(event, gateway) -> list[str]:
     """Best-effort download of inbound WhatsApp media into private Files (A9).
 
@@ -349,8 +394,7 @@ def _save_whatsapp_media(event, gateway) -> list[str]:
             creds = _gateway_credentials(gateway)
             direct = {"token": creds.get("access_token"), "url": bridge.graph_base_url(creds.get("graph_api_url"))}
         downloaded = bridge.download_media(account, media_id, credentials=direct, kind=msg_type)
-        name = os.path.basename(str(downloaded.get("filename") or media_id))
-        name = _MEDIA_SAFE_NAME.sub("_", name).lstrip(".")[:100] or "media"
+        name = _media_file_name(msg_type, media, media_id, downloaded)
         file_doc = frappe.get_doc(
             {
                 "doctype": "File",
@@ -1258,12 +1302,80 @@ def _conversation_race_errors() -> tuple[type, ...]:
     return (frappe.QueryDeadlockError, frappe.TimestampMismatchError)
 
 
+BUSY_CONVERSATION_MARKER = "currently executing another run"
+_BUSY_ATTEMPTS = 6
+_BUSY_BASE_DELAY = 2.0
+_BUSY_MAX_DELAY = 20.0
+_CONVERSATION_LOCK_WAIT = 90
+_CONVERSATION_LOCK_TTL = 330
+_REQUEUE_MAX = 5
+_REQUEUE_TTL = 3600
+
+
+class ConversationBusy(Exception):
+    """The sender's conversation stayed busy for the whole retry budget; the event is re-queued."""
+
+
+def _is_busy_conversation_error(exc: BaseException) -> bool:
+    return isinstance(exc, frappe.ValidationError) and BUSY_CONVERSATION_MARKER in str(exc)
+
+
+def _busy_delay(attempt: int) -> float:
+    return min(_BUSY_BASE_DELAY * (2 ** (attempt - 1)), _BUSY_MAX_DELAY) * random.uniform(0.75, 1.25)
+
+
+def _run_agent_serialised(run_fn, *, lock_key: str, **kwargs):
+    """Run one event's agent turn while holding a per-conversation lock, so messages from the same
+    sender are processed one after another. Waiting too long raises :class:`ConversationBusy`."""
+    try:
+        lock = frappe.cache.lock(lock_key, timeout=_CONVERSATION_LOCK_TTL, blocking_timeout=_CONVERSATION_LOCK_WAIT)
+        acquired = lock.acquire()
+    except Exception:
+        # No lock backend: fall back to the busy-conversation retry alone.
+        return _run_agent_with_retry(run_fn, **kwargs)
+    if not acquired:
+        raise ConversationBusy(f"Conversation {lock_key} is busy")
+    try:
+        return _run_agent_with_retry(run_fn, **kwargs)
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+
+def _requeue_busy_event(event, error: str) -> dict:
+    """Leave the event Queued for another worker pass; fail it only after a bounded number of requeues."""
+    key = f"huf_gw_requeue:{event.name}"
+    count = int(frappe.cache.get_value(key) or 0) + 1
+    frappe.db.rollback()
+    if count > _REQUEUE_MAX:
+        event.db_set({"status": "Failed", "error_message": f"Conversation stayed busy: {error}"[-500:]})
+        _commit_unless_testing()
+        return {"event_name": event.name, "status": "Failed", "error": "conversation_busy"}
+    frappe.cache.set_value(key, count, expires_in_sec=_REQUEUE_TTL)
+    event.db_set({"status": "Queued", "error_message": f"Conversation busy; retry {count}/{_REQUEUE_MAX}"})
+    _commit_unless_testing()
+    frappe.enqueue(
+        "huf.ai.gateway_service.process_gateway_event",
+        queue="default",
+        timeout=300,
+        event_name=event.name,
+        enqueue_after_commit=True,
+    )
+    return {"event_name": event.name, "status": "Queued", "requeued": count}
+
+
 def _run_agent_with_retry(run_fn, **kwargs):
     """Run the agent, retrying with backoff when concurrent same-sender events collide on the
-    conversation row (deadlock / timestamp mismatch) instead of terminally failing the event."""
+    conversation row (deadlock / timestamp mismatch) or the conversation is busy with another run,
+    instead of terminally failing the event. The idempotency key keeps a retry from duplicating a run."""
     import time
 
-    for attempt in range(1, _CONVERSATION_RACE_ATTEMPTS + 1):
+    busy_attempts = 0
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             result = run_fn(**kwargs)
             if attempt > 1 and isinstance(result, dict) and (
@@ -1280,6 +1392,14 @@ def _run_agent_with_retry(run_fn, **kwargs):
                 raise
             frappe.db.rollback()
             time.sleep(_CONVERSATION_RACE_BACKOFF * attempt)
+        except frappe.ValidationError as exc:
+            if not _is_busy_conversation_error(exc):
+                raise
+            busy_attempts += 1
+            if busy_attempts >= _BUSY_ATTEMPTS:
+                raise ConversationBusy(str(exc)) from exc
+            frappe.db.rollback()
+            time.sleep(_busy_delay(busy_attempts))
 
 
 def ingest_gateway_event(
@@ -1521,8 +1641,9 @@ def _process_gateway_event(event_name: str) -> dict:
             fallback_note = ""
             _maybe_mark_read_typing(event, gateway)
             _commit_unless_testing()  # keep Running status and saved media across a retry rollback
-            result = _run_agent_with_retry(
+            result = _run_agent_serialised(
                 run_agent_sync,
+                lock_key=f"huf_gw_conv:{gateway.name}:{event.thread_id or event.conversation_id or event.sender_id}",
                 agent_name=event.target_agent,
                 prompt=prompt,
                 channel_id=f"gateway:{gateway.name}",
@@ -1602,6 +1723,8 @@ def _process_gateway_event(event_name: str) -> dict:
             return {"event_name": event.name, "status": "Queued", "flow_run_id": flow_run.name}
 
         raise frappe.ValidationError(_("Gateway event has no valid target."))
+    except ConversationBusy as busy:
+        return _requeue_busy_event(event, str(busy))
     except Exception:
         message = _redact_error_text(frappe.get_traceback())
         # GW-06: a failure here (e.g. send_gateway_reply raising after a
