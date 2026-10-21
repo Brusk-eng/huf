@@ -633,10 +633,15 @@ def _send_template(kwargs: dict) -> str:
 	if header_params is None or button_params is None:
 		return _error("'header_params' and 'button_params' must be lists (or JSON lists)")
 
+	if _is_opted_out(kwargs, recipient):
+		return _refused("opted_out", "This contact opted out (STOP); no messages are sent until they opt back in (START).")
+	if bridge.is_bsuid(recipient):
+		return _refused("bsuid_recipient", "A BSUID cannot be used as a recipient; send to the contact's phone number.")
+
 	acct = _resolve_bridge_account(kwargs)
 	if acct:
 		try:
-			extra: dict[str, Any] = {}
+			extra: dict[str, Any] = {"gateway_name": kwargs.get("gateway_name")}
 			if header_params:
 				extra["header_params"] = header_params
 			if button_params:

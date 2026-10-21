@@ -17,6 +17,7 @@ from typing import Any
 
 import frappe
 from huf.ai import whatsapp_account_events as account_events_mod
+from huf.ai import whatsapp_outbound_policy as policy
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 from huf.ai.gateway_adapters import whatsapp_calls as wc
 from huf.ai.gateway_adapters import whatsapp_errors as we
@@ -397,6 +398,9 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			"reply_to_message_id": quoted,
 			"forwarded": bool(context.get("forwarded") or context.get("frequently_forwarded")),
 		}
+		contact_name = names.get(sender) or names.get(bsuid, "")
+		if contact_name:
+			raw["contact_name"] = contact_name  # for the fallback template's default parameter
 		if bsuid:
 			raw["bsuid"] = bsuid  # kept next to the phone key for a later identity merge
 		referral = msg.get("referral") if isinstance(msg.get("referral"), dict) else {}
@@ -444,11 +448,13 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			if not state.get("open"):
 				if self._fallback_template:
 					return self._window_fallback(reply.conversation_id)
+				self._guard(reply.conversation_id)
 				raise WhatsAppWindowClosed(
 					f"WhatsApp 24-hour customer-service window is closed for {reply.conversation_id}. "
 					"Free-form replies are not allowed; set a Fallback template on the Gateway "
 					"or wait for the customer to message again."
 				)
+		self._guard(reply.conversation_id)
 
 		if reply.attachments:
 			return self._send_reply_media(reply)
@@ -475,11 +481,13 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			if not state.get("open"):
 				if self._fallback_template:
 					return self._window_fallback(conversation_id)
+				self._guard(conversation_id)
 				raise WhatsAppWindowClosed(
 					f"WhatsApp 24-hour customer-service window is closed for {conversation_id}. "
 					"Free-form replies are not allowed; set a Fallback template on the Gateway "
 					"or wait for the customer to message again."
 				)
+		self._guard(conversation_id)
 		return self._send_parts(conversation_id, parts, reply_to)
 
 	def _send_parts(self, conversation_id: str, parts: list[str], reply_to: str | None) -> OutboundDelivery:
@@ -508,6 +516,13 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		Parameters: the Gateway's ``fallback_template_params`` when configured, else one default value per
 		body variable (the contact name, or "there").
 		"""
+		try:
+			policy.check_recipient(self._gateway_name or None, to)
+		except policy.OutboundRefused as exc:
+			code = "recipient_opted_out" if exc.code == "opted_out" else exc.code
+			raise WhatsAppFallbackUnavailable(
+				f"{exc} The 24-hour window is closed so the fallback template was not sent.", code
+			) from exc
 		language = self._fallback_language
 		params: Any = self._fallback_params
 		if self._bridge_mode():
@@ -637,7 +652,12 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		self._ensure_window(to)
 		return self._deliver_media(to, kind, link, media_id, caption, filename, reply_to, trusted, voice)
 
+	def _guard(self, to: str) -> None:
+		"""Outbound policy (STOP, BSUID) for one recipient; raises :class:`OutboundRefused`."""
+		policy.check_recipient(self._gateway_name or None, to)
+
 	def _ensure_window(self, to: str) -> None:
+		self._guard(to)
 		if self._gateway_name and not bridge.window_state(self._gateway_name, to).get("open"):
 			raise WhatsAppWindowClosed(
 				f"WhatsApp 24-hour customer-service window is closed for {to}. "
@@ -751,10 +771,12 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		else:
 			params = [p if isinstance(p, dict) else str(p) for p in (body_params or [])]
 		header_arg: Any = header_params if isinstance(header_params, dict) else list(header_params or [])
+		self._guard(to)
 		if self._bridge_mode():
 			result = bridge.send_template(
 				self._account, to, template_name, params, header_params=header_arg,
 				trusted=trusted, language_code=language_code, button_params=list(button_params or []),
+				gateway_name=self._gateway_name or None,
 			)
 			return _delivery_from_bridge(result)
 		components, errors = direct_send_components(params, header_arg, list(button_params or []))
@@ -763,7 +785,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		template: dict[str, Any] = {"name": template_name, "language": {"code": language_code or DEFAULT_TEMPLATE_LANGUAGE}}
 		if components:
 			template["components"] = components
-		return self._graph_send(
+		delivery = self._graph_send(
 			{
 				"messaging_product": "whatsapp",
 				"recipient_type": "individual",
@@ -772,6 +794,9 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 				"template": template,
 			}
 		)
+		if self._gateway_name:
+			policy.record_template_outreach(self._gateway_name, to)
+		return delivery
 
 	def _graph_send(self, data: dict[str, Any]) -> OutboundDelivery:
 		refusal = account_events_mod.send_refusal(self._phone_number_id)

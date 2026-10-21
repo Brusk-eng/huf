@@ -30,6 +30,7 @@ from urllib.parse import quote, urljoin, urlparse
 import frappe
 import frappe.utils
 
+from huf.ai import whatsapp_outbound_policy as policy
 from huf.ai.gateway_adapters import whatsapp_messages as wm
 from huf.ai.gateway_adapters import whatsapp_templates as wt
 
@@ -712,7 +713,7 @@ def _template_row(docname: str) -> dict[str, Any] | None:
 		docname,
 		[
 			"template", "header_type", "header", "sample", "actual_name", "template_name", "language_code", "status",
-			"whatsapp_account",
+			"whatsapp_account", "category",
 		],
 		as_dict=True,
 	)
@@ -879,8 +880,14 @@ def send_template(
 	language_code: str | None = None,
 	button_params: list | None = None,
 	http_post: Callable[..., Any] | None = None,
+	gateway_name: str | None = None,
 ) -> dict[str, Any]:
 	"""Send an approved template.
+
+	Goes through :mod:`huf.ai.whatsapp_outbound_policy` first: a STOPped contact, a BSUID recipient, a
+	template that is not APPROVED and marketing to a contact who stopped marketing are refused with a
+	``BridgeError`` whose ``error`` is the policy code. ``gateway_name`` scopes the checks; without it
+	every Gateway linked to the account is checked.
 
 	Plain body-only sends of POSITIONAL templates use an Outgoing ``WhatsApp Message``
 	(use_template=1), which frappe_whatsapp sends. Everything else (header or button parameters,
@@ -905,6 +912,11 @@ def send_template(
 	if tpl and (tpl.get("whatsapp_account") or "") != (account_name or ""):
 		# the docname resolves to another account's template: never send it from this account
 		raise BridgeError(_err("template_not_found", message="That template does not belong to this WhatsApp account."))
+
+	try:
+		policy.enforce_template(account_name, to, tpl, gateway_name)
+	except policy.OutboundRefused as exc:
+		raise BridgeError(_err(exc.code, message=str(exc))) from exc
 
 	other_buttons, copy_comps, errors = split_copy_code_params(button_params)
 	view = _send_view(tpl) if tpl else _params_template_view(body_params, header_params)
@@ -969,7 +981,9 @@ def send_template(
 				mirror["template_header_parameters"] = str(hp.get("text"))
 			elif hp.get("type") in ("image", "video", "document"):
 				mirror["attach"] = (hp.get(hp["type"]) or {}).get("link")
-		return _mirror_template_send(acct, docname, to, wamid, mirror, trusted)
+		result = _mirror_template_send(acct, docname, to, wamid, mirror, trusted)
+		policy.note_template_sent(account_name, to, gateway_name)
+		return result
 
 	values: dict[str, Any] = {
 		"doctype": "WhatsApp Message",
@@ -994,6 +1008,7 @@ def send_template(
 		raise
 	except Exception as exc:
 		raise BridgeError(_err("send_failed", message=_redact(exc))) from exc
+	policy.note_template_sent(account_name, to, gateway_name)
 	return _readback(doc)
 
 
