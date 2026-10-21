@@ -918,6 +918,25 @@ def _exec_agent_run(flow_run, node: dict, config: dict, settings: dict) -> dict:
 		return {"status": "failed", "error": str(e)}
 
 
+def _bound_gateway(flow_run, config: dict):
+	"""Trusted gateway for the WhatsApp tool: the gateway that started this flow, else the node's ``gateway``.
+
+	Model/tool arguments never select it; empty means the tool fails closed (gateway_context_required).
+	"""
+	from huf.ai.tools.whatsapp import trusted_gateway
+
+	gateway = ""
+	try:
+		payload = flow_run.get("trigger_payload")
+		payload = json.loads(payload) if isinstance(payload, str) else (payload or {})
+		event = payload.get("gateway_event") if isinstance(payload, dict) else None
+		if event:
+			gateway = frappe.db.get_value("Gateway Event", event, "gateway") or ""
+	except Exception:
+		gateway = ""
+	return trusted_gateway(gateway or str(config.get("gateway") or ""))
+
+
 def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""Execute tool.call node - deterministic tool execution.
 
@@ -1009,7 +1028,7 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 			if not isinstance(result, dict):
 				result = {"success": True, "result": result}
 		else:
-			with tool_run_context(invocation_ctx):
+			with tool_run_context(invocation_ctx), _bound_gateway(flow_run, config):
 				result = execute_tool(tool_name, args)
 
 		is_success = result.get("success", False) if isinstance(result, dict) else bool(result)

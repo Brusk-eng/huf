@@ -192,14 +192,23 @@ class TestFlowWhatsAppGatewayTrigger(fs.TestWhatsAppMultiGateway):
 		self.assertTrue(posts[0]["url"].endswith(f"/{self.PHONE_A}/messages"))
 		self.assertEqual(posts[0]["body"]["text"]["body"], "from the flow")
 
-	def test_flow_free_form_send_is_refused_when_the_window_is_closed(self):
+	def test_forged_gateway_name_in_flow_tool_args_is_ignored(self):
+		# gateway B is named in the args, but the flow was started by gateway A: A's number sends
 		flow_run = self._run_triggered_flow(
 			"wamid.W2",
-			# gateway B never heard from this customer: its window is closed
-			{"action": "send_message", "gateway_name": self.gateway_b.name, "to": fs.SENDER, "message": "too late"},
+			{"action": "send_message", "gateway_name": self.gateway_b.name, "to": fs.SENDER, "message": "via a"},
 		)
-		self.assertEqual(self._text_posts(), [], self.meta.calls)
-		self.assertIn("proactive_send_not_permitted", self._tool_output(flow_run))
+		posts = self._text_posts()
+		self.assertEqual(len(posts), 1, self._tool_output(flow_run))
+		self.assertTrue(posts[0]["url"].endswith(f"/{self.PHONE_A}/messages"))
+
+	def test_flow_without_gateway_context_fails_closed(self):
+		self._grant_flow_access()
+		flow_id = self._flow({"action": "send_message", "gateway_name": self.gateway_a.name, "to": fs.SENDER, "message": "x"})
+		started = flow_api.run_flow(flow_id, {})
+		flow_run = frappe.get_doc("Flow Run", started["flow_run_id"])
+		self.assertEqual(self._text_posts(), [])
+		self.assertIn("gateway_context_required", self._tool_output(flow_run))
 
 	def test_flow_cannot_send_proactively_from_gateway_a_to_a_stranger(self):
 		flow_run = self._run_triggered_flow(
