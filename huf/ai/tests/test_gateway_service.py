@@ -1073,8 +1073,8 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
         pending = gateway_service.list_gateway_access_entries(gateway=gw, state="Pending")
         approved = gateway_service.list_gateway_access_entries(gateway=gw, state="Approved")
 
-        assert any(row["pairing_code"] == "PAIR-LIST" for row in pending)
-        assert not any(row["pairing_code"] == "PAIR-LIST" for row in approved)
+        assert any(row["pairing_code"] == "*********ST" or row["pairing_code"].endswith("ST") and "*" in row["pairing_code"] for row in pending)
+        assert not any(row["pairing_code"] == "PAIR-LIST" for row in approved + pending)
 
 
 class TestWhatsAppGatewayService(unittest.TestCase):
