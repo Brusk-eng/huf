@@ -102,7 +102,7 @@ class Store:
 		stack.enter_context(patch.object(f.db, "commit"))
 		stack.enter_context(patch.object(f, "enqueue", side_effect=self.enqueue))
 		stack.enter_context(patch.object(gs, "now_datetime", return_value=NOW))
-		cache = SimpleNamespace(set=self.cache_set)
+		cache = SimpleNamespace(set=self.cache_set, delete=lambda key: self.cache_keys.pop(key, None))
 		stack.enter_context(patch.object(f, "cache", return_value=cache))
 		return stack
 
@@ -202,16 +202,23 @@ class TestAtomicRecovery(unittest.TestCase):
 				gs._recover_orphaned_events()
 		self.assertEqual(len(store.enqueued), 1)
 
-	def test_retry_claim_key_is_per_event_not_per_attempt(self):
+	def test_retry_claim_is_per_event_so_an_overlapping_attempt_is_skipped(self):
 		store = Store([_event("E1", "Running", reply_status="retrying")])
 		event = SimpleNamespace(name="E1", reply_status="retrying", status="Running", gateway="GW", sender_id="", agent_run="")
-		with store.patch(), patch.object(gs.frappe, "get_doc", return_value=event), patch.object(
-			gs, "_attempt_reply_parts", return_value={}
+		gateway = SimpleNamespace(execution_user="")
+		inner = []
+
+		def attempt(*a, **k):
+			inner.append(gs.retry_gateway_reply("E1", ["p"], attempt=3, not_before=0))
+			return {}
+
+		with store.patch(), patch.object(
+			gs.frappe, "get_doc", side_effect=lambda dt, n=None: gateway if dt == "Gateway" else event
+		), patch.object(gs, "_attempt_reply_parts", side_effect=attempt
 		), patch.object(gs, "is_opted_out", return_value=False):
 			gs.retry_gateway_reply("E1", ["p"], attempt=2, not_before=0)
-			gs.retry_gateway_reply("E1", ["p"], attempt=3, not_before=0)
-		self.assertEqual(len([k for k in store.cache_keys if k.startswith("huf_gw_reply_retry")]), 1)
-		self.assertNotIn(":2", "".join(store.cache_keys))
+			self.assertEqual(inner, [{"event_name": "E1", "skipped": True}])
+			self.assertEqual(store.cache_keys, {})  # released after the attempt
 
 	def test_retry_hopping_back_to_the_queue_refreshes_modified(self):
 		store = Store([_event("E1", "Running", age=9, reply_status="retrying")])
