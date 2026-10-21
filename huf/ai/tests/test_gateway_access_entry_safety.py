@@ -83,6 +83,10 @@ class TestAudit(_Fixture, IntegrationTestCase):
 
 class TestAdminAuthority(_Fixture, IntegrationTestCase):
 	def _as(self, huf_role, frappe_roles=("Guest",)):
+		if not frappe.db.exists("User", "wp2.tester@example.com"):
+			frappe.get_doc(
+				{"doctype": "User", "email": "wp2.tester@example.com", "first_name": "WP2", "send_welcome_email": 0}
+			).insert(ignore_permissions=True)
 		frappe.set_user("wp2.tester@example.com")
 		for p in (
 			patch.object(gsvc.frappe, "get_roles", return_value=list(frappe_roles)),

@@ -305,6 +305,7 @@ class TestPairingScopeAndAuthority(_GatewayFixture, IntegrationTestCase):
 		self.assertEqual(self.entry_state(entry), "Pending")
 
 	def test_integrations_capability_counts_as_admin(self):
+		frappe.set_user("Guest")
 		with patch.object(gsvc.frappe, "get_roles", return_value=["Desk User"]), patch(
 			"huf.permissions.has_capability", side_effect=lambda user, cap: cap == "system.integrations.manage"
 		):
@@ -476,14 +477,13 @@ class TestOptOut(_GatewayFixture, IntegrationTestCase):
 		self.assertEqual(self.sent_texts(), [gsvc.DEFAULT_OPT_IN_REPLY])
 		self.assertEqual(self.ingest(a, "15551230001", "hello")["status"], "Queued")
 
-	def test_start_for_unknown_sender_returns_to_normal_policy(self):
+	def test_stranger_stop_and_start_create_no_state(self):
+		# C-027: a sender that is not admitted gets no row and no reply from STOP/START.
 		a = self.make_gateway("A")  # Pairing
 		self.ingest(a, "15551230009", "UNSUBSCRIBE")
-		self.assertTrue(gsvc.is_opted_out(a, "15551230009"))
-		self.ingest(a, "15551230009", "start")
 		self.assertFalse(gsvc.is_opted_out(a, "15551230009"))
-		result = self.ingest(a, "15551230009", "hello")
-		self.assertRegex(self.event_error(result)["error_message"], r"Pairing code: \*+[A-Z0-9]{2}$")
+		self.assertEqual(frappe.db.count("Gateway Access Entry", {"gateway": a}), 0)
+		self.adapter.send_reply.assert_not_called()
 
 	def test_keyword_must_be_the_whole_message(self):
 		a = self.make_gateway("A", policy="Allow list")

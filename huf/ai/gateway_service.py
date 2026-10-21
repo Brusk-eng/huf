@@ -624,7 +624,7 @@ def _save_entry(entry, updates: dict[str, Any]):
     if isinstance(entry, str):
         entry = frappe.get_doc("Gateway Access Entry", entry)
     entry.update(updates)
-    entry.save(ignore_permissions=True)
+    entry.save(ignore_permissions=True, ignore_version=False)
     return entry
 
 
@@ -940,20 +940,27 @@ def _pairing_cap_reason(gateway, sender_id: str) -> str:
     """
     limit = _int_setting(gateway, "pairing_pending_limit", PAIRING_DEFAULT_PENDING_LIMIT)
     if limit > 0:
-        pending = frappe.db.count("Gateway Access Entry", {"gateway": gateway.name, "state": "Pending"})
-        if pending >= limit:
+        pending = frappe.get_all(
+            "Gateway Access Entry",
+            filters={"gateway": gateway.name, "state": "Pending"},
+            pluck="name",
+            limit_page_length=limit,
+        )
+        if len(pending or []) >= limit:
             return "Pairing capacity reached for this gateway"
     external_id = _normalize_sender_for_provider(gateway.provider, "Sender", sender_id)
-    recent = frappe.db.count(
+    recent = frappe.get_all(
         "Gateway Access Entry",
-        {
+        filters={
             "gateway": gateway.name,
             "entry_type": "Sender",
             "external_id": external_id,
             "creation": [">", add_to_date(now_datetime(), hours=-24)],
         },
+        pluck="name",
+        limit_page_length=PAIRING_MAX_REQUESTS_PER_SENDER_PER_DAY,
     )
-    if recent >= PAIRING_MAX_REQUESTS_PER_SENDER_PER_DAY:
+    if len(recent or []) >= PAIRING_MAX_REQUESTS_PER_SENDER_PER_DAY:
         return "Too many pairing requests from this sender"
     return ""
 
