@@ -82,11 +82,11 @@ class TestSameCallIsOneMessage(_Base):
 
 
 class TestNoRunNoAutoKey(_Base):
-	def test_without_a_run_or_explicit_key_nothing_is_deduplicated(self):
+	def test_without_a_run_or_explicit_key_nothing_is_deduplicated_but_each_send_is_claimed(self):
 		self.call(run=None)
 		self.call(run=None)
 		self.assertEqual(self.sent.call_count, 2)
-		self.assertEqual(frappe.db.count("WhatsApp Send Key", {"gateway": GW}), 0)
+		self.assertEqual(frappe.db.count("WhatsApp Send Key", {"gateway": GW}), 2)
 
 	def test_explicit_key_works_without_a_run(self):
 		self.call(run=None, idempotency_key="flow-1")
@@ -95,9 +95,9 @@ class TestNoRunNoAutoKey(_Base):
 
 
 class TestExplicitKey(_Base):
-	def test_explicit_key_dedupes_across_runs_and_calls(self):
+	def test_explicit_key_dedupes_across_calls_and_payload_within_a_run_and_recipient(self):
 		self.call(idempotency_key="order-42", call_id="x")
-		again = self.call(idempotency_key="order-42", call_id="y", run="RUN-9", message="reworded")
+		again = self.call(idempotency_key="order-42", call_id="y", message="reworded")
 		self.assertEqual(self.sent.call_count, 1)
 		self.assertTrue(again["deduplicated"])
 
@@ -133,17 +133,17 @@ class TestCoverage(_Base):
 
 
 class TestFailuresAndDurability(_Base):
-	def test_failed_send_releases_the_key_so_a_retry_sends(self):
-		self.sent.side_effect = [json.dumps({"success": False, "error": "boom"}), _ok("wamid.2")]
+	def test_definitely_refused_send_releases_the_key_so_a_retry_sends(self):
+		self.sent.side_effect = [json.dumps({"success": False, "error": "invalid_thing"}), _ok("wamid.2")]
 		self.call(call_id="c")
 		retry = self.call(call_id="c")
 		self.assertEqual(self.sent.call_count, 2)
 		self.assertTrue(retry["success"])
 		self.assertNotIn("deduplicated", retry)
 
-	def test_exception_releases_the_key(self):
-		self.sent.side_effect = [RuntimeError("x"), _ok()]
-		with self.assertRaises(RuntimeError):
+	def test_permission_error_releases_the_key(self):
+		self.sent.side_effect = [frappe.PermissionError("x"), _ok()]
+		with self.assertRaises(frappe.PermissionError):
 			self.call(call_id="c")
 		self.assertTrue(self.call(call_id="c")["success"])
 		self.assertEqual(self.sent.call_count, 2)

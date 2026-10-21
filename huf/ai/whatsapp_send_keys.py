@@ -13,6 +13,10 @@ rather than risk a second message. Keys expire after :data:`TTL_HOURS` (:data:`P
 unfinished claim) and are purged daily.
 
 Because the key includes the tool call id, two distinct tool calls with the same text are both sent.
+
+A failure whose outcome is unknown (request timeout, connection reset, 5xx after the request left) keeps
+its claim ``Pending``: Meta may have delivered it, so a retry must not send again. Only a definite
+refusal (nothing reached Meta, or Meta rejected it with a 4xx) releases the claim.
 """
 
 from __future__ import annotations
@@ -52,16 +56,17 @@ def explicit_key(kwargs: dict) -> str:
 
 
 def derive_key(gateway: str, run_id: str | None, call_id: str | None, action: str, kwargs: dict, explicit: str = "") -> str:
-	"""Stable key for one send. Scoped to the gateway; an explicit key ignores run, call and payload."""
-	if explicit:
-		material: Any = ["explicit", explicit]
-	else:
-		payload = {k: v for k, v in kwargs.items() if k not in _NON_PAYLOAD}
-		for field in ("to", "recipient", "phone_number"):
-			if payload.get(field):
-				from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+	"""Stable key for one send. Scoped to the gateway; an explicit key is also scoped to run, action and recipient."""
+	from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 
-				payload[field] = bridge.normalize_phone(payload[field])
+	payload = {k: v for k, v in kwargs.items() if k not in _NON_PAYLOAD}
+	for field in ("to", "recipient", "phone_number"):
+		if payload.get(field):
+			payload[field] = bridge.normalize_phone(payload[field])
+	if explicit:
+		recipient = payload.get("to") or payload.get("recipient") or payload.get("phone_number") or ""
+		material: Any = ["explicit", explicit, run_id or "", action, recipient]
+	else:
 		material = ["auto", run_id or "", call_id or "", action, payload]
 	blob = json.dumps([gateway, material], sort_keys=True, default=str, ensure_ascii=False)
 	return hashlib.sha256(blob.encode()).hexdigest()
@@ -93,6 +98,28 @@ def _release(key: str) -> None:
 	frappe.db.commit()
 
 
+# Pre-send refusal codes that never reach Meta.
+_NO_SEND_GRAPH_CODES = {1, 2}  # Graph "unknown error" / "service temporarily unavailable": outcome unknown
+
+
+def is_definite_failure(result: Any) -> bool:
+	"""True when a failed send certainly did not deliver (safe to release the claim and retry).
+
+	Anything ambiguous (free-text errors, a transport failure, a retryable or 5xx Graph error) is unknown.
+	"""
+	if not isinstance(result, dict) or result.get("success"):
+		return False
+	if result.get("definite") is True:
+		return True
+	error = result.get("error")
+	if not isinstance(error, str) or not error:
+		return False
+	if error == "send_failed":
+		code = result.get("graph_code")
+		return code is not None and code not in _NO_SEND_GRAPH_CODES and not result.get("retryable")
+	return error.replace("_", "").isalnum() and error == error.lower()  # a policy / validation code, not free text
+
+
 def _message_id(result: dict) -> str:
 	data = result.get("data") if isinstance(result.get("data"), dict) else result
 	return str((data or {}).get("message_id") or "")
@@ -110,7 +137,18 @@ def run_once(
 	gateway: str, key: str, action: str, send: Callable[[], str], run: str = "", recipient: str = ""
 ) -> str:
 	"""Run ``send`` (returns the tool's JSON) at most once per ``key``."""
-	if not _claim(gateway, key, action, run, recipient):
+	try:
+		claimed = _claim(gateway, key, action, run, recipient)
+	except Exception:
+		try:
+			frappe.log_error(title="WhatsApp send key claim failed")
+		except Exception:
+			pass
+		return json.dumps({  # fail closed: an unrecorded send could not be capped or deduplicated
+			"success": False, "error": "send_unavailable", "definite": True,
+			"message": "The send could not be recorded, so it was not sent.",
+		})
+	if not claimed:
 		row = frappe.db.get_value(DOCTYPE, key, ["status", "result"], as_dict=True)
 		if row and row.status == "Sent" and row.result:
 			original = json.loads(row.result)
@@ -124,7 +162,7 @@ def run_once(
 		})
 	try:
 		raw = send()
-	except BaseException:
+	except frappe.PermissionError:
 		_release(key)
 		raise
 	try:
@@ -133,7 +171,7 @@ def run_once(
 		result = {}
 	if isinstance(result, dict) and result.get("success"):
 		_finish(key, raw, result)
-	else:
+	elif is_definite_failure(result):
 		_release(key)
 	return raw
 

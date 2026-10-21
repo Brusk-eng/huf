@@ -215,7 +215,7 @@ class TestFlowWhatsAppGatewayTrigger(fs.TestWhatsAppMultiGateway):
 			{"action": "send_message", "gateway_name": self.gateway_a.name, "to": "15559990000", "message": "hi stranger"},
 		)
 		self.assertEqual(self._text_posts(), [], self.meta.calls)
-		self.assertIn("proactive_send_not_permitted", self._tool_output(flow_run))
+		self.assertIn("recipient_not_permitted", self._tool_output(flow_run))  # scope stops the stranger before the window gate
 
 	# -- WP-7: flow target end to end -------------------------------------------------------
 

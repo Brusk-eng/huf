@@ -82,7 +82,8 @@ def _merge_run_context(args_dict: dict, ctx) -> dict:
 
     tool_call_id = getattr(ctx, "tool_call_id", None)
     if tool_call_id:
-        args_dict.setdefault("call_id", tool_call_id)
+        # Overwrite: the model must not choose the id that scopes idempotency and audit linkage.
+        args_dict["call_id"] = tool_call_id
 
     return args_dict
 

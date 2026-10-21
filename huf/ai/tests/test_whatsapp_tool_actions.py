@@ -9,6 +9,8 @@ constant, and the list_templates / create_template actions.
 from __future__ import annotations
 
 import json
+
+import frappe
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -70,6 +72,9 @@ class TestWhatsAppToolGating(unittest.TestCase):
 		self.mock_available, self.mock_resolve, _default, self.mock_window, *_ = (p.start() for p in self._patches)
 		self.post = patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.9"}]})).start()
 		self.addCleanup(patch.stopall)
+		# every send (even without a run) is now claimed and counted: start from a clean slate
+		frappe.db.delete("WhatsApp Send Key", {"gateway": ["like", "GW-%"]})
+		self.addCleanup(frappe.db.delete, "WhatsApp Send Key", {"gateway": ["like", "GW-%"]})
 
 	def _send(self, **overrides):
 		kwargs = {"to": "+1 (555) 123-4567", "message": "hi"}
@@ -120,7 +125,7 @@ class TestWhatsAppToolGating(unittest.TestCase):
 	def test_settings_read_failure_fails_closed(self):
 		with patch.object(whatsapp.frappe.db, "get_value", side_effect=RuntimeError("db down")):
 			result = self._send(allow_proactive=True)
-		self.assertEqual(result["error"], "proactive_send_not_permitted")
+		self.assertFalse(result["success"])
 		self.post.assert_not_called()
 
 	def test_open_window_allows_send_without_flag(self):
@@ -253,6 +258,9 @@ class TestWhatsAppToolBridgeRouting(unittest.TestCase):
 		patch.object(whatsapp, "_is_opted_out", return_value=False).start()
 		patch.object(whatsapp, "_gateway_account_name", return_value="WA-1").start()
 		self.addCleanup(patch.stopall)
+		# every send (even without a run) is now claimed and counted: start from a clean slate
+		frappe.db.delete("WhatsApp Send Key", {"gateway": ["like", "GW-%"]})
+		self.addCleanup(frappe.db.delete, "WhatsApp Send Key", {"gateway": ["like", "GW-%"]})
 
 	def test_send_message_uses_bridge_send_text_when_account_resolvable(self):
 		with (
@@ -321,6 +329,9 @@ class TestWhatsAppToolTemplateActions(unittest.TestCase):
 		patch.object(whatsapp, "_gateway_account_name", return_value="WA-1").start()
 		patch.object(whatsapp, "_is_opted_out", return_value=False).start()
 		self.addCleanup(patch.stopall)
+		# every send (even without a run) is now claimed and counted: start from a clean slate
+		frappe.db.delete("WhatsApp Send Key", {"gateway": ["like", "GW-%"]})
+		self.addCleanup(frappe.db.delete, "WhatsApp Send Key", {"gateway": ["like", "GW-%"]})
 
 	def test_list_templates_returns_bridge_rows(self):
 		rows = [{"name": "TPL-1", "template_name": "promo", "status": "APPROVED"}]
@@ -439,6 +450,9 @@ class TestWhatsAppToolTypedSends(unittest.TestCase):
 			p.start()
 		self.post = patch.object(whatsapp.requests, "post", return_value=FakeResponse(body={"messages": [{"id": "wamid.9"}]})).start()
 		self.addCleanup(patch.stopall)
+		# every send (even without a run) is now claimed and counted: start from a clean slate
+		frappe.db.delete("WhatsApp Send Key", {"gateway": ["like", "GW-%"]})
+		self.addCleanup(frappe.db.delete, "WhatsApp Send Key", {"gateway": ["like", "GW-%"]})
 
 	def run_action(self, action, **overrides):
 		kwargs = {"to": "+1 (555) 123-4567", **self.CASES[action][0], **overrides}
