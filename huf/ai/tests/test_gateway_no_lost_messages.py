@@ -30,11 +30,21 @@ class FakeStore:
 					ok = ok and val is not None and val < cond[1]
 				elif isinstance(cond, list) and cond[0] == "!=":
 					ok = ok and val != cond[1]
+				elif isinstance(cond, list) and cond[0] == "in":
+					ok = ok and val in cond[1]
 				else:
 					ok = ok and val == cond
 			if ok:
 				out.append(row["name"] if pluck else dict(row))
 		return out
+
+	def get_value(self, doctype, name, fieldname=None, as_dict=False, for_update=False, **kw):
+		row = self.rows.get(name) if isinstance(name, str) else None
+		if row is None:
+			return None
+		if isinstance(fieldname, (list, tuple)):
+			return {f: row.get(f) for f in fieldname}
+		return row.get(fieldname)
 
 	def set_value(self, doctype, name, values, *a, **kw):
 		self.rows[name].update(values)
@@ -45,6 +55,7 @@ class FakeStore:
 	def patches(self):
 		return (
 			patch.object(gateway_service.frappe, "get_all", side_effect=self.get_all),
+			patch.object(gateway_service.frappe.db, "get_value", side_effect=self.get_value),
 			patch.object(gateway_service.frappe.db, "set_value", side_effect=self.set_value),
 			patch.object(gateway_service.frappe.db, "commit"),
 			patch.object(gateway_service.frappe, "enqueue", side_effect=self.enqueue),

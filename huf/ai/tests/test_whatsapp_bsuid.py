@@ -80,9 +80,12 @@ class TestLookups(unittest.TestCase):
 
 	def test_is_opted_out_queries_bsuid_verbatim(self):
 		gw = SimpleNamespace(name="gw", provider="WhatsApp")
-		with patch.object(gateway_service.frappe, "get_all", return_value=["row"]) as ga:
+		def get_all(doctype, **kw):
+			return [] if doctype == "Gateway Event" else ["row"]
+
+		with patch.object(gateway_service.frappe, "get_all", side_effect=get_all) as ga:
 			self.assertTrue(gateway_service.is_opted_out(gw, BSUID))
-		self.assertEqual(ga.call_args.kwargs["filters"]["external_id"], BSUID)
+		self.assertEqual(ga.call_args.kwargs["filters"]["external_id"], ["in", [BSUID]])
 
 	def test_live_sender_entry_uses_bsuid(self):
 		gw = SimpleNamespace(name="gw", provider="WhatsApp")

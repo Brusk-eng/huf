@@ -1,6 +1,7 @@
 """Hardening fixes from live security testing of the WhatsApp gateway."""
 
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -146,6 +147,12 @@ class TestWebhookLimits(unittest.TestCase):
 		self.assertEqual(headers["Retry-After"], "60")
 
 
+def _event_row_value(*args, **kwargs):
+	if args and args[0] == "Gateway Event" and kwargs.get("as_dict"):
+		return {"status": "Running", "modified": datetime(2000, 1, 1), "reply_status": ""}
+	return None
+
+
 class TestTerminalStatePersistence(unittest.TestCase):
 	def setUp(self):
 		self._in_test = frappe.flags.get("in_test")
@@ -204,12 +211,18 @@ class TestTerminalStatePersistence(unittest.TestCase):
 	def test_reaper_fails_stuck_running_events(self):
 		with (
 			patch.object(gateway_service.frappe, "get_all", return_value=["GEV-1", "GEV-2"]) as get_all,
+			patch.object(
+				gateway_service.frappe.db,
+				"get_value",
+				side_effect=_event_row_value,
+			),
+			patch.object(gateway_service, "_flow_run_is_active", return_value=False),
 			patch.object(gateway_service.frappe.db, "set_value") as set_value,
 			patch.object(gateway_service.frappe.db, "commit"),
 			patch.object(gateway_service, "_recover_orphaned_events", return_value=0),
 		):
 			self.assertEqual(gateway_service.reap_stuck_gateway_events(), 2)
-		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["status"], "Running")
+		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["status"], ["in", ["Running", "Replying"]])
 		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["reply_status"], ["!=", "retrying"])
 		self.assertEqual(set_value.call_count, 2)
 		self.assertEqual(set_value.call_args.args[2]["status"], "Failed")
