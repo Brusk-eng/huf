@@ -26,7 +26,9 @@ class FakeResponse:
 
 def _bound():
 	return patch.multiple(
-		whatsapp, _run_gateway=MagicMock(return_value="GW-1"), _authorize=MagicMock(return_value=None)
+		whatsapp, _run_gateway=MagicMock(return_value="GW-1"),
+		_authorize=MagicMock(return_value=None),
+		_scope_refusal=MagicMock(return_value=None),
 	)
 
 

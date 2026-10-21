@@ -209,8 +209,8 @@ class TestTerminalStatePersistence(unittest.TestCase):
 			patch.object(gateway_service, "_recover_orphaned_events", return_value=0),
 		):
 			self.assertEqual(gateway_service.reap_stuck_gateway_events(), 2)
-		self.assertEqual(get_all.call_args.kwargs["filters"]["status"], "Running")
-		self.assertEqual(get_all.call_args.kwargs["filters"]["reply_status"], ["!=", "retrying"])
+		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["status"], "Running")
+		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["reply_status"], ["!=", "retrying"])
 		self.assertEqual(set_value.call_count, 2)
 		self.assertEqual(set_value.call_args.args[2]["status"], "Failed")
 
