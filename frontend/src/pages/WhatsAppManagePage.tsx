@@ -164,7 +164,7 @@ export default function WhatsAppManagePage() {
 
   return (
     <PageFrame
-      title="Manage WhatsApp"
+      title="WhatsApp"
       actions={
         summary ? <GatewaySwitcher gateways={gateways} value={gateway} onChange={(g) => update({ gateway: g })} /> : undefined
       }
