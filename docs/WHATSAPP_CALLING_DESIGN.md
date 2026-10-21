@@ -1,0 +1,169 @@
+# WhatsApp Business Calling: design and spike (T10)
+
+Status: design + spike only. No feature code in `huf/`. Researched 2026-10-21.
+Legend: **[V]** verified against Meta's official docs fetched today; **[U]** unverified (not on a fetched page, or from prior research only); **[L]** verified locally by running code.
+Sources fetched: `developers.facebook.com/docs/whatsapp/cloud-api/calling` (+ `/user-initiated-calls`, `/business-initiated-calls`, `/call-settings`), `/docs/whatsapp/pricing`. The pricing page for calls, call-permissions page, SIP page body, limits page and test-number notes were NOT retrievable in this pass.
+
+## 1. Purpose and scope
+
+Automation, not a softphone:
+1. Phase 1: a user calls the business number; Huf answers, plays one pre-recorded audio file (greeting/announcement), hangs up.
+2. Phase 2: business-initiated call after the user grants call permission (e.g. appointment reminder read-out).
+Out of scope: live conversation/ASR/TTS agent loop, DTMF menus (DTMF arrives as RTP events, no webhook [V per research]), call recording, voicemail, SIP trunking.
+
+## 2. Meta prerequisites checklist
+
+| # | Item | Status |
+|---|------|--------|
+| 1 | Number is on Cloud API (not WhatsApp Business app) | V |
+| 2 | App has `whatsapp_business_messaging` permission; app subscribed to Messaging webhook for the number | V |
+| 3 | Subscribe app to the `calls` webhook field (not needed for SIP-only) | V |
+| 4 | Business daily messaging limit >= 2,000 unique recipients; test numbers and sandbox exempt | V (test-number exemption stated on calling overview) |
+| 5 | Enable calling: `POST /<PHONE_ID>/settings {"calling":{"status":"ENABLED"}}` -> `{"success":true}`; off by default | V |
+| 6 | Verify: `GET /<PHONE_ID>/settings` returns `calling.{status,call_icon_visibility,callback_permission_status,call_hours,sip,audio,voicemail}`; needs `whatsapp_business_management` | V |
+| 7 | Client-side visibility of settings changes can lag up to 7 days (server applies immediately) | V |
+| 8 | `call_icon_visibility`: DEFAULT shows button; DISABLE_ALL hides it and blocks unsolicited calls. `restrict_to_user_countries` exists (Dec 2025) | V |
+| 9 | `callback_permission_status: ENABLED` prompts the user for call permission after they call (path to business-initiated permission) | V |
+| 10 | Audio codecs: Opus always on; PCMA/PCMU optional via `audio.additional_codecs` (need transcoding) | V |
+| 11 | User-initiated calling: everywhere Cloud API is available | V |
+| 12 | Business-initiated: NOT available when the business number is in US, Canada, Egypt, Vietnam, Nigeria | V |
+| 13 | Call permission required for business-initiated; error `138006` when missing | V |
+| 14 | Permission request via free-form message in open service window, or template, or `callback_permission_status`, or permanent grant in business profile | V |
+| 15 | Permission limits (production, per business+user): 1 request/day, 2/week; 2 consecutive unanswered -> reconsider notice, 4 -> auto-revoke. Sandbox (Tech Partners): 25/day, 100/week, 5/10 | V |
+| 16 | 10,000 new business-initiated calls per number per 24 h; per-user 100 calls/day (changelog 2025-12-19, relation to the 1/day permission limit unclear) | V (10k), V (changelog) |
+| 17 | Restrictions for low pickup rate (Sep 2025) and user feedback (Jan 2026) | V (exists), U (thresholds) |
+| 18 | Can calling be enabled on the Meta-provided test number, and in which countries | U. Overview says test numbers are exempt from the 2,000 floor; the settings page says nothing about test numbers. First live step must confirm. |
+| 19 | Calling pricing (per minute, by country, user- vs business-initiated, free tiers, increments) | U. Pricing page only says calling "has different pricing". Fetch `.../calling/pricing`. |
+| 20 | Graph API version to pin | U (spike defaults v21.0; set to current) |
+
+## 3. Call lifecycle
+
+### 3.1 User-initiated (Phase 1)
+
+Webhook `calls` / `event:connect` [V]: `calls[0] = {id, from, to, direction:"USER_INITIATED", timestamp, session:{sdp_type:"offer", sdp}, deeplink_payload?, cta_payload?}`; `contacts[0]` carries `wa_id`, `user_id`(BSUID), profile.
+
+```
+WhatsApp user   Meta            gwh (gunicorn)         Redis            huf-media (aiortc)        Frappe (whitelisted API)
+   | call -------->|                |                    |                    |                          |
+   |               |--POST connect->| verify X-Hub-Sig   |                    |                          |
+   |               |  (SDP offer)   | admission(policy)  |                    |                          |
+   |               |                | STOP/blocked?----> POST /calls reject (via sidecar-less direct call) ; Event(call,rejected)
+   |               |                | Gateway Event(call,received)            |                          |
+   |               |<--200 fast-----| RPUSH huf:media:calls {call_id,gateway,offer,audio_ref,deadline}
+   |               |                |                    |--BLPOP------------>|                          |
+   |               |                |                    |                    |--get_call_credentials--->|
+   |               |                |                    |                    | setRemoteDescription(offer)
+   |               |                |                    |                    | add audio track (gated: silence)
+   |               |                |                    |                    | createAnswer, wait ICE gather
+   |               |<------------------------ POST /calls pre_accept (SDP answer) ---|
+   |<==== ICE + DTLS-SRTP (UDP, peer-to-peer media path to sidecar) ====>|
+   |               |                |                    |                    | wait pc connected (timeout)
+   |               |<------------------------ POST /calls accept (SAME SDP) ---------|
+   |               |---200 OK------------------------------------------------------>|
+   |<===== audio starts ONLY now (gate opens) ==========================|
+   |               |<------------------------ POST /calls terminate (at EOF/max dur)|
+   |               |--POST terminate webhook (status, start/end, duration, errors)-->| gwh updates Event
+   |               |                |                    |<--PUBLISH huf:media:status----| record_call_result
+```
+Notes: pre_accept/accept bodies are `{messaging_product:"whatsapp", call_id, action, session:{sdp_type:"answer", sdp}}`; reject/terminate have no `session` [V]. `accept` SDP must equal the `pre_accept` SDP or it fails [V]. Answer deadline after connect webhook is about 30-60 s, then user sees Not Answered and a terminate webhook arrives [V]. Wait for 200 on accept before sending media, else first words are clipped [V]. Call `terminate` even if RTCP BYE was seen (affects pricing accuracy); not needed if the user hung up [V]. Terminate webhook: `status` COMPLETED|FAILED, `start_time/end_time/duration` only if answered, `errors` only on failure, echoes `biz_opaque_callback_data` if given on accept (<=512 chars) [V]. DTMF: clock rate 8000, PT 126 only [V].
+Whether `pre_accept` is strictly required: Meta calls it recommended (research) [V-prior]; we always do it so ICE/DTLS completes before accept.
+
+### 3.2 Business-initiated (Phase 2, later)
+```
+Huf -> send call-permission request (free-form in open window, or template)     [V]
+User grants (or callback_permission_status / permanent grant)                    [V]
+sidecar: RTCPeerConnection, createOffer (audio sendonly/sendrecv, Opus), wait ICE gather
+sidecar -> POST /<PHONE_ID>/calls {messaging_product, to|recipient(BSUID), action:"connect",
+                                    session:{sdp_type:"offer", sdp}, biz_opaque_callback_data?}  -> call id   [V]
+Meta -> webhook calls event:connect direction:BUSINESS_INITIATED, session = SDP ANSWER             [V]
+gwh -> Redis PUBLISH huf:media:answer:<call_id> -> sidecar setRemoteDescription(answer)
+Meta -> status webhooks RINGING | ACCEPTED | REJECTED                                              [V]
+on ACCEPTED (media connected): open gate, play, terminate action; terminate webhook closes Event.  [V]
+```
+Gates: not for US/CA/EG/VN/NG numbers; 138006 if no permission; 1 permission request/day/user.
+
+## 4. Process model (Opus 5.5 recommendation, adopted)
+
+A call is a long-lived stateful media session (ICE, DTLS, SRTP, a 20 ms audio clock, an ffmpeg subprocess) with a 30-60 s answer deadline. It must NOT run in gunicorn (request-bound, worker timeouts, no UDP lifecycle) nor in an RQ worker (blocks a slot, job timeouts, killed on restart, no sticky state). Use a dedicated **`huf-media` asyncio sidecar** (aiortc), same pattern as Frappe's socketio node process.
+
+- Jobs in: Redis list `huf:media:calls` (RPUSH by gwh, BLPOP by sidecar). Job = `{call_id, gateway, direction, sdp_offer, audio_ref, max_seconds, deadline_ts}`. Drop jobs whose `deadline_ts` already passed (answer window gone) and write a `missed` Event.
+- Status out: Redis pub/sub `huf:media:status` (`{call_id, stage, t}`), plus the durable result via whitelisted `huf.ai.whatsapp_calls.record_call_result` which writes the Gateway Event. Pub/sub alone is lossy; the Event is the record.
+- Credentials: the sidecar never stores the WhatsApp token; it calls `get_call_credentials` (service API key) for a short-lived value (design from GAP_ANALYSIS section 3).
+- Deployment: one more unit next to gunicorn/RQ: systemd (`huf-media.service`), supervisor program, or a compose service with `network_mode: host` (or a published UDP range). Restart policy always; on crash all live calls die, so `terminate` them best-effort on SIGTERM.
+- Network: public IP reachable on a UDP port range (set aiortc/ICE port range; ~2 ports per call plus margin, e.g. 40000-40199 -> ~100 calls), outbound UDP to Meta media relays, STUN/TURN. aiortc defaults to Google STUN; a host with a public IP can run with no TURN **[U against Meta's relays]**; behind NAT or restrictive firewalls add coturn (TURN over 443/TCP+TLS as fallback). Today's Huf bench/prod topology exposes none of this **[from GAP_ANALYSIS]**.
+- Capacity: aiortc is Python/GIL bound; Opus encode plus ffmpeg decode per call. One process per CPU core, scale by running N sidecars on the same list. CPU per call is a spike measurement (not yet measured). Go/Pion or a media server is the escape hatch above tens of concurrent calls.
+- Audio prep: pre-transcode the greeting once to 48 kHz Opus/ogg at upload; avoids per-call ffmpeg cost spikes.
+
+## 5. Data model additions (pre-release: no migrations/back-compat needed)
+
+Gateway (WhatsApp type): `calling_enabled` (Check), `call_audio_file` (Attach, private File, <=~60 s, ogg/opus preferred), `call_greeting_text` (Small Text, accessible text alternative/for later TTS), `call_max_seconds` (Int, default 60), `call_max_concurrent` (Int, default 2).
+Gateway Event: kind/type `call` with `call_id`, `direction`, `call_status` (received, rejected, answered, completed, failed, missed), `duration` (s), `terminate_reason` (user_hangup | eof | max_duration | ice_failed | answer_timeout | rejected_policy | error), `timings` (JSON: webhook->pre_accept->accept->first_rtp->terminate), reuse `wa_id`/BSUID contact link. `call_id` unique index for idempotency (Meta retries webhooks).
+
+## 6. Security and compliance
+- Verify `X-Hub-Signature-256` on the `calls` webhook with the same HMAC path as messages; reject unsigned. Do it before queueing (a forged connect would otherwise make the sidecar open media).
+- Admission = same policy as messages (allow-list/pairing, STOP/opt-out, blocked) -> `reject` action, Event `rejected_policy`. Unknown callers: default reject unless gateway policy is open.
+- Abuse: max concurrent calls per gateway and global, per-caller rate limit (e.g. 3 calls/hour), `call_max_seconds` hard cap enforced in the sidecar (terminate), job deadline check, bounded Redis list length.
+- Idempotency on `call_id` (Meta may redeliver `connect`; never answer twice).
+- Recording consent: Phase 1 plays audio only and records nothing. Any future recording/ASR needs an in-call consent announcement and legal review per jurisdiction **[U, legal]**. Do not store inbound audio by default.
+- PII: caller number/BSUID in Event is personal data; mask in logs (last 4), do not log SDP bodies at INFO (contain IPs/ICE candidates/fingerprints). SDP IPs reveal the sidecar host publicly by design.
+- Token handling: no token in the sidecar config or logs (see Credentials).
+
+## 7. Observability
+Per-call timings (webhook, answer_built, pre_accept_ok, dtls_connected, accept_ok, first_rtp_out, terminate_sent, terminate_webhook); counters by outcome and terminate_reason; gauge of live calls; ICE/DTLS failure count; p95 webhook->accept; sidecar CPU and RSS per call; Graph error codes (138006 etc.) logged with call_id. Surface as Gateway Event rows and sidecar structured logs; a health key `huf:media:heartbeat` (TTL 10 s) so gwh can reject early with "calling unavailable" instead of queueing into a dead sidecar.
+
+## 8. Failure modes
+| Failure | Handling |
+|---|---|
+| ICE/DTLS never connects (UDP blocked, wrong public IP) | connect timeout (spike 20 s) -> `terminate`, Event `ice_failed`; surfaced as top diagnostic |
+| Answer deadline (30-60 s [V]) exceeded (slow queue, sidecar down) | deadline_ts in job; miss -> Event `answer_timeout`; heartbeat check prevents queueing |
+| Audio clipped | gate opens only after accept 200 [V rule]; verified gate in selftest [L] |
+| Silence after accept (late start) | start immediately on accept 200; measure accept->first_rtp_out |
+| accept SDP != pre_accept SDP | build answer once, reuse string [L] |
+| ICE gathering slow | measured 5.3 s locally with default STUN and many interfaces [L]; restrict interfaces/use a fixed host candidate to cut it; it eats the answer budget |
+| Sidecar crash mid-call | supervisor restart; user sees call drop; Event left `answered` -> reaper marks `failed`; terminate webhook may still arrive |
+| Duplicate/out-of-order webhooks | idempotent on call_id and status ordering |
+| Graph 4xx on actions | log code; for connect-window errors just clean up; never retry accept blindly |
+| Meta restricts number (low pickup, feedback) [V exists] | alert on rising rejected/FAILED ratio |
+
+## 9. Cost
+Calling has separate per-minute pricing [V that it is separate; U on rates/increments/free tiers]. A user call also opens the 24 h customer service window like a message [V on pricing page]. Terminate promptly: billing accuracy depends on the terminate action [V]. Cost of Phase 1 is dominated by minutes x rate; cap with `call_max_seconds`. Infra: one small VM with public IP/UDP range; TURN adds bandwidth cost only if needed.
+
+## 10. Testing strategy
+1. Unit: signature check, admission, job schema, Event mapping, idempotency (no network).
+2. Local loopback: two aiortc peers, fake Graph recording action order (done in spike `--selftest`: order pre_accept, accept, terminate; zero media frames before accept) [L].
+3. Fake Graph server + recorded webhook fixtures incl. terminate/FAILED/errors, replay duplicates.
+4. Live: enabled test number (confirm item 18), host with public UDP, real phone: listen for clipping, measure timings, CPU, then business-initiated with a real permission grant (non-restricted country).
+5. Soak: N simulated peers (aiortc callers) against the sidecar for CPU/port limits.
+
+## 11. Rollout and effort
+| Phase | Scope | Effort |
+|---|---|---|
+| 0 | This design + spike (done locally) | done |
+| 1 | Live spike on test number (needs host, owner go-ahead) | 1-2 days |
+| 2 | `huf-media` sidecar, Gateway fields, webhook routing, Events, admission, unit tests | ~1-1.5 weeks |
+| 3 | Hardening: concurrency, TURN, metrics, reaper, UI toggle/upload | ~1 week |
+| 4 | Business-initiated + permission-request flow | ~1 week, blocked on Meta/country |
+Total to usable Phase 1: about 2-3 weeks; spike alone 2-3 days (matches GAP_ANALYSIS).
+
+## 12. Spike: `tools/wa_call_spike.py`
+Standalone; aiohttp webhook server (GET challenge, POST HMAC check), connect -> RTCPeerConnection + remote offer + gated MediaPlayer track -> pre_accept -> wait connected -> accept (same SDP) -> open gate -> play N s -> terminate; terminate webhook handler; timing log; injectable post; `--dry-run`; `--selftest`.
+aiortc facts used [L]: `MediaPlayer(file)` decodes through ffmpeg/PyAV; `setLocalDescription` returns after ICE gathering so `localDescription.sdp` is final; Opus is encoded by aiortc. The gate does not read the file before accept, so nothing is consumed early.
+Selftest result (Python 3.14.7, aiortc 1.15.0, aiohttp 3.14.5, macOS): PASS. Action order pre_accept, accept, terminate; 0 frames received before accept; 147 frames received (about 3 s tone); webhook->answer_built 5.3 s (ICE gathering), accept->first outbound frame 25 ms.
+NOT verified: any Meta interaction, Meta's SDP acceptance of aiortc's answer (codec/ICE/DTLS role/`a=setup`, ICE-lite expectations) [U], real-phone audio quality, CPU per call.
+
+### Live-spike exit criteria
+1. Audio heard on the phone, first words not clipped.
+2. webhook -> accept under 10 s (ICE gather time reduced from 5 s if needed).
+3. terminate webhook arrives with `COMPLETED` and a sane `duration`.
+4. 10 consecutive calls without leaked sockets/processes; CPU per call recorded.
+5. Failure paths exercised: blocked UDP -> `ice_failed` terminate; unanswered -> terminate webhook.
+Fail -> record findings, decide between fixing SDP/ICE or the SIP+Asterisk alternative.
+
+## 13. Open questions for the owner
+1. Which number/country for the live spike; OK to enable calling on the test number (item 18) or use a real number >= 2,000 limit?
+2. Host with public IP and a UDP range (and who opens the firewall)? Is TURN acceptable?
+3. Is Phase 1 (inbound greeting) enough value, or is a conversational (ASR/TTS) call the real goal? That changes the media stack.
+4. Business-initiated blocked for US/CA/EG/VN/NG numbers: which numbers will Huf customers actually use?
+5. Recording/consent stance (none in v1?).
+6. Budget approval for per-minute call charges (rates unverified).
+7. Admission for unknown callers: reject by default or follow gateway open policy?
