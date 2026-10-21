@@ -54,7 +54,9 @@ send authority); it is routed through the bridge when available so a WhatsApp Me
 written. The tool never switches the session user.
 """
 
+import contextvars
 import json
+from contextlib import contextmanager
 from typing import Optional, Any
 
 import frappe
@@ -112,12 +114,36 @@ _LIST_DEFAULT_LIMIT = 20
 _LIST_MAX_LIMIT = 50
 
 
-def _run_gateway() -> str:
-	"""The enabled WhatsApp Gateway the current agent run belongs to, or '' (fail closed).
+_trusted_gateway: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_trusted_gateway", default="")
 
-	Derived from Agent Run -> Agent Conversation.channel (``gateway:<name>``); never from tool args.
+
+@contextmanager
+def trusted_gateway(gateway_name: str):
+	"""Bind the gateway for a TRUSTED, deterministic caller (the Flow engine's tool.call node).
+
+	Only server code can enter this block; tool arguments never can. The gateway comes from the flow
+	run's own gateway event, or from an admin-configured node field, never from the model.
+	"""
+	token = _trusted_gateway.set(str(gateway_name or "").strip())
+	try:
+		yield
+	finally:
+		_trusted_gateway.reset(token)
+
+
+def _run_gateway() -> str:
+	"""The enabled WhatsApp Gateway the current run belongs to, or '' (fail closed).
+
+	A trusted caller's binding wins; otherwise it is derived from Agent Run -> Agent
+	Conversation.channel (``gateway:<name>``). Never from tool args.
 	"""
 	try:
+		bound = _trusted_gateway.get()
+		if bound:
+			row = frappe.db.get_value("Gateway", bound, ["provider", "is_enabled"], as_dict=True)
+			if row and row.get("provider") == "WhatsApp" and row.get("is_enabled"):
+				return bound
+			return ""
 		run_id = getattr(frappe.flags, "huf_current_agent_run_id", None)
 		if not run_id:
 			return ""

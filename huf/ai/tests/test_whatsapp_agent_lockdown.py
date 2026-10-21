@@ -105,6 +105,24 @@ class TestRunGatewayBinding(unittest.TestCase):
 			self.assertEqual(whatsapp._run_gateway(), "")
 
 
+class TestTrustedGateway(unittest.TestCase):
+	def test_trusted_binding_wins_only_inside_the_block(self):
+		with patch.object(whatsapp.frappe.db, "get_value", return_value={"provider": "WhatsApp", "is_enabled": 1}):
+			with whatsapp.trusted_gateway("GW-F"):
+				self.assertEqual(whatsapp._run_gateway(), "GW-F")
+			self.assertEqual(whatsapp._run_gateway(), "")
+
+	def test_trusted_binding_to_a_disabled_gateway_fails_closed(self):
+		with patch.object(whatsapp.frappe.db, "get_value", return_value={"provider": "WhatsApp", "is_enabled": 0}):
+			with whatsapp.trusted_gateway("GW-F"):
+				self.assertEqual(whatsapp._run_gateway(), "")
+
+	def test_model_args_cannot_bind_the_trusted_gateway(self):
+		with patch.object(whatsapp, "_authorize", return_value=None):
+			result = json.loads(whatsapp.handle_action("send_message", to="1", message="x", gateway_name="GW", trusted_gateway="GW"))
+		self.assertEqual(result["error"], "gateway_context_required")
+
+
 class TestAuthority(unittest.TestCase):
 	def tearDown(self):
 		patch.stopall()
