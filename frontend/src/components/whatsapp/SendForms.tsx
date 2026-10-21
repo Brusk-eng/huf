@@ -6,7 +6,8 @@ import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   INTERACTIVE_LIMITS, sendContactsMessage, sendInteractiveMessage, sendLocationMessage, sendMediaMessage,
-  sendReactionMessage, sendStickerMessage, sendTextMessage, uploadPublicFile, validateInteractive, validateMediaSend,
+  sendReactionMessage, sendStickerMessage, sendTextMessage, sendVoiceNote, uploadPublicFile, validateInteractive, validateMediaSend,
+  validateVoiceNote,
   type InteractiveButton, type InteractiveKind, type MediaKind, type WhatsAppError,
 } from '@/services/whatsappApi';
 import { TemplateSend } from './TemplateSend';
@@ -67,6 +68,7 @@ function MediaForm({ kind, gateway, to, run, sending, setError }: FormProps & { 
   const [file, setFile] = useState<{ fileUrl: string; name: string } | null>(null);
   const [caption, setCaption] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [voice, setVoice] = useState(false);
 
   const pick = async (f: File | undefined) => {
     if (!f) return;
@@ -76,16 +78,21 @@ function MediaForm({ kind, gateway, to, run, sending, setError }: FormProps & { 
     setUploading(false);
     if ('fileUrl' in res) { setFile({ fileUrl: res.fileUrl, name: f.name }); setLink(''); } else setError(res);
   };
-  const reset = () => { setLink(''); setFile(null); setCaption(''); };
+  const reset = () => { setLink(''); setFile(null); setCaption(''); setVoice(false); };
   const submit = () => {
+    const asVoice = kind === 'audio' && voice;
     const problem = kind === 'sticker'
       ? (!link.trim() && !file ? 'Add a file or paste a public link' : null)
-      : validateMediaSend({ kind, link, fileUrl: file?.fileUrl, caption });
+      : asVoice
+        ? validateVoiceNote({ link, fileUrl: file?.fileUrl, fileName: file?.name })
+        : validateMediaSend({ kind, link, fileUrl: file?.fileUrl, caption });
     if (problem) return setError(bad(problem));
     const fileUrl = link.trim() ? undefined : file?.fileUrl;
     void run(
       () => kind === 'sticker'
         ? sendStickerMessage(gateway, to, { link, fileUrl })
+        : asVoice
+        ? sendVoiceNote(gateway, to, { link, fileUrl })
         : sendMediaMessage(gateway, to, { kind, link, fileUrl, caption, filename: kind === 'document' ? file?.name : undefined }),
       'Message sent',
       reset,
@@ -103,6 +110,12 @@ function MediaForm({ kind, gateway, to, run, sending, setError }: FormProps & { 
       </div>
       {(kind === 'image' || kind === 'video' || kind === 'document') && (
         <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="Caption (optional)" aria-label="Media caption" />
+      )}
+      {kind === 'audio' && (
+        <label className="flex items-center gap-2 text-xs text-steel">
+          <input type="checkbox" checked={voice} onChange={(e) => setVoice(e.target.checked)} aria-label="Send as voice note" />
+          Send as a voice note (Ogg/Opus, mono, up to 16 MB)
+        </label>
       )}
       <SendButton sending={sending} disabled={uploading || !to.trim()} onClick={submit} />
     </div>

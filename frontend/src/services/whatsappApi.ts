@@ -452,6 +452,17 @@ export function validateMediaSend(f: { kind: MediaKind; link?: string; fileUrl?:
   return null;
 }
 
+const VOICE_EXT = /\.(ogg|opus|oga)$/i;
+
+/** A WhatsApp voice note must be an Ogg/Opus file; checks the link or uploaded file name before calling the server. */
+export function validateVoiceNote(f: { link?: string; fileUrl?: string; fileName?: string }): string | null {
+  const link = f.link?.trim();
+  if (!link && !f.fileUrl) return 'Add a file or paste a public link';
+  if (link && !/^https:\/\//.test(link)) return 'The link must start with https://';
+  const target = (link ? link.split(/[?#]/)[0] : f.fileName || f.fileUrl || '').trim();
+  return VOICE_EXT.test(target) ? null : 'A voice note must be an Ogg file with the Opus codec (.ogg or .opus)';
+}
+
 export const getSetupStatus = (gatewayName?: string) =>
   invoke<SetupStatus>('get_setup_status', gatewayName ? { gateway_name: gatewayName } : {}, 'get');
 
@@ -546,6 +557,14 @@ export const sendMediaMessage = (
       caption: media.caption?.trim() || undefined,
       filename: media.filename?.trim() || undefined,
     },
+    'post',
+  );
+
+/** Send audio as a voice note (`audio.voice: true`); Ogg/Opus only. */
+export const sendVoiceNote = (gatewayName: string, to: string, voice: { link?: string; fileUrl?: string }) =>
+  invoke<Record<string, unknown>>(
+    'send_voice_note',
+    { gateway_name: gatewayName, to, link: voice.link?.trim() || undefined, file_url: voice.fileUrl || undefined },
     'post',
   );
 

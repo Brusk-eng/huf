@@ -14,6 +14,8 @@ import {
   listTemplateDrafts,
   listTemplates,
   sendTemplateMessage,
+  sendVoiceNote,
+  validateVoiceNote,
   syncTemplates,
   templateNameProblem,
   errorText,
@@ -145,6 +147,26 @@ describe('whatsappApi helpers', () => {
     expect(validateTemplateForm(f)).toBeNull();
     expect('header_type' in buildEditPayload(f)).toBe(false);
     expect(validateTemplateForm({ ...f, keepExistingMedia: false })).toMatch(/sample file/);
+  });
+});
+
+describe('voice notes', () => {
+  beforeEach(() => post.mockReset().mockResolvedValue({ message: { success: true } }));
+
+  it('calls send_voice_note with the gateway and trims the link', async () => {
+    await sendVoiceNote('GW-A', '15551234567', { link: ' https://cdn.example/v.ogg ' });
+    const [method, args] = post.mock.calls[0] as [string, Record<string, unknown>];
+    expect(method).toBe('huf.ai.whatsapp_management.send_voice_note');
+    expect(args).toMatchObject({ gateway_name: 'GW-A', to: '15551234567', link: 'https://cdn.example/v.ogg' });
+  });
+
+  it('accepts only Ogg/Opus names before calling the server', () => {
+    expect(validateVoiceNote({ link: 'https://x.example/v.ogg?sig=1' })).toBeNull();
+    expect(validateVoiceNote({ fileUrl: '/files/v.opus', fileName: 'note.OPUS' })).toBeNull();
+    expect(validateVoiceNote({ link: 'https://x.example/v.mp3' })).toMatch(/Ogg/);
+    expect(validateVoiceNote({ fileUrl: '/files/v.m4a', fileName: 'v.m4a' })).toMatch(/Ogg/);
+    expect(validateVoiceNote({ link: 'http://x.example/v.ogg' })).toMatch(/https/);
+    expect(validateVoiceNote({})).toMatch(/Add a file/);
   });
 });
 
