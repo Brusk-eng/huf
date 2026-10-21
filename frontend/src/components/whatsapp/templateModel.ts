@@ -221,3 +221,9 @@ export function statusToastText(template: string, status?: string): { text: stri
     default: return { text: `Template ${template} is now ${statusInfo(status).label.toLowerCase()}`, tone: 'info' };
   }
 }
+
+/** "MARKETING" -> "Marketing"; any category WhatsApp adds later reads the same way. */
+export function categoryLabel(category?: string | null): string {
+  const c = (category || '').trim();
+  return c ? c.charAt(0).toUpperCase() + c.slice(1).toLowerCase() : '';
+}
