@@ -1609,6 +1609,17 @@ def ingest_gateway_event(
         existing = frappe.db.get_value("Gateway Event", {"idempotency_key": key}, "name")
         return {"duplicate": True, "event_name": existing}
 
+    return _continue_ingest(event, gateway_name, provider_event_id, context, verified_sender)
+
+
+def _continue_ingest(
+    event, gateway_name: str, provider_event_id: str, context: dict[str, Any], verified_sender: bool
+) -> dict:
+    """Everything after the event row exists: reject, record-only, admission, routing, enqueue.
+
+    Split out so the reaper and the dead-letter replay can resume an event that was inserted but
+    never routed, with exactly the same rules as a fresh delivery.
+    """
     if not verified_sender:
         event.db_set({"status": "Rejected", "error_message": "Provider did not verify sender"})
         return {"event_name": event.name, "status": "Rejected"}
@@ -1681,9 +1692,133 @@ def _commit_unless_testing() -> None:
 STUCK_RUNNING_MINUTES = 15
 _TERMINAL_STATES = ("Succeeded", "Failed")
 
+# Reaper v2 (WP-5). Every recovery attempt is persisted on the event (``recovery_attempts``) with a
+# ``retry_deadline`` set at the first attempt, so the budget survives cache flushes and restarts.
+QUEUED_STUCK_MINUTES = 10  # Queued, enqueue lost (worker killed / job dropped)
+RECEIVED_STUCK_MINUTES = 5  # inserted but never routed (crash between insert and route)
+RETRYING_STUCK_MINUTES = 10  # reply_status 'retrying' whose retry job is gone
+RECOVERY_MAX_ATTEMPTS = 3
+RECOVERY_DEADLINE_MINUTES = 60
+DEAD_LETTER_PREFIX = "dead_letter:"
+# Callables ``hook(event_name, reason)`` run (best effort) when an event ends Failed because
+# recovery gave up or a worker died. The failure/fallback path (WP-4b) registers the sender notice here.
+REAP_FAILURE_HOOKS: list = []
+
+
+def fail_event_after_budget(event_name: str, reason: str) -> dict:
+    """End an event Failed with ``reason`` and flag it for a sender notice (hooks never raise)."""
+    frappe.db.set_value("Gateway Event", event_name, {"status": "Failed", "error_message": reason[:500]})
+    for hook in list(REAP_FAILURE_HOOKS):
+        try:
+            hook(event_name, reason)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Gateway reaper failure hook failed")
+    return {"event_name": event_name, "status": "Failed", "notify_sender": True, "reason": reason}
+
+
+def _spend_recovery_attempt(row: dict, now) -> str | None:
+    """Persist one more recovery attempt. Returns a failure reason when the budget is spent, else None."""
+    attempts = int(row.get("recovery_attempts") or 0)
+    deadline = row.get("retry_deadline")
+    if attempts >= RECOVERY_MAX_ATTEMPTS:
+        return f"Recovery gave up after {attempts} attempts; the event was never completed."
+    if deadline and now > deadline:
+        return "Recovery deadline passed before the event completed."
+    values = {"recovery_attempts": attempts + 1}
+    if not deadline:
+        values["retry_deadline"] = add_to_date(now, minutes=RECOVERY_DEADLINE_MINUTES)
+    frappe.db.set_value("Gateway Event", row["name"], values)
+    return None
+
+
+_RECOVERY_FIELDS = [
+    "name", "status", "modified", "received_at", "reply_status", "reply_message_id",
+    "agent_run", "recovery_attempts", "retry_deadline", "gateway",
+]  # fmt: skip
+
+
+def _reply_parts_for_run(agent_run: str) -> list[str]:
+    """Rebuild the reply parts from the finished Agent Run (empty when it cannot be recovered)."""
+    if not agent_run:
+        return []
+    from huf.ai.gateway_adapters import whatsapp_format as wf
+
+    response = frappe.db.get_value("Agent Run", agent_run, "response")
+    if not response:
+        return []
+    return wf.split_body(wf.to_whatsapp(response)) or [response]
+
+
+def _recover_orphaned_events(limit: int = 50) -> int:
+    """Recover Queued / Received orphans and 'retrying' replies whose job is gone (bounded)."""
+    now = now_datetime()
+    recovered = 0
+
+    def fetch(filters):
+        return frappe.get_all(
+            "Gateway Event", filters=filters, fields=_RECOVERY_FIELDS, limit_page_length=limit
+        )
+
+    queued = fetch({"status": "Queued", "modified": ["<", add_to_date(now, minutes=-QUEUED_STUCK_MINUTES)]})
+    received = fetch(
+        {"status": "Received", "modified": ["<", add_to_date(now, minutes=-RECEIVED_STUCK_MINUTES)]}
+    )
+    retrying = fetch(
+        {
+            "status": "Running",
+            "reply_status": "retrying",
+            "modified": ["<", add_to_date(now, minutes=-RETRYING_STUCK_MINUTES)],
+        }
+    )
+    for row in queued + received + retrying:
+        try:
+            reason = _spend_recovery_attempt(row, now)
+            if reason:
+                fail_event_after_budget(row["name"], f"{row['status']} orphan: {reason}")
+            elif row["status"] == "Queued":
+                frappe.enqueue(
+                    "huf.ai.gateway_service.process_gateway_event",
+                    queue="default",
+                    timeout=300,
+                    event_name=row["name"],
+                    enqueue_after_commit=True,
+                )
+            elif row["status"] == "Received":
+                try:
+                    _replay_event_ingest(row["name"])
+                except Exception as exc:
+                    _mark_dead_letter(row["name"], exc)
+            else:
+                _recover_retrying_reply(row)
+            recovered += 1
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Gateway orphan recovery failed")
+    return recovered
+
+
+def _recover_retrying_reply(row: dict) -> None:
+    attempts = int(row.get("recovery_attempts") or 0) + 1  # already spent above
+    parts = [] if row.get("reply_message_id") else _reply_parts_for_run(row.get("agent_run") or "")
+    if not parts:
+        fail_event_after_budget(
+            row["name"],
+            "Reply retry lost: the retry job is gone and the unsent part of the reply cannot be rebuilt.",
+        )
+        return
+    frappe.enqueue(
+        "huf.ai.gateway_service.retry_gateway_reply",
+        queue="default",
+        timeout=300,
+        enqueue_after_commit=True,
+        event_name=row["name"],
+        parts_remaining=parts,
+        attempt=1 + attempts,
+        not_before=0,
+    )
+
 
 def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int = 50) -> int:
-    """Mark events stuck in Running (a lost terminal write / killed worker) as Failed with a reason."""
+    """Recover or fail events a worker lost: stuck Running, orphaned Queued/Received, dead 'retrying' replies."""
     try:
         cutoff = add_to_date(now_datetime(), minutes=-minutes)
         stuck = frappe.get_all(
@@ -1691,28 +1826,143 @@ def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int =
             filters={
                 "status": "Running",
                 "modified": ["<", cutoff],
-                # a pending send-only reply retry is legitimately Running; never drop it
+                # a pending send-only reply retry is handled by the retrying recovery below
                 "reply_status": ["!=", "retrying"],
             },
             pluck="name",
             limit_page_length=limit,
         )
         for name in stuck:
-            frappe.db.set_value(
-                "Gateway Event",
+            fail_event_after_budget(
                 name,
-                {
-                    "status": "Failed",
-                    "error_message": f"Stuck in Running for over {minutes} minutes; the worker "
-                    "finished or died without recording a result.",
-                },
+                f"Stuck in Running for over {minutes} minutes; the worker "
+                "finished or died without recording a result.",
             )
-        if stuck:
+        count = len(stuck)
+        count += _recover_orphaned_events(limit)
+        if count:
             _commit_unless_testing()
-        return len(stuck)
+        return count
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Gateway stuck-event reaper failed")
         return 0
+
+
+# -- ingest dead letters --------------------------------------------------------
+
+
+def _mark_dead_letter(event_name: str, error: BaseException | str) -> None:
+    text = _redact_error_text(str(error))[:400]
+    frappe.db.set_value(
+        "Gateway Event",
+        event_name,
+        {"status": "Failed", "error_message": f"{DEAD_LETTER_PREFIX} ingest failed: {text}"},
+    )
+
+
+def store_ingest_dead_letter(
+    gateway_name: str,
+    provider_event_id: str,
+    context: dict[str, Any],
+    raw_payload: dict[str, Any] | None,
+    error: BaseException | str,
+) -> str:
+    """Keep a deterministically failing delivery as a Failed Gateway Event (dead letter).
+
+    The row carries the redacted raw payload plus the ingest context so ``retry_gateway_event`` can
+    replay it, and uses the normal idempotency key so a provider redelivery or a replay can never
+    create a second event.
+    """
+    key = _idempotency_key(gateway_name, provider_event_id)
+    reason = f"{DEAD_LETTER_PREFIX} ingest failed: {_redact_error_text(str(error))[:400]}"
+    existing = frappe.db.get_value("Gateway Event", {"idempotency_key": key}, ["name", "status"], as_dict=True)
+    if existing:
+        if existing.get("status") in ("Received", "Failed"):
+            frappe.db.set_value("Gateway Event", existing["name"], {"status": "Failed", "error_message": reason})
+        return existing["name"]
+    payload = _redact_payload(raw_payload or {})
+    payload = dict(payload) if isinstance(payload, dict) else {"payload": payload}
+    payload["_replay_context"] = _redact_payload(dict(context or {}))
+    doc = frappe.get_doc(
+        {
+            "doctype": "Gateway Event",
+            "gateway": gateway_name,
+            "idempotency_key": key,
+            "provider_event_id": provider_event_id,
+            "status": "Failed",
+            "received_at": now_datetime(),
+            "verified_sender": 1,
+            "sender_id": str((context or {}).get("sender_id") or ""),
+            "conversation_id": str((context or {}).get("conversation_id") or ""),
+            "thread_id": str((context or {}).get("thread_id") or ""),
+            "message_text": _cap_message_text((context or {}).get("message_text")),
+            "raw_payload": payload,
+            "error_message": reason,
+        }
+    )
+    doc.insert(ignore_permissions=True)
+    return doc.name
+
+
+def _replay_context(event) -> dict[str, Any]:
+    raw = event.raw_payload
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = {}
+    saved = raw.get("_replay_context") if isinstance(raw, dict) else None
+    if isinstance(saved, dict):
+        return saved
+    return {
+        "kind": "message",
+        "sender_id": event.sender_id or "",
+        "conversation_id": event.conversation_id or "",
+        "thread_id": event.thread_id or "",
+        "message_text": event.message_text or "",
+    }
+
+
+def _replay_event_ingest(event_name: str) -> dict:
+    """Resume ingest for an existing event row (same idempotency key, same rules as a fresh delivery)."""
+    event = frappe.get_doc("Gateway Event", event_name)
+    return _continue_ingest(
+        event,
+        event.gateway,
+        event.provider_event_id or "",
+        _replay_context(event),
+        bool(event.verified_sender),
+    )
+
+
+@frappe.whitelist(methods=["POST"])
+def retry_gateway_event(name: str) -> dict:
+    """Admin action: replay an ingest dead letter. Idempotent; only dead letters, only once they are Failed."""
+    _require_gateway_admin()
+    row = frappe.db.get_value(
+        "Gateway Event", name, ["name", "status", "error_message"], as_dict=True, for_update=True
+    )
+    if not row:
+        raise frappe.DoesNotExistError(_("Gateway Event {0} not found").format(name))
+    is_dead = row.get("status") == "Failed" and str(row.get("error_message") or "").startswith(
+        DEAD_LETTER_PREFIX
+    )
+    if not is_dead:
+        if row.get("status") == "Failed":
+            frappe.throw(_("Only ingest dead letters can be replayed."))
+        return {"event_name": name, "replayed": False, "status": row.get("status")}
+    previous_error = row["error_message"]
+    frappe.db.savepoint("gw_replay")
+    frappe.db.set_value("Gateway Event", name, {"status": "Received", "error_message": ""})
+    try:
+        result = _replay_event_ingest(name)
+    except Exception as exc:
+        frappe.db.rollback(save_point="gw_replay")
+        frappe.db.set_value("Gateway Event", name, {"status": "Failed", "error_message": previous_error})
+        frappe.log_error(frappe.get_traceback(), "Gateway dead-letter replay failed")
+        return {"event_name": name, "replayed": False, "status": "Failed", "error": _redact_error_text(str(exc))[:300]}
+    _commit_unless_testing()
+    return {"event_name": name, "replayed": True, "status": result.get("status")}
 
 
 def _persist_terminal_state(event_name: str, result: Any) -> None:

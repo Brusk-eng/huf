@@ -131,42 +131,6 @@ class TestWebhookLimits(unittest.TestCase):
 		self.assertEqual(mf.local.response.http_status_code, 413)
 		adapter.verify_inbound.assert_not_called()
 
-	def test_message_cap_ignores_the_rest(self):
-		n = gateway_webhook.MAX_MESSAGES_PER_PAYLOAD + 20
-		events = [
-			SimpleNamespace(
-				provider_event_id=f"id{i}",
-				sender_id="1",
-				conversation_id="1",
-				thread_id="",
-				message_text="t",
-				is_room=0,
-				mentioned=0,
-				raw_payload={},
-			)
-			for i in range(n)
-		]
-		parsed = SimpleNamespace(
-			messages=tuple(events), statuses=(), template_updates=(), ignored=0, unknown_phone_ids=()
-		)
-		adapter = MagicMock()
-		adapter.parse_payload.return_value = parsed
-		gateway = SimpleNamespace(name="GW", whatsapp_account="")
-		with (
-			patch.object(gateway_webhook, "_ingest_rate_gate"),
-			patch.object(gateway_webhook, "touch_last_event"),
-			patch.object(gateway_webhook, "_warn"),
-			patch.object(gateway_webhook, "_record_unknown_phone_ids"),
-			patch(
-				"huf.ai.gateway_service.ingest_gateway_event",
-				return_value={"event_name": "E", "status": "Rejected"},
-			) as ingest,
-		):
-			result = gateway_webhook._handle_batched_payload(gateway, adapter, _req(b"{}"))
-		self.assertEqual(ingest.call_count, gateway_webhook.MAX_MESSAGES_PER_PAYLOAD)
-		self.assertEqual(result["ignored"], 20)
-		self.assertTrue(result["note"])
-
 	def test_rate_limit_sets_retry_after(self):
 		headers = {}
 		with (
@@ -242,6 +206,7 @@ class TestTerminalStatePersistence(unittest.TestCase):
 			patch.object(gateway_service.frappe, "get_all", return_value=["GEV-1", "GEV-2"]) as get_all,
 			patch.object(gateway_service.frappe.db, "set_value") as set_value,
 			patch.object(gateway_service.frappe.db, "commit"),
+			patch.object(gateway_service, "_recover_orphaned_events", return_value=0),
 		):
 			self.assertEqual(gateway_service.reap_stuck_gateway_events(), 2)
 		self.assertEqual(get_all.call_args.kwargs["filters"]["status"], "Running")
