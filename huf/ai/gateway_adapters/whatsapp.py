@@ -692,7 +692,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 	def _payload(request: GatewayInboundRequest) -> dict[str, Any] | None:
 		try:
 			payload = json.loads(request.body.decode("utf-8"))
-		except (UnicodeDecodeError, json.JSONDecodeError):
+		except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
 			return None
 		return payload if isinstance(payload, dict) else None
 

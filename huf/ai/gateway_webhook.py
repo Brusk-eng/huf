@@ -243,7 +243,22 @@ def _ingest_rate_gate() -> None:
 	"""
 
 
-_ingest_rate_gate = rate_limit(key="gateway_name", limit=100, seconds=60)(_ingest_rate_gate)
+_ingest_rate_limited = rate_limit(key="gateway_name", limit=100, seconds=60)(_ingest_rate_gate)
+_RATE_LIMIT_WINDOW_SECONDS = 60
+MAX_BODY_BYTES = 3 * 1024 * 1024  # Meta's webhook payload cap
+MAX_MESSAGES_PER_PAYLOAD = 100
+
+
+def _ingest_rate_gate() -> None:
+	"""Apply the ingest rate limit; a rejection also tells the sender when to retry."""
+	try:
+		_ingest_rate_limited()
+	except frappe.RateLimitExceededError:
+		try:
+			frappe.local.response_headers["Retry-After"] = str(_RATE_LIMIT_WINDOW_SECONDS)
+		except Exception:
+			pass
+		raise
 
 
 def _transient_error_types() -> tuple[type, ...]:
@@ -527,7 +542,15 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		frappe.local.response.http_status_code = 400
 		return {"success": False, "error": "Invalid payload"}
 
-	if parsed.messages:
+	messages = list(parsed.messages)
+	over_cap = max(len(messages) - MAX_MESSAGES_PER_PAYLOAD, 0)
+	if over_cap:
+		messages = messages[:MAX_MESSAGES_PER_PAYLOAD]
+		_warn(
+			f"WhatsApp gateway {gateway.name}: payload carried {len(parsed.messages)} messages; "
+			f"processed the first {MAX_MESSAGES_PER_PAYLOAD}, ignored {over_cap}"
+		)
+	if messages:
 		_ingest_rate_gate()
 
 	ingested = duplicates = 0
@@ -535,7 +558,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 	first_transient = None
 	failed = 0
 	account_name = None
-	for event in parsed.messages:
+	for event in messages:
 		try:
 			result = ingest_gateway_event(
 				gateway.name,
@@ -546,6 +569,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			)
 		except Exception as exc:
 			frappe.log_error(frappe.get_traceback(), "WhatsApp gateway ingest failed")
+			_set_gateway_error(gateway.name, f"Inbound message {event.provider_event_id} not stored: {exc}")
 			if isinstance(exc, _TRANSIENT_ERRORS):
 				first_transient = first_transient or exc  # re-raised below so Meta retries (deduped)
 			else:
@@ -606,13 +630,14 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		raise first_transient
 	return {
 		"success": True,
-		"messages": len(parsed.messages),
+		"messages": len(messages),
 		"ingested": ingested,
 		"duplicates": duplicates,
 		"statuses": len(parsed.statuses),
 		"template_updates": len(parsed.template_updates),
 		"forwarded": forwarded,
-		"ignored": parsed.ignored,
+		"ignored": parsed.ignored + over_cap,
+		"note": (f"Only the first {MAX_MESSAGES_PER_PAYLOAD} messages were processed" if over_cap else ""),
 		"failed": failed,
 		"results": results,
 	}
@@ -651,8 +676,16 @@ def handle_gateway_webhook() -> dict | None:
 		frappe.local.response.http_status_code = 403
 		return {"success": False, "error": "Gateway is disabled"}
 
+	declared = getattr(frappe.request, "content_length", None) if frappe.request is not None else None
+	if declared is not None and declared > MAX_BODY_BYTES:
+		frappe.local.response.http_status_code = 413
+		return {"success": False, "error": "Payload too large"}
+
 	adapter = get_gateway_adapter(gateway)
 	request = _inbound_request()
+	if len(getattr(request, "body", b"") or b"") > MAX_BODY_BYTES:
+		frappe.local.response.http_status_code = 413
+		return {"success": False, "error": "Payload too large"}
 	if request.method == "GET" and hasattr(adapter, "verify_url"):
 		_ingest_rate_gate()
 		try:

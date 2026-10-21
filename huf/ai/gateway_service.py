@@ -1211,6 +1211,39 @@ def resolve_gateway_route(gateway_name: str, context: dict[str, Any]) -> dict:
     return {"status": "Unrouted", "reason": "No enabled route matches this message"}
 
 
+# Small Text is a 64 KB column; cap well below it (utf8mb4 is up to 4 bytes/char) so an oversized
+# body never makes the Gateway Event insert fail. The full text is not kept.
+MESSAGE_TEXT_MAX_CHARS = 16000
+_CONVERSATION_RACE_ATTEMPTS = 4
+_CONVERSATION_RACE_BACKOFF = 0.2
+
+
+def _cap_message_text(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= MESSAGE_TEXT_MAX_CHARS:
+        return text
+    return text[:MESSAGE_TEXT_MAX_CHARS] + "\n[truncated]"
+
+
+def _conversation_race_errors() -> tuple[type, ...]:
+    return (frappe.QueryDeadlockError, frappe.TimestampMismatchError)
+
+
+def _run_agent_with_retry(run_fn, **kwargs):
+    """Run the agent, retrying with backoff when concurrent same-sender events collide on the
+    conversation row (deadlock / timestamp mismatch) instead of terminally failing the event."""
+    import time
+
+    for attempt in range(1, _CONVERSATION_RACE_ATTEMPTS + 1):
+        try:
+            return run_fn(**kwargs)
+        except _conversation_race_errors():
+            if attempt >= _CONVERSATION_RACE_ATTEMPTS:
+                raise
+            frappe.db.rollback()
+            time.sleep(_CONVERSATION_RACE_BACKOFF * attempt)
+
+
 def ingest_gateway_event(
     gateway_name: str,
     provider_event_id: str,
@@ -1245,13 +1278,14 @@ def ingest_gateway_event(
             "sender_id": str(context.get("sender_id") or ""),
             "conversation_id": str(context.get("conversation_id") or ""),
             "thread_id": str(context.get("thread_id") or ""),
-            "message_text": context.get("message_text") or "",
+            "message_text": _cap_message_text(context.get("message_text")),
             "raw_payload": _redact_payload(raw_payload or {}),
         }
     )
     try:
         event.insert(ignore_permissions=True)
-    except frappe.DuplicateEntryError:
+    except (frappe.DuplicateEntryError, frappe.UniqueValidationError):
+        # A unique-index race surfaces as UniqueValidationError (DuplicateEntryError's sibling).
         existing = frappe.db.get_value("Gateway Event", {"idempotency_key": key}, "name")
         return {"duplicate": True, "event_name": existing}
 
@@ -1378,7 +1412,8 @@ def process_gateway_event(event_name: str) -> dict:
 
             fallback_note = ""
             _maybe_mark_read_typing(event, gateway)
-            result = run_agent_sync(
+            result = _run_agent_with_retry(
+                run_agent_sync,
                 agent_name=event.target_agent,
                 prompt=prompt,
                 channel_id=f"gateway:{gateway.name}",
