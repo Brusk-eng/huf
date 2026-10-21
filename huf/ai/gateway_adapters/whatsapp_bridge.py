@@ -273,6 +273,32 @@ def is_reaction_payload(raw_payload: Any) -> bool:
 	return isinstance(message, dict) and message.get("type") == "reaction"
 
 
+def payload_kind(raw_payload: Any) -> str:
+	"""``kind`` of a stored Gateway Event ``raw_payload`` ("" when absent or unparsable)."""
+	if isinstance(raw_payload, (str, bytes)):
+		try:
+			raw_payload = json.loads(raw_payload)
+		except ValueError:
+			return ""
+	return str(raw_payload.get("kind") or "") if isinstance(raw_payload, dict) else ""
+
+
+def fallback_template_info(account_name: str, template_name: str, language: str | None = None) -> dict[str, Any] | None:
+	"""``{"status", "variables"}`` of the account's template row (None when unknown or unavailable).
+
+	``variables`` are the body variable tokens in order (``"1"`` or a NAMED token).
+	"""
+	if not is_available():
+		return None
+	try:
+		row = _template_row(_template_docname(account_name, template_name, language))
+	except Exception:
+		return None
+	if not row or (row.get("whatsapp_account") or "") != (account_name or ""):
+		return None
+	return {"status": str(row.get("status") or ""), "variables": wt.variables(row.get("template") or "")}
+
+
 def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> dict[str, Any]:
 	"""Compute the 24h customer-service window from signed Gateway Events only (A3).
 
@@ -298,10 +324,14 @@ def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> 
 		order_by="received_at desc",
 		limit_page_length=50,
 	)
+	from huf.ai.gateway_adapters import whatsapp_inbound as inbound
+
 	last = None
 	for row in rows or []:
 		if not row.get("verified_sender"):
 			continue
+		if payload_kind(row.get("raw_payload")) in inbound.RECORD_ONLY_KINDS:
+			continue  # recorded edit/revoke/system/unknown events never open or extend the window
 		if is_reaction_payload(row.get("raw_payload")):
 			continue  # a reaction never opens or extends the customer-service window
 		ts = row.get("received_at")

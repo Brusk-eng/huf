@@ -61,6 +61,19 @@ class WhatsAppWindowClosed(frappe.ValidationError):
 	"""The 24h customer-service window is closed and no template fallback is configured."""
 
 
+class WhatsAppFallbackUnavailable(WhatsAppWindowClosed):
+	"""The window is closed and the configured fallback template cannot be sent.
+
+	Subclasses :class:`WhatsAppWindowClosed` so every caller that already treats a closed window as
+	"not sendable right now" handles it. ``code`` is the stable machine-readable reason (a refusal is a
+	raised typed error, not a delivery: ``OutboundDelivery`` requires a real provider message id).
+	"""
+
+	def __init__(self, message: str, code: str):
+		super().__init__(message)
+		self.code = code
+
+
 class WhatsAppSendError(ValueError):
 	"""A Graph send failed. ``classification`` is the :func:`whatsapp_errors.classify` result."""
 
@@ -173,6 +186,15 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		self._account = str(ctx.get("whatsapp_account") or "").strip()
 		self._fallback_template = str(ctx.get("fallback_template") or "").strip()
 		self._fallback_language = str(ctx.get("fallback_template_language") or "").strip() or DEFAULT_TEMPLATE_LANGUAGE
+		raw_params = ctx.get("fallback_template_params")
+		self._fallback_params: Any = (
+			{str(k): str(v) for k, v in raw_params.items()}
+			if isinstance(raw_params, dict)
+			else [str(p) for p in raw_params]
+			if isinstance(raw_params, (list, tuple))
+			else None
+		)
+		self._contact_name = str(ctx.get("contact_name") or "").strip()
 		self._preview_url = str(ctx.get("preview_url") or "").strip().lower() == "on"
 
 	# ------------------------------------------------------------------ ingress
@@ -396,18 +418,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			state = bridge.window_state(self._gateway_name, reply.conversation_id)
 			if not state.get("open"):
 				if self._fallback_template:
-					language = self._fallback_language
-					if self._bridge_mode():
-						language = (
-							bridge.template_language(self._account, self._fallback_template, language) or language
-						)
-					delivery = self.send_template(
-						reply.conversation_id, self._fallback_template, language, [], trusted=True
-					)
-					return OutboundDelivery(
-						provider_message_id=delivery.provider_message_id,
-						provider_response={**dict(delivery.provider_response), "fallback_template_sent": True},
-					)
+					return self._window_fallback(reply.conversation_id)
 				raise WhatsAppWindowClosed(
 					f"WhatsApp 24-hour customer-service window is closed for {reply.conversation_id}. "
 					"Free-form replies are not allowed; set a Fallback template on the Gateway "
@@ -466,10 +477,32 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		)
 
 	def _window_fallback(self, to: str) -> OutboundDelivery:
+		"""Send the Gateway's fallback template with its body parameters.
+
+		Refuses (raises :class:`WhatsAppFallbackUnavailable`) when the template is known and not APPROVED.
+		Parameters: the Gateway's ``fallback_template_params`` when configured, else one default value per
+		body variable (the contact name, or "there").
+		"""
 		language = self._fallback_language
+		params: Any = self._fallback_params
 		if self._bridge_mode():
 			language = bridge.template_language(self._account, self._fallback_template, language) or language
-		delivery = self.send_template(to, self._fallback_template, language, [], trusted=True)
+			info = bridge.fallback_template_info(self._account, self._fallback_template, language)
+			if isinstance(info, dict):
+				status = str(info.get("status") or "").upper()
+				if status and status != "APPROVED":
+					raise WhatsAppFallbackUnavailable(
+						f"WhatsApp fallback template '{self._fallback_template}' is {status.lower()}, not approved; "
+						"the 24-hour window is closed so the reply was not sent.",
+						"fallback_template_not_approved",
+					)
+				if params is None:
+					variables = info.get("variables") or []
+					default = self._contact_name or "there"
+					params = {str(v): default for v in variables} if any(not str(v).isdigit() for v in variables) else [
+						default for _ in variables
+					]
+		delivery = self.send_template(to, self._fallback_template, language, params or [], trusted=True)
 		return OutboundDelivery(
 			provider_message_id=delivery.provider_message_id,
 			provider_response={**dict(delivery.provider_response), "fallback_template_sent": True},
@@ -517,12 +550,15 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		kind = (att.kind if att.kind in wt.MEDIA_KINDS else "") or _kind_from_mime(att.mime_type)
 		# Audio and stickers cannot carry a caption (Meta rejects it): send the text separately.
 		is_audio = kind in ("audio", "sticker")
+		# Caption is formatted and <= 1024 chars; the remaining text follows as text parts (never lost).
+		caption_parts = [] if is_audio else wf.split_body(wf.to_whatsapp(reply.text), wt.MAX_CAPTION)
+		caption = caption_parts[0] if caption_parts else None
 		delivery = self._deliver_media(
 			reply.conversation_id,
 			kind,
 			link=att.url,
 			media_id=None if att.url else att.file_id,
-			caption=None if is_audio else reply.text,
+			caption=caption,
 			filename=att.filename or None,
 			reply_to=reply.reply_to_provider_message_id,
 			trusted=True,
@@ -533,6 +569,18 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 			return OutboundDelivery(
 				provider_message_id=text.provider_message_id,
 				provider_response={**dict(text.provider_response), "media_message_id": delivery.provider_message_id},
+			)
+		if len(caption_parts) > 1:
+			try:
+				rest = self._send_parts(reply.conversation_id, caption_parts[1:], None)
+			except WhatsAppPartsError as exc:
+				raise exc.cause from exc
+			return OutboundDelivery(
+				provider_message_id=delivery.provider_message_id,
+				provider_response={
+					**dict(delivery.provider_response),
+					"message_ids": [delivery.provider_message_id, *rest.provider_response.get("message_ids", [])],
+				},
 			)
 		return delivery
 
