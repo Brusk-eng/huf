@@ -259,4 +259,42 @@ describe('edit mode', () => {
     expect(screen.getByText('Category rejected by WhatsApp.')).toBeInTheDocument();
     expect(onDone).not.toHaveBeenCalled();
   });
+
+  it('shows Meta\'s title, message, subcode and trace for a refused edit, and that no edit was used', async () => {
+    edit.mockResolvedValue({
+      success: false,
+      error: 'edit_failed',
+      message: "Meta won't let this template be edited right now (it may still be in review, or was just approved/reclassified). Try again later or create a new version. Meta says: The status for this message template can't be changed. You can only delete or add templates.",
+      user_title: "Message template status can't be changed",
+      user_msg: "The status for this message template can't be changed. You can only delete or add templates.",
+      graph_code: 100,
+      subcode: 2388039,
+      kind: 'edit_blocked',
+      trace_id: 'AbC123xyz',
+      quota_used: false,
+    });
+    setup({ initial, docName: 'tpl-1', editsLeft: 2 });
+    next();
+    fireEvent.click(screen.getByRole('button', { name: 'Submit changes to WhatsApp' }));
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByText("Message template status can't be changed")).toBeInTheDocument();
+    expect(within(alert).getByText(/You can only delete or add templates/)).toBeInTheDocument();
+    expect(within(alert).getByText(/Meta won't let this template be edited right now/)).toBeInTheDocument();
+    expect(within(alert).getByText(/subcode 2388039/)).toBeInTheDocument();
+    expect(within(alert).getByText(/trace AbC123xyz/)).toBeInTheDocument();
+    expect(within(alert).getByText(/did not use up an edit/)).toBeInTheDocument();
+    expect(onDone).not.toHaveBeenCalled();
+  });
+});
+
+describe('URL button example', () => {
+  it('expands a bare value into the full link when the field loses focus', () => {
+    const d = addButton({ ...emptyDraft('UTILITY'), name: 'order_update', language: 'en_US', body: 'Your order shipped' }, 'URL', 'u1');
+    setup({ initial: { ...d, buttons: [{ ...d.buttons[0], text: 'Track', url: 'https://example.com/track/{{1}}' }] }, docName: 'tpl-1', editsLeft: 2 });
+    const input = screen.getByLabelText('Example link') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'abc123' } });
+    fireEvent.blur(input);
+    expect(input.value).toBe('https://example.com/track/abc123');
+    expect(screen.getByText(/Expanded to the full link: https:\/\/example.com\/track\/abc123/)).toBeInTheDocument();
+  });
 });

@@ -25,7 +25,7 @@ import re
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import frappe
 import frappe.utils
@@ -469,6 +469,69 @@ def graph_error_message(resp: Any) -> str:
 			parts.append(str(details))
 		return _redact(" ".join(p for p in parts if p).strip())
 	return _redact(getattr(resp, "text", "") or f"HTTP {getattr(resp, 'status_code', '?')}")
+
+
+EDIT_BLOCKED_SUBCODE = 2388039
+EDIT_BLOCKED_TEXT = (
+	"Meta won't let this template be edited right now (it may still be in review, or was just "
+	"approved/reclassified). Try again later or create a new version."
+)
+EDIT_BLOCKED_SECONDS = 3600
+
+
+def graph_error_detail(resp_or_exc: Any) -> dict[str, Any]:
+	"""Structured, always-redacted detail of a Graph error response or exception. Never raises.
+
+	Keys: ``message`` (best human text: Meta user message, else Meta message plus the classifier advice), ``user_title``,
+	``user_msg`` (Meta's ``error_user_title`` / ``error_user_msg``), ``code``, ``subcode``, ``kind``
+	(from ``whatsapp_errors.classify``), ``retryable``, ``operator_text``, ``trace_id`` (``fbtrace_id``).
+	Subcode 2388039 ("status can't be changed") gets a plain explanation as ``operator_text``/``message``.
+	"""
+	from huf.ai.gateway_adapters import whatsapp_errors as we
+
+	def clean(value: Any) -> str:
+		return _redact(we.redact(value)).strip() if value not in (None, "") else ""
+
+	try:
+		cls = we.classify(resp_or_exc)
+		try:
+			inner = we._unpack(resp_or_exc)[1] or {}
+		except Exception:
+			inner = {}
+		title, user_msg = clean(inner.get("error_user_title")), clean(inner.get("error_user_msg"))
+		trace = clean(inner.get("fbtrace_id"))
+		code, subcode, kind = cls.get("code"), cls.get("subcode"), cls.get("kind") or "unknown"
+		operator_text = clean(cls.get("operator_text"))
+		meta_message = clean(cls.get("message")) or clean(resp_or_exc)
+		blocked = subcode == EDIT_BLOCKED_SUBCODE or "can't be changed" in f"{title} {user_msg}".lower()
+		if blocked:
+			kind, operator_text = "edit_blocked", EDIT_BLOCKED_TEXT
+			message = EDIT_BLOCKED_TEXT + (f" Meta says: {user_msg}" if user_msg else "")
+		else:
+			# Meta's own user message first; else its message, plus the classifier's advice when that adds something
+			message = user_msg or meta_message or operator_text
+			if not user_msg and operator_text and kind not in ("unknown", "param") and operator_text not in message:
+				message = f"{message} {operator_text}".strip()
+		return {
+			"message": message, "user_title": title, "user_msg": user_msg, "code": code, "subcode": subcode,
+			"kind": kind, "retryable": bool(cls.get("retryable")) and not blocked, "operator_text": operator_text,
+			"trace_id": trace,
+		}
+	except Exception:
+		return {
+			"message": clean(resp_or_exc) or "Meta request failed.", "user_title": "", "user_msg": "", "code": None,
+			"subcode": None, "kind": "unknown", "retryable": False, "operator_text": "", "trace_id": "",
+		}
+
+
+def _graph_err(error: str, resp_or_exc: Any, **extra: Any) -> dict[str, Any]:
+	"""Error dict carrying the structured Graph detail (the numeric Graph code is ``graph_code``)."""
+	d = graph_error_detail(resp_or_exc)
+	return _err(
+		error, message=d["message"], user_title=d["user_title"], user_msg=d["user_msg"],
+		graph_code=d["code"], subcode=d["subcode"], kind=d["kind"], retryable=d["retryable"],
+		operator_text=d["operator_text"], trace_id=d["trace_id"], **extra,
+	)
 
 
 def _graph_post_message(acct: dict[str, Any], data: dict[str, Any], http_post: Callable[..., Any] | None = None) -> str:
@@ -1078,6 +1141,51 @@ def _sample_problem(code: str, message: str) -> BridgeError:
 	return BridgeError(wt.validation_error([wt._e("sample", code, message)]))
 
 
+_SAMPLE_MAX_REDIRECTS = 3
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+def _check_sample_hop(url: str) -> None:
+	"""SSRF guard for ONE hop of a sample fetch: https only, no private/loopback/link-local host."""
+	parsed = urlparse(url)
+	host = parsed.hostname or ""
+	if host and parsed.netloc.lower() in _test_hosts():  # tests only (see _test_hosts)
+		return
+	if parsed.scheme != "https":
+		raise _sample_problem("sample_not_https", "The sample URL must be https (a redirect to a non-https URL was refused).")
+	if not host or _is_private_host(host):
+		raise _sample_problem("sample_private_host", "The sample URL (or a redirect target) points to a private or local address.")
+
+
+def _fetch_sample(sample: str, get: Callable[..., Any]) -> Any:
+	"""GET a sample URL following up to 3 redirects by hand, checking EVERY hop (SSRF). Returns the 2xx response."""
+	url, seen = sample, []
+	for hop in range(_SAMPLE_MAX_REDIRECTS + 1):
+		_check_sample_hop(url)
+		seen.append(url)
+		try:
+			resp = get(url, timeout=30, allow_redirects=False)
+		except Exception as exc:
+			raise _sample_problem("sample_unreachable", f"Could not fetch the sample: {_redact(exc)}") from exc
+		code = getattr(resp, "status_code", 200)
+		if isinstance(code, int) and code in _REDIRECT_STATUSES:
+			headers = getattr(resp, "headers", None) or {}
+			location = str(headers.get("Location") or headers.get("location") or "").strip()
+			if not location:
+				raise _sample_problem("sample_unreachable", f"The sample URL answered HTTP {code} without a Location header.")
+			url = urljoin(url, location)
+			if url in seen:
+				raise _sample_problem("sample_unreachable", "The sample URL redirects in a loop.")
+			continue
+		if not isinstance(code, int) or code >= 300:
+			via = f" after {hop} redirect{'s' if hop != 1 else ''}" if hop else ""
+			raise _sample_problem("sample_unreachable", f"The sample URL answered HTTP {code}{via}.")
+		return resp
+	raise _sample_problem(
+		"sample_unreachable", f"The sample URL redirected more than {_SAMPLE_MAX_REDIRECTS} times (last status HTTP {code})."
+	)
+
+
 def _read_header_sample(
 	sample: str, header_type: str, http_get: Callable[..., Any] | None = None
 ) -> tuple[bytes, str]:
@@ -1085,14 +1193,7 @@ def _read_header_sample(
 	import mimetypes
 
 	if wt.is_http_url(sample):
-		get = http_get or _default_get
-		try:
-			resp = get(sample, timeout=30, allow_redirects=False)
-		except Exception as exc:
-			raise _sample_problem("sample_unreachable", f"Could not fetch the sample: {_redact(exc)}") from exc
-		code = getattr(resp, "status_code", 200)
-		if not isinstance(code, int) or code >= 300:
-			raise _sample_problem("sample_unreachable", f"The sample URL answered HTTP {code}.")
+		resp = _fetch_sample(sample, http_get or _default_get)
 		content = resp.content
 		mime = str((getattr(resp, "headers", None) or {}).get("Content-Type") or "").split(";")[0].strip().lower()
 		mime = mime or (mimetypes.guess_type(urlparse(sample).path)[0] or "")
@@ -1147,7 +1248,7 @@ def upload_header_handle(
 		)
 		code = getattr(opened, "status_code", 200)
 		if isinstance(code, int) and code >= 400:
-			raise BridgeError(_err("upload_failed", message=graph_error_message(opened)))
+			raise BridgeError(_graph_err("upload_failed", opened))
 		session = str(opened.json()["id"])
 		sent = http_post(
 			f"{base}/{session}",
@@ -1157,12 +1258,12 @@ def upload_header_handle(
 		)
 		code = getattr(sent, "status_code", 200)
 		if isinstance(code, int) and code >= 400:
-			raise BridgeError(_err("upload_failed", message=graph_error_message(sent)))
+			raise BridgeError(_graph_err("upload_failed", sent))
 		return str(sent.json()["h"])
 	except BridgeError:
 		raise
 	except Exception as exc:
-		raise BridgeError(_err("upload_failed", message=_redact(exc))) from exc
+		raise BridgeError(_graph_err("upload_failed", exc)) from exc
 
 
 def _guard():
@@ -1344,10 +1445,10 @@ def create_template(
 			timeout=_HTTP_TIMEOUT,
 		)
 	except Exception as exc:
-		return _err("create_failed", message=_redact(exc))
+		return _graph_err("create_failed", exc)
 	code = getattr(resp, "status_code", 200)
 	if isinstance(code, int) and code >= 400:
-		return _err("create_failed", message=graph_error_message(resp))
+		return _graph_err("create_failed", resp)
 	try:
 		data = resp.json() or {}
 		tid = str(data["id"])
@@ -1359,6 +1460,8 @@ def create_template(
 	doc.id, doc.status, doc.category = tid, status, meta_category
 	doc.flags.huf_mirror = True
 	result: dict[str, Any] = {"success": True, "name": docname, "status": status, "id": tid}
+	if spec.get("notes"):
+		result["notes"] = spec["notes"]
 	try:
 		with _guard().huf_template_write():
 			_insert_mirror_row(doc)
@@ -1400,7 +1503,7 @@ def delete_template(name: str) -> dict[str, Any]:
 	except frappe.PermissionError:
 		raise
 	except Exception as exc:
-		return _err("delete_failed", message=_redact(exc))
+		return _graph_err("delete_failed", exc)
 	return {"success": True, "name": name}
 
 
@@ -1675,7 +1778,7 @@ def sync_templates(account_name: str, http_get: Callable[..., Any] | None = None
 			url = next_url
 			params = None
 	except Exception as exc:
-		return _err("sync_failed", message=_redact(exc))
+		return _graph_err("sync_failed", exc)
 	return {
 		"success": True,
 		"seen": seen,
@@ -1971,7 +2074,7 @@ def _record_state_from_meta(account_name: str, tpl: dict[str, Any], docname: str
 	)
 
 
-def edit_quota(status: str, edit_log: Any, now: datetime | None = None) -> dict[str, Any]:
+def edit_quota(status: str, edit_log: Any, now: datetime | None = None, blocked_until: str | None = None) -> dict[str, Any]:
 	"""Meta edit rules for a template in ``status`` given its ``edit_log`` (ISO timestamps).
 
 	APPROVED: at most 1 edit per 24h and 10 per 30 days; REJECTED/PAUSED: unlimited;
@@ -1985,7 +2088,7 @@ def edit_quota(status: str, edit_log: Any, now: datetime | None = None) -> dict[
 	last_30d = [t for t in times if now - t < timedelta(days=30)]
 	out: dict[str, Any] = {
 		"editable": False, "editable_reason": "", "editable_message": "", "edits_left": 0,
-		"edits_30d": len(last_30d), "next_edit_at": None,
+		"edits_30d": len(last_30d), "next_edit_at": None, "edit_blocked_until": None,
 	}
 	if status in ("REJECTED", "PAUSED"):
 		out.update(editable=True, edits_left=None)
@@ -2004,7 +2107,32 @@ def edit_quota(status: str, edit_log: Any, now: datetime | None = None) -> dict[
 	else:
 		out.update(editable_reason="status_not_editable",
 			editable_message=f"A template with status {status or 'UNKNOWN'} cannot be edited (only APPROVED, REJECTED or PAUSED).")
+	until = _parse_ts(blocked_until) if blocked_until else None
+	if out["editable"] and until and until > now:
+		out.update(editable=False, editable_reason="edit_blocked", edit_blocked_until=until.isoformat(),
+			editable_message=EDIT_BLOCKED_TEXT)
 	return out
+
+
+def _edit_blocked_key(account: Any, name: str) -> str:
+	return f"huf_wa_edit_blocked:{account or ''}:{name}"
+
+
+def _edit_blocked_until(account: Any, name: str) -> str | None:
+	try:
+		return frappe.cache().get_value(_edit_blocked_key(account, name)) or None
+	except Exception:
+		return None
+
+
+def _mark_edit_blocked(account: Any, name: str) -> str | None:
+	"""Remember for an hour that Meta refused an edit (2388039) so the UI does not invite retry loops."""
+	until = (_utcnow() + timedelta(seconds=EDIT_BLOCKED_SECONDS)).isoformat()
+	try:
+		frappe.cache().set_value(_edit_blocked_key(account, name), until, expires_in_sec=EDIT_BLOCKED_SECONDS)
+	except Exception:
+		return None
+	return until
 
 
 def _button_dicts(docname: str) -> list[dict[str, Any]]:
@@ -2193,7 +2321,7 @@ def get_template(name: str) -> dict[str, Any]:
 	row = frappe.db.get_value("WhatsApp Templates", name, _ROW_FIELDS, as_dict=True)
 	state = _state_row(name, row.get("whatsapp_account")) or {}
 	status = (state.get("status") or row.get("status") or "").upper()
-	quota = edit_quota(status, state.get("edit_log"))
+	quota = edit_quota(status, state.get("edit_log"), blocked_until=_edit_blocked_until(row.get("whatsapp_account"), name))
 	extra = _get_extra(row.get("whatsapp_account"), name) or {}
 	meta_components = extra.get("components_json") or _loads(state.get("components"), []) or []
 	derived = _meta_extras(meta_components, extra.get("parameter_format"), _extra_ttl(extra))
@@ -2216,8 +2344,9 @@ def get_template(name: str) -> dict[str, Any]:
 	business_id = ""
 	if row.get("whatsapp_account"):
 		business_id = frappe.db.get_value("WhatsApp Account", row["whatsapp_account"], "business_id") or ""
-	category = row.get("category")
+	category = str(state.get("category") or row.get("category") or "").upper() or row.get("category")  # Meta's current one
 	correct = state.get("correct_category") or ""
+	previous = str(state.get("previous_category") or "").upper()
 	return {
 		"success": True,
 		"name": name,
@@ -2225,7 +2354,8 @@ def get_template(name: str) -> dict[str, Any]:
 		"template_name": row.get("actual_name") or row.get("template_name"),
 		"language_code": row.get("language_code"),
 		"category": category,
-		"previous_category": state.get("previous_category") or "",
+		"previous_category": previous,
+		"category_changed_by_meta": bool(previous and previous != category),
 		"correct_category": correct,
 		"category_change_pending": bool(correct and correct != category),
 		"status": status,
@@ -2286,10 +2416,12 @@ def edit_template(
 		return _err("no_template_id", message="This template has no Meta ID yet; sync templates first.")
 	state = _state_row(name, row.get("whatsapp_account")) or {}
 	status = (state.get("status") or row.get("status") or "").upper()
-	quota = edit_quota(status, state.get("edit_log"))
+	blocked_until = _edit_blocked_until(row.get("whatsapp_account"), name)
+	quota = edit_quota(status, state.get("edit_log"), blocked_until=blocked_until)
 	if not quota["editable"]:
 		return _err(quota["editable_reason"], message=quota["editable_message"], status=status,
-			next_edit_at=quota["next_edit_at"], edits_left=quota["edits_left"])
+			next_edit_at=quota["next_edit_at"], edits_left=quota["edits_left"],
+			edit_blocked_until=quota["edit_blocked_until"])
 	acct = resolve_account(row.get("whatsapp_account"))
 	if not acct or acct.get("error"):
 		return _err("no_account")
@@ -2329,7 +2461,9 @@ def edit_template(
 			merged.pop("sample", None)  # the old header's sample belongs to the old media kind
 		if str(payload["header_type"]).upper() != "TEXT" and "header" not in payload:
 			merged.pop("header", None)
-	category = str(payload.get("category") or row.get("category") or "").upper()
+	# Meta may have reclassified the template (UTILITY -> MARKETING): compare with ITS category, not a stale one
+	current_category = str(state.get("category") or row.get("category") or "").upper()
+	category = str(payload.get("category") or current_category).upper()
 	if category not in TEMPLATE_CATEGORIES:
 		return _err("invalid_category", message="Category must be one of " + ", ".join(TEMPLATE_CATEGORIES))
 	merged["category"] = category
@@ -2414,7 +2548,7 @@ def edit_template(
 			and (spec["named_samples"] or []) == list(extra.get("named_samples") or spec["named_samples"] or [])
 		)
 	if (
-		category == str(row.get("category") or "").upper()
+		category == current_category
 		and (spec["ttl_seconds"] or None) == (current_ttl or None)
 		and content_same
 		and not (spec["header_type"] in wt.MEDIA_HEADER_TYPES and not media_unchanged and not reuploaded)
@@ -2422,7 +2556,7 @@ def edit_template(
 		return _err("no_changes", message="Nothing changed; no edit was sent to Meta.")
 
 	body: dict[str, Any] = {"components": components}
-	if category != str(row.get("category") or "").upper():
+	if category != current_category:  # only an operator's change; never re-send the stored category
 		body["category"] = category
 	if spec["ttl_seconds"] is not None:
 		body["message_send_ttl_seconds"] = spec["ttl_seconds"]
@@ -2434,10 +2568,13 @@ def edit_template(
 			timeout=_HTTP_TIMEOUT,
 		)
 	except Exception as exc:
-		return _err("edit_failed", message=_redact(exc))
+		return _graph_err("edit_failed", exc)
 	code = getattr(resp, "status_code", 200)
 	if isinstance(code, int) and code >= 400:
-		return _err("edit_failed", message=graph_error_message(resp))
+		failed = _graph_err("edit_failed", resp, status=status, quota_used=False)
+		if failed.get("kind") == "edit_blocked":
+			failed["edit_blocked_until"] = _mark_edit_blocked(row.get("whatsapp_account"), name)
+		return failed
 
 	changes: dict[str, Any] = {
 		"template": spec["body"],
@@ -2481,11 +2618,16 @@ def edit_template(
 	edit_key = state_key(row.get("whatsapp_account"), name)
 	if frappe.db.exists(STATE_DOCTYPE, edit_key):
 		frappe.db.set_value(STATE_DOCTYPE, edit_key, "edit_log", json.dumps(log))
+	try:
+		frappe.cache().delete_value(_edit_blocked_key(row.get("whatsapp_account"), name))
+	except Exception:
+		pass
 	return {
 		"success": True,
 		"name": name,
 		"status": "PENDING",
 		"edits_left": edit_quota("APPROVED", log)["edits_left"] if status == "APPROVED" else None,
+		**({"notes": spec["notes"]} if spec.get("notes") else {}),
 	}
 
 
@@ -2617,6 +2759,9 @@ def approve_draft(name: str, note: str = "") -> dict[str, Any]:
 	}
 	if not out["success"]:
 		out["error"] = result.get("error")
+		for key in ("user_title", "user_msg", "graph_code", "subcode", "kind", "retryable", "operator_text", "trace_id", "message"):
+			if result.get(key) not in (None, ""):
+				out[key] = result[key]
 	return out
 
 

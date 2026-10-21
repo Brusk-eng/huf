@@ -387,8 +387,22 @@ def validate_template_spec(payload: dict[str, Any]) -> tuple[dict[str, Any], lis
 		"buttons": buttons,
 		"category": category if category in CATEGORIES else "",
 		"ttl_seconds": ttl if ttl is not None and not isinstance(ttl, bool) and isinstance(ttl, int) else None,
+		"notes": [b["note"] for b in buttons if b.get("note")],
 	}
 	return spec, errors
+
+
+def expand_url_example(prefix: str, example: str) -> tuple[str, str]:
+	"""Full example URL for a dynamic URL button, plus a note when a bare suffix was expanded.
+
+	``prefix`` is the button URL up to the variable. An example that is already absolute (has a
+	scheme) is returned unchanged; a bare value (``abc123``) is appended to the prefix.
+	"""
+	example = (example or "").strip()
+	if not example or "://" in example or not prefix:
+		return example, ""
+	full = prefix + (example[1:] if prefix.endswith("/") and example.startswith("/") else example)
+	return full, f"The example '{example}' was expanded to the full URL {full} (Meta needs the whole URL)."
 
 
 def _validate_buttons(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -440,8 +454,15 @@ def _validate_buttons(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, st
 					errors.append(_e(f"{field}.example", "too_long", f"The example URL is longer than {URL_MAX} characters."))
 				elif "," in example:
 					errors.append(_e(f"{field}.example", "sample_comma", "The example URL cannot contain commas."))
-				elif not example.startswith(prefix) or example == prefix:
-					errors.append(_e(f"{field}.example", "invalid_example", "The example must start with the URL prefix and add a value for the variable."))
+				else:
+					full, note = expand_url_example(prefix, example)
+					if note:
+						btn["note"] = f"{field}: {note}"
+					btn["example"] = full
+					if not full.startswith("https://"):
+						errors.append(_e(f"{field}.example", "invalid_example", "The example must be an absolute https URL, e.g. " + prefix + "abc123."))
+					elif not full.startswith(prefix) or full == prefix:
+						errors.append(_e(f"{field}.example", "invalid_example", f"The example must start with {prefix} and add a value for the variable."))
 			btn["dynamic"] = dynamic
 		elif btype == "PHONE_NUMBER":
 			phone = _PHONE_CLEAN_RE.sub("", str(item.get("phone_number") or item.get("phone") or ""))

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { Loader2 } from 'lucide-react';
-import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import {
@@ -18,6 +17,7 @@ import { toCreatePayload, toEditPayload } from '../template/payload';
 import { stepOfField, validateDraft } from '../template/rules';
 import { addButton, moveButton, switchVariableType } from './draftActions';
 import { backendFieldErrors, mapBackendErrors } from './backendErrors';
+import { FailureAlert, failureDetail, type FailureDetail } from './FailureAlert';
 import { StepLayout, type FieldApi } from './fields';
 import { draftToPreviewModel } from './previewModel';
 import { ReviewStep } from './ReviewStep';
@@ -69,6 +69,7 @@ export function TemplateWizard(props: TemplateWizardProps) {
   const [attempts, setAttempts] = useState(0);
   const [serverFields, setServerFields] = useState<Record<string, string>>({});
   const [notices, setNotices] = useState<string[]>([]);
+  const [detail, setDetail] = useState<FailureDetail | undefined>();
   const [busy, setBusy] = useState(false);
   const regionRef = useRef<HTMLDivElement>(null);
   const firstRender = useRef(true);
@@ -129,6 +130,7 @@ export function TemplateWizard(props: TemplateWizardProps) {
     }
     setBusy(true);
     setNotices([]);
+    setDetail(undefined);
     const res =
       isEdit && docName
         ? await editTemplate(docName, toEditPayload(draft))
@@ -149,9 +151,13 @@ export function TemplateWizard(props: TemplateWizardProps) {
 
   const showFailure = (res: WhatsAppError & { field?: string }) => {
     const errs = backendFieldErrors(res);
+    const meta = failureDetail(res);
+    setDetail(meta);
     if (errs.length === 0) {
       setServerFields({});
-      setNotices([errorText(res)]);
+      // Meta's own title/message are shown by the panel; keep the plain explanation unless it repeats them.
+      const text = errorText(res).replace(/ Meta says: [\s\S]*$/, meta?.message ? '' : '$&');
+      setNotices(text && text !== meta?.message ? [text] : []);
       return;
     }
     const mapped = mapBackendErrors(errs, draft);
@@ -183,11 +189,7 @@ export function TemplateWizard(props: TemplateWizardProps) {
         <Stepper current={step} lockedBefore={isEdit ? WRITE : 0} onGo={setStep} />
 
         <div ref={regionRef} role="region" aria-label={STEP_TITLES[step]} tabIndex={-1} className="space-y-6 outline-none">
-          {notices.length > 0 && (
-            <Alert variant="destructive" role="alert">
-              <AlertDescription>{notices.join(' ')}</AlertDescription>
-            </Alert>
-          )}
+          {(notices.length > 0 || detail) && <FailureAlert notices={notices} detail={detail} />}
 
           {step === 0 && <TypeStep kindId={kindId} onSelect={selectKind} />}
 

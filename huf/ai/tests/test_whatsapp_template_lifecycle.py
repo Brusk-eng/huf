@@ -668,6 +668,69 @@ class TestEditTemplate(LifecycleCase):
 		self.assertEqual(frappe.db.get_value("WhatsApp Templates", docname, "template"), "Hi {{1}}, order shipped")
 		self.assertEqual((self._state(docname).status, self._state(docname).edit_log in (None, "", "[]")), ("APPROVED", True))
 
+	def test_unchanged_category_is_never_sent_and_meta_reclassification_is_synced(self):
+		docname = self._created("lc_cat")
+		self.server.reclassify("lc_cat", "MARKETING")
+		synced = mgmt.sync_templates(account=self.account.name)
+		self.assertTrue(synced["success"], synced)
+		detail = mgmt.get_template(name=docname)
+		self.assertEqual((detail["category"], detail["previous_category"], detail["category_changed_by_meta"]), ("MARKETING", "UTILITY", True))
+		self.assertEqual(frappe.db.get_value("WhatsApp Templates", docname, "category"), "MARKETING")
+		# the form echoes the category it loaded: it is Meta's current one, so it must not be re-sent
+		out = mgmt.edit_template(name=docname, payload={"body": "Hello {{1}}, edited", "category": "MARKETING"})
+		self.assertTrue(out["success"], out)
+		(post,) = self._edit_posts()
+		self.assertEqual(set(json.loads(post["raw"])), {"components"})
+		self.assertEqual(self.server.violations, [])
+
+	def test_stale_local_category_is_not_resent_after_a_category_webhook(self):
+		docname = self._created("lc_stale")
+		self.server.reclassify("lc_stale", "MARKETING")
+		tid = self.server.templates[("lc_stale", "en_US")]["id"]
+		bridge.record_template_state(docname=docname, template_id=tid, account=self.account.name, category="MARKETING", previous_category="UTILITY", event="CATEGORY_UPDATE")
+		self.assertEqual(mgmt.get_template(name=docname)["category"], "MARKETING")
+		out = mgmt.edit_template(name=docname, payload={"body": "Hello {{1}}, edited"})  # row still says UTILITY
+		self.assertTrue(out["success"], out)
+		self.assertEqual(set(json.loads(self._edit_posts()[0]["raw"])), {"components"})
+
+	def test_changed_category_is_sent(self):
+		docname = self._created("lc_chg")
+		out = mgmt.edit_template(name=docname, payload={"category": "MARKETING"})
+		self.assertTrue(out["success"], out)
+		sent = json.loads(self._edit_posts()[0]["raw"])
+		self.assertEqual(sent["category"], "MARKETING")
+		self.assertEqual(mgmt.get_template(name=docname)["category"], "MARKETING")
+
+	def test_meta_refusal_2388039_is_structured_and_sets_a_retry_hint(self):
+		docname = self._created("lc_blk")
+		self.addCleanup(lambda: frappe.cache().delete_value(bridge._edit_blocked_key(self.account.name, docname)))
+		self.server.refuse_edits("lc_blk")
+		out = mgmt.edit_template(name=docname, payload={"footer": "Thanks"})
+		self.assertEqual((out["success"], out["error"]), (False, "edit_failed"))
+		self.server.violations.clear()  # the refusal is the point of this test
+		self.assertEqual((out["graph_code"], out["subcode"], out["kind"], out["retryable"]), (100, 2388039, "edit_blocked", False))
+		self.assertEqual(out["user_title"], "Message template status can't be changed")
+		self.assertIn("You can only delete or add templates", out["user_msg"])
+		self.assertTrue(out["trace_id"])
+		self.assertTrue(out["message"].startswith("Meta won't let this template be edited right now"))
+		self.assertTrue(out["edit_blocked_until"])
+		# quota consumed only on success
+		self.assertEqual(json.loads(self._state(docname).edit_log or "[]"), [])
+		detail = mgmt.get_template(name=docname)
+		self.assertEqual((detail["editable"], detail["editable_reason"], detail["edits_left"]), (False, "edit_blocked", 10))
+		self.assertTrue(detail["edit_blocked_until"])
+		# no retry loop: the next attempt is refused locally
+		again = mgmt.edit_template(name=docname, payload={"footer": "Again"})
+		self.assertEqual(again["error"], "edit_blocked")
+		self.assertEqual(len(self._edit_posts()), 1)
+
+	def test_expired_hint_allows_editing_again(self):
+		docname = self._created("lc_exp")
+		self.addCleanup(lambda: frappe.cache().delete_value(bridge._edit_blocked_key(self.account.name, docname)))
+		past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+		frappe.cache().set_value(bridge._edit_blocked_key(self.account.name, docname), past, expires_in_sec=60)
+		self.assertTrue(mgmt.get_template(name=docname)["editable"])
+
 	def test_edit_requires_write_permission(self):
 		docname = self._created("lc_perm")
 		frappe.set_user(fgc.EXEC_USER)

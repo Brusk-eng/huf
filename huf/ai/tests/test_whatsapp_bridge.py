@@ -783,6 +783,158 @@ class TestBridge(unittest.TestCase):
 			self.assertEqual({c["phone"]: c["count"] for c in convs}, {"111": 2, "222": 1})
 			self.assertEqual(convs[0]["profile_name"], "Al")
 
+LIVE_2388039 = {
+	"error": {
+		"message": "Invalid parameter",
+		"type": "OAuthException",
+		"code": 100,
+		"error_subcode": 2388039,
+		"is_transient": False,
+		"error_user_title": "Message template status can't be changed",
+		"error_user_msg": "The status for this message template can't be changed. You can only delete or add templates.",
+		"fbtrace_id": "AbC123xyz",
+	}
+}
+
+
+class ErrResp:
+	def __init__(self, body, status=400):
+		self._b, self.status_code, self.text = body, status, json.dumps(body)
+
+	def json(self):
+		return self._b
+
+
+class TestGraphErrorDetail(unittest.TestCase):
+	def test_live_edit_refusal(self):
+		d = wb.graph_error_detail(ErrResp(LIVE_2388039))
+		self.assertEqual((d["code"], d["subcode"], d["trace_id"]), (100, 2388039, "AbC123xyz"))
+		self.assertEqual(d["user_title"], "Message template status can't be changed")
+		self.assertIn("can't be changed", d["user_msg"])
+		self.assertEqual(d["kind"], "edit_blocked")
+		self.assertFalse(d["retryable"])
+		self.assertTrue(d["message"].startswith("Meta won't let this template be edited right now"))
+		self.assertIn("create a new version", d["message"])
+
+	def test_user_msg_wins_then_meta_message_with_advice(self):
+		body = {"error": {"code": 100, "message": "Invalid parameter", "error_user_msg": "Body text is too long.", "error_subcode": 2388001}}
+		self.assertEqual(wb.graph_error_detail(ErrResp(body))["message"], "Body text is too long.")
+		d = wb.graph_error_detail(ErrResp({"error": {"code": 100, "message": "Invalid parameter"}}))
+		self.assertIn("Invalid parameter", d["message"])
+		d = wb.graph_error_detail(ErrResp({"error": {"code": 4, "message": "rate", "fbtrace_id": "T1"}}, 429))
+		self.assertEqual((d["kind"], d["retryable"], d["trace_id"]), ("rate_limited", True, "T1"))
+		self.assertIn("Retry with backoff", d["message"])
+
+	def test_always_redacted(self):
+		body = {"error": {"code": 100, "message": "bad", "error_user_msg": "See https://x.example/a?access_token=EAAB1234567890abcd and Bearer EAAB1234567890abcd"}}
+		d = wb.graph_error_detail(ErrResp(body))
+		blob = json.dumps(d)
+		self.assertNotIn("EAAB1234567890abcd", blob)
+		self.assertNotIn("x.example", blob)
+
+	def test_exception_without_body_keeps_its_text(self):
+		d = wb.graph_error_detail(RuntimeError("disk exploded token=SECRET123"))
+		self.assertIn("disk exploded", d["message"])
+		self.assertNotIn("SECRET123", d["message"])
+		self.assertIsNone(d["code"])
+
+	def test_http_error_exception_uses_the_response_body(self):
+		import requests
+
+		exc = requests.HTTPError("400 Client Error", response=SimpleNamespace(status_code=400, json=lambda: LIVE_2388039, text="", headers={}))
+		self.assertEqual(wb.graph_error_detail(exc)["subcode"], 2388039)
+
+	def test_error_dict_carries_all_fields(self):
+		out = wb._graph_err("edit_failed", ErrResp(LIVE_2388039))
+		for key in ("message", "user_title", "user_msg", "graph_code", "subcode", "kind", "retryable", "operator_text", "trace_id"):
+			self.assertIn(key, out)
+		self.assertEqual((out["success"], out["error"], out["graph_code"]), (False, "edit_failed", 100))
+
+
+class HopResp:
+	def __init__(self, status=200, location=None, content=b"\x89PNGdata", ctype="image/png"):
+		self.status_code, self.content = status, content
+		self.headers = {"Content-Type": ctype, **({"Location": location} if location else {})}
+
+
+class TestSampleRedirects(unittest.TestCase):
+	def _get(self, routes, calls):
+		def get(url, **kw):
+			calls.append((url, kw.get("allow_redirects")))
+			return routes[url]
+		return get
+
+	def _read(self, routes, start="https://a.example/s.png", header="IMAGE"):
+		calls = []
+		with patch.object(wb, "_is_private_host", side_effect=lambda h: h.startswith(("10.", "127.", "internal"))):
+			try:
+				return wb._read_header_sample(start, header, self._get(routes, calls)), calls
+			except wb.BridgeError as exc:
+				return exc.payload, calls
+
+	def test_no_redirect(self):
+		(content, mime), calls = self._read({"https://a.example/s.png": HopResp()})
+		self.assertEqual((mime, calls), ("image/png", [("https://a.example/s.png", False)]))
+
+	def test_one_and_three_hops_are_followed(self):
+		routes = {"https://a.example/s.png": HopResp(302, "https://b.example/x"), "https://b.example/x": HopResp()}
+		(_, mime), calls = self._read(routes)
+		self.assertEqual((mime, len(calls)), ("image/png", 2))
+		routes = {
+			"https://a.example/s.png": HopResp(301, "/p1"), "https://a.example/p1": HopResp(307, "https://b.example/p2"),
+			"https://b.example/p2": HopResp(308, "https://c.example/p3"), "https://c.example/p3": HopResp(),
+		}
+		(_, mime), calls = self._read(routes)
+		self.assertEqual((mime, len(calls)), ("image/png", 4))
+
+	def test_four_hops_are_refused(self):
+		routes = {f"https://a.example/{i}": HopResp(302, f"https://a.example/{i + 1}") for i in range(5)}
+		routes["https://a.example/4"] = HopResp()
+		out, calls = self._read(routes, start="https://a.example/0")
+		self.assertEqual(out["errors"][0]["code"], "sample_unreachable")
+		self.assertIn("more than 3 times", out["errors"][0]["message"])
+		self.assertEqual(len(calls), 4)
+
+	def test_redirect_to_private_ip_is_refused_before_fetching_it(self):
+		out, calls = self._read({"https://a.example/s.png": HopResp(302, "https://10.0.0.1/secret"), "https://10.0.0.1/secret": HopResp()})
+		self.assertEqual(out["errors"][0]["code"], "sample_private_host")
+		self.assertEqual(len(calls), 1)
+
+	def test_redirect_to_http_is_refused(self):
+		out, calls = self._read({"https://a.example/s.png": HopResp(302, "http://b.example/x"), "http://b.example/x": HopResp()})
+		self.assertEqual(out["errors"][0]["code"], "sample_not_https")
+		self.assertEqual(len(calls), 1)
+
+	def test_first_hop_http_or_private_is_refused(self):
+		out, calls = self._read({}, start="http://a.example/s.png")
+		self.assertEqual((out["errors"][0]["code"], calls), ("sample_not_https", []))
+		out, calls = self._read({}, start="https://internal.corp/s.png")
+		self.assertEqual((out["errors"][0]["code"], calls), ("sample_private_host", []))
+
+	def test_redirect_loop(self):
+		routes = {"https://a.example/s.png": HopResp(302, "https://b.example/x"), "https://b.example/x": HopResp(302, "https://a.example/s.png")}
+		out, calls = self._read(routes)
+		self.assertEqual(out["errors"][0]["code"], "sample_unreachable")
+		self.assertIn("loop", out["errors"][0]["message"])
+
+	def test_final_status_is_in_the_message(self):
+		routes = {"https://a.example/s.png": HopResp(302, "https://b.example/x"), "https://b.example/x": HopResp(404)}
+		out, _ = self._read(routes)
+		self.assertEqual(out["errors"][0]["code"], "sample_unreachable")
+		self.assertIn("HTTP 404 after 1 redirect", out["errors"][0]["message"])
+
+	def test_redirect_without_location(self):
+		out, _ = self._read({"https://a.example/s.png": HopResp(302)})
+		self.assertIn("without a Location", out["errors"][0]["message"])
+
+	def test_final_content_type_and_size_still_apply(self):
+		routes = {"https://a.example/s.png": HopResp(302, "https://b.example/x"), "https://b.example/x": HopResp(ctype="text/html")}
+		out, _ = self._read(routes)
+		self.assertEqual(out["errors"][0]["code"], "invalid_sample")
+		routes = {"https://a.example/s.png": HopResp(content=b"x" * (5 * 1024 * 1024 + 1))}
+		out, _ = self._read(routes)
+		self.assertEqual(out["errors"][0]["code"], "sample_too_large")
+
 
 if __name__ == "__main__":
 	unittest.main()

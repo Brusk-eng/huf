@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { ChevronDown, ChevronUp, Copy, ExternalLink, Phone, Plus, Reply, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
@@ -7,6 +8,7 @@ import { WIZARD_LIMITS } from '../template/rules';
 import { buttonBlocker } from './draftActions';
 import { controlA11y } from './controlA11y';
 import { Field, Section, type FieldApi } from './fields';
+import { expandUrlExample } from './urlExample';
 
 const KINDS: { type: WizardButtonType; label: string; Icon: typeof Reply }[] = [
   { type: 'QUICK_REPLY', label: 'Custom reply', Icon: Reply },
@@ -25,19 +27,32 @@ interface Props {
 }
 
 function ButtonFields({ button, index, field, onChange }: { button: WizardButton; index: number; field: FieldApi; onChange: Props['onChange'] }) {
+  const [expandedNote, setExpandedNote] = useState('');
   const text = (name: keyof WizardButton, label: string, placeholder: string, hint?: string, max?: number) => {
     const path = `buttons.${index}.${name}`;
     const id = `tpl-btn-${index}-${name}`;
     const error = field.error(path);
     const value = String(button[name]);
     return (
-      <Field id={id} label={label} error={error} hint={hint} counter={max ? { length: value.length, max } : undefined}>
+      <Field id={id} label={label} error={error} hint={name === 'urlExample' && expandedNote ? expandedNote : hint} counter={max ? { length: value.length, max } : undefined}>
         <Input
           {...controlA11y(id, error)}
           value={value}
           placeholder={placeholder}
-          onChange={(e) => onChange(index, { [name]: e.target.value })}
-          onBlur={() => field.touch(path)}
+          onChange={(e) => {
+            if (name === 'urlExample') setExpandedNote('');
+            onChange(index, { [name]: e.target.value });
+          }}
+          onBlur={() => {
+            if (name === 'urlExample') {
+              const full = expandUrlExample(button.url, value);
+              if (full !== value) {
+                onChange(index, { urlExample: full });
+                setExpandedNote(`Expanded to the full link: ${full}`);
+              }
+            }
+            field.touch(path);
+          }}
         />
       </Field>
     );

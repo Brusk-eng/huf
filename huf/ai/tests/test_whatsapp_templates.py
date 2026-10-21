@@ -3,6 +3,7 @@
 
 """Pure unit tests for rich-template validation and outbound payload builders."""
 
+import json
 import unittest
 
 from huf.ai.gateway_adapters import whatsapp_templates as wt
@@ -74,6 +75,47 @@ class TestTemplateSpec(unittest.TestCase):
 		self.assertIn(("buttons[0].url", "bad_placeholder"), _codes(wt.validate_template_spec(self.base(buttons=bad_url))[1]))
 		no_example = [{"type": "URL", "text": "u", "url": "https://x.example/{{1}}"}]
 		self.assertIn(("buttons[0].example", "required"), _codes(wt.validate_template_spec(self.base(buttons=no_example))[1]))
+
+
+class TestUrlButtonExample(unittest.TestCase):
+	def spec(self, url, example=None):
+		btn = {"type": "URL", "text": "Track", "url": url}
+		if example is not None:
+			btn["example"] = example
+		return wt.validate_template_spec({"template": "Hi {{1}}, welcome", "sample_values": "Ann", "buttons": [btn]})
+
+	def test_bare_suffix_is_expanded_with_a_note(self):
+		spec, errors = self.spec("https://example.com/track/{{1}}", "abc123")
+		self.assertEqual(errors, [])
+		self.assertEqual(spec["buttons"][0]["example"], "https://example.com/track/abc123")
+		self.assertEqual(len(spec["notes"]), 1)
+		self.assertIn("https://example.com/track/abc123", spec["notes"][0])
+		meta = wt.build_meta_payload(spec)["components"]
+		self.assertIn("https://example.com/track/abc123", json.dumps(meta))
+
+	def test_leading_slash_suffix_does_not_double_the_slash(self):
+		spec, errors = self.spec("https://example.com/track/{{1}}", "/abc")
+		self.assertEqual((errors, spec["buttons"][0]["example"]), ([], "https://example.com/track/abc"))
+
+	def test_absolute_example_passes_unchanged_without_note(self):
+		spec, errors = self.spec("https://example.com/track/{{1}}", "https://example.com/track/9")
+		self.assertEqual((errors, spec["notes"]), ([], []))
+
+	def test_invalid_examples(self):
+		for url, example in [
+			("https://example.com/track/{{1}}", "https://other.example/track/9"),  # wrong prefix
+			("https://example.com/track/{{1}}", "http://example.com/track/9"),  # not https
+			("https://example.com/track/{{1}}", "https://example.com/track/"),  # no value
+			("https://example.com/track/{{1}}", "a,b"),  # comma
+		]:
+			_, errors = self.spec(url, example)
+			self.assertTrue({c for f, c in _codes(errors) if f == "buttons[0].example"} & {"invalid_example", "sample_comma"}, (url, example, errors))
+		self.assertIn(("buttons[0].example", "required"), _codes(self.spec("https://example.com/track/{{1}}")[1]))
+
+	def test_url_needs_exactly_one_trailing_variable(self):
+		for url in ("https://example.com/{{1}}/x", "https://example.com/{{1}}{{2}}", "https://example.com/{{}}"):
+			_, errors = self.spec(url, "abc")
+			self.assertIn(("buttons[0].url", "bad_placeholder"), _codes(errors), url)
 
 
 class TestSendBuilders(unittest.TestCase):

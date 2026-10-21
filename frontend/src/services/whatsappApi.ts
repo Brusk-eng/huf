@@ -25,6 +25,19 @@ export interface WhatsAppError {
   /** Draft approval: the status the draft ended in and why Meta refused it. */
   status?: string;
   submit_error?: string;
+  /** Structured Meta (Graph) error detail; `message` is already the best human text. */
+  user_title?: string;
+  user_msg?: string;
+  /** Numeric Graph error code (the string `error` is Huf's own code). */
+  graph_code?: number | null;
+  subcode?: number | null;
+  kind?: string;
+  retryable?: boolean;
+  operator_text?: string;
+  trace_id?: string;
+  /** Edit refused: the quota was not used. */
+  quota_used?: boolean;
+  edit_blocked_until?: string | null;
 }
 export type WhatsAppResult<T> = ({ success: true } & T) | WhatsAppError;
 
@@ -91,6 +104,9 @@ export interface TemplateDetail {
   category: string;
   correct_category: string;
   category_change_pending: boolean;
+  /** Category Meta had before it reclassified the template, when it did. */
+  previous_category?: string;
+  category_changed_by_meta?: boolean;
   status: string;
   whatsapp_account?: string;
   components: {
@@ -120,6 +136,7 @@ export interface TemplateDetail {
   editable_message?: string;
   edits_left?: number | null;
   next_edit_at?: string | null;
+  edit_blocked_until?: string | null;
   manager_url: string;
   business_id: string;
 }
@@ -266,6 +283,7 @@ export function errorText(res: WhatsAppError): string {
     edit_limit_24h: 'Approved templates can be edited once every 24 hours.',
     edit_limit_30d: 'The edit limit for the last 30 days has been used up.',
     status_not_editable: 'This template cannot be edited in its current state.',
+    edit_blocked: "Meta won't let this template be edited right now. Try again later or create a new version.",
     no_template_id: 'This template is not linked to WhatsApp yet. Sync templates first.',
   };
   if (res.errors?.length) return res.errors.map((e) => e.message).join(' ');

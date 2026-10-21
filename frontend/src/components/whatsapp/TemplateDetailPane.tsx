@@ -96,6 +96,12 @@ export function TemplateDetailPane({ row, refreshKey, onSend, onEdit, onDelete, 
                 Last updated {timeAgo(updated)} ({format(updatedDate, 'd MMM yyyy, HH:mm')})
               </p>
             )}
+            {detail.previous_category && detail.previous_category !== detail.category && (
+              <p role="note" className="text-steel">
+                Meta changed this template&apos;s category from {categoryLabel(detail.previous_category)} to {categoryLabel(detail.category)}.
+                Edits keep the category Meta assigned unless you change it.
+              </p>
+            )}
             {detail.category_change_pending && (
               <p className="text-steel">
                 WhatsApp plans to move this template from {categoryLabel(detail.category).toLowerCase()} to{' '}
@@ -161,6 +167,7 @@ export function TemplateDetailPane({ row, refreshKey, onSend, onEdit, onDelete, 
               <p className="text-[11px] text-steel">
                 {detail.editable_message}
                 {nextEdit ? ` You can edit again after ${format(nextEdit, 'd MMM, HH:mm')}.` : ''}
+                {detail.edit_blocked_until && !nextEdit ? ` Try again after ${format(new Date(detail.edit_blocked_until), 'd MMM, HH:mm')}.` : ''}
               </p>
             )}
             {detail.status === 'APPROVED' && typeof detail.edits_left === 'number' && (

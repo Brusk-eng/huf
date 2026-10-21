@@ -236,6 +236,21 @@ class FakeGraphServer:
 					return t
 		raise KeyError(template_id)
 
+	def refuse_edits(self, name: str, language: str | None = None, only_with_category: bool = False) -> dict:
+		"""Make Meta refuse edits of this template with the live 2388039 ("status can't be changed") error."""
+		t = self.templates[self._tpl_key(name, language)]
+		t["edit_refusal"] = "category" if only_with_category else "always"
+		return t
+
+	def reclassify(self, name: str, new_category: str, language: str | None = None) -> dict:
+		"""Meta reclassifies a template: new category, ``previous_category`` reported by the listing."""
+		t = self.templates[self._tpl_key(name, language)]
+		t["previous_category"], t["category"] = t["category"], new_category
+		return t
+
+	def _tpl_key(self, name: str, language: str | None) -> tuple[str, str]:
+		return next(k for k in self.templates if k[0] == name and (language is None or k[1] == language))
+
 	def set_template_status(self, name: str, status: str, language: str | None = None) -> dict:
 		"""Move a template through review; returns the matching webhook payload."""
 		with self.lock:
@@ -787,6 +802,10 @@ class FakeGraphServer:
 			t = self.template_by_id(template_id)
 			_need(t["status"] in self.EDITABLE_STATUSES, f"Message template with status {t['status']} cannot be edited",
 				code=100, subcode=2388025, title="Template Not Editable")
+			refusal = t.get("edit_refusal")
+			_need(not (refusal == "always" or (refusal == "category" and body.get("category"))),
+				"The status for this message template can't be changed. You can only delete or add templates.",
+				code=100, subcode=2388039, title="Message template status can't be changed")
 			now = time.time()
 			if t["status"] == "APPROVED":
 				times = t["edit_times"]

@@ -49,4 +49,32 @@ describe('TemplateDetailPane', () => {
     expect(screen.getAllByText(/Hi Ana, your order shipped/).length).toBeGreaterThan(0);
     expect(screen.getByText(/4 edits left/)).toBeInTheDocument();
   });
+
+  const pane = () => (
+    <TemplateDetailPane
+      row={{ name: 'tpl-1' } as never} refreshKey={0} onSend={vi.fn()} onEdit={vi.fn()} onDelete={vi.fn()} onUnavailable={vi.fn()}
+    />
+  );
+
+  it("says when Meta changed the template's category", async () => {
+    vi.mocked(getTemplate).mockResolvedValue({ ...detail, category: 'MARKETING', previous_category: 'UTILITY', category_changed_by_meta: true } as never);
+    render(pane());
+    expect(await screen.findByText(/Meta changed this template's category from utility to marketing/i)).toBeInTheDocument();
+  });
+
+  it('shows no category notice when nothing was reclassified', async () => {
+    render(pane());
+    await screen.findByText('Name variables');
+    expect(screen.queryByText(/Meta changed this template/)).toBeNull();
+  });
+
+  it('explains an edit block from a refused edit', async () => {
+    vi.mocked(getTemplate).mockResolvedValue({
+      ...detail, editable: false, editable_reason: 'edit_blocked', editable_message: "Meta won't let this template be edited right now.",
+      edit_blocked_until: '2030-01-01T10:00:00+00:00',
+    } as never);
+    render(pane());
+    expect(await screen.findByText(/won't let this template be edited right now/)).toBeInTheDocument();
+    expect(screen.getByText(/Try again after/)).toBeInTheDocument();
+  });
 });
