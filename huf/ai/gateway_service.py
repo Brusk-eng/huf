@@ -1903,6 +1903,12 @@ def _recover_retrying_reply(row: dict) -> None:
     )
 
 
+def _flow_run_is_waiting(event_name: str) -> bool:
+    """A Flow-routed event whose run is parked on a human is not stuck."""
+    run = frappe.db.get_value("Gateway Event", event_name, "flow_run")
+    return bool(run) and frappe.db.get_value("Flow Run", run, "status") in ("Waiting User", "Waiting Approval")
+
+
 def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int = 50) -> int:
     """Recover or fail events a worker lost: stuck Running, orphaned Queued/Received, dead 'retrying' replies."""
     try:
@@ -1918,6 +1924,7 @@ def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int =
             pluck="name",
             limit_page_length=limit,
         )
+        stuck = [name for name in stuck if not _flow_run_is_waiting(name)]
         for name in stuck:
             fail_event_after_budget(
                 name,
@@ -2068,6 +2075,102 @@ def _persist_terminal_state(event_name: str, result: Any) -> None:
     )
     frappe.db.set_value("Gateway Event", event_name, expected)
     _commit_unless_testing()
+
+
+def _flow_trigger_payload(event, gateway, attachments: list[str]) -> dict:
+    """What a Flow gets for a gateway message: who, where, what, media and reply context."""
+    try:
+        raw = event.raw_payload
+        raw = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        raw = None
+    message = raw.get("message") if isinstance(raw, dict) and isinstance(raw.get("message"), dict) else {}
+    msg_type = str(message.get("type") or "text")
+    context = message.get("context") if isinstance(message.get("context"), dict) else {}
+    interactive = message.get("interactive") if isinstance(message.get("interactive"), dict) else {}
+    reply = interactive.get("button_reply") or interactive.get("list_reply") or {}
+    sender = str(event.sender_id or "")
+    return {
+        "gateway_event": event.name,
+        "gateway": gateway.name,
+        "provider": gateway.provider,
+        "sender_id": sender,
+        "wa_id": sender if gateway.provider == "WhatsApp" else "",
+        "conversation_id": event.conversation_id,
+        "thread_id": event.thread_id,
+        "message_id": event.provider_event_id,
+        "message": event.message_text,
+        "text": event.message_text,
+        "message_type": msg_type,
+        "attachments": list(attachments),
+        "reply_to_message_id": str(context.get("id") or "") or None,
+        "interactive_reply": {"id": reply.get("id"), "title": reply.get("title")} if reply else None,
+    }
+
+
+def _start_flow_for_event(event, gateway) -> dict:
+    """Start the routed Flow once per event; a re-queued or redelivered event never starts a second run."""
+    from huf.ai.flow_engine import create_flow_run
+
+    existing = frappe.db.get_value("Gateway Event", event.name, "flow_run", for_update=True)
+    if existing:
+        event.db_set("status", "Running")
+        return {"event_name": event.name, "status": "Running", "flow_run_id": existing}
+    attachments = _save_whatsapp_media(event, gateway) if gateway.provider == "WhatsApp" else []
+    # Route authorisation already happened (enabled gateway, flow bound by an admin), so the run is
+    # created on the gateway's behalf: the execution user needs no Huf User role.
+    flow_run = create_flow_run(
+        flow_id=event.target_flow,
+        payload=_flow_trigger_payload(event, gateway, attachments),
+        trigger_type="Gateway",
+        ignore_permissions=True,
+    )
+    event.db_set({"flow_run": flow_run.name, "status": "Running"})
+    frappe.enqueue(
+        "huf.ai.flow_engine.run_flow",
+        queue="default",
+        timeout=300,
+        flow_run_name=flow_run.name,
+        enqueue_after_commit=True,
+    )
+    return {"event_name": event.name, "status": "Running", "flow_run_id": flow_run.name}
+
+
+def finish_flow_event(flow_run_name: str, status: str, reply_text: str | None = None, error: str = "") -> None:
+    """Flow Run -> Gateway Event: deliver the Flow's reply through the normal pipeline and sync the status.
+
+    Idempotent: a terminal event is left alone, so a replayed completion never sends twice. Never raises.
+    """
+    try:
+        event_name = frappe.db.get_value("Gateway Event", {"flow_run": flow_run_name}, "name")
+        if not event_name:
+            return
+        event = frappe.get_doc("Gateway Event", event_name)
+        if event.status in ("Succeeded", "Failed", "Rejected"):
+            return
+        if status != "Success":
+            event.db_set({"status": "Failed", "error_message": _redact_error_text(error or "Flow failed")[-500:]})
+            return
+        gateway = frappe.get_doc("Gateway", event.gateway)
+        text = (reply_text or "").strip()
+        if not text or _is_no_reply(text):
+            event.db_set({"status": "Succeeded", **({"reply_status": "suppressed"} if text else {})})
+            return
+        if gateway.provider == "WhatsApp":
+            _send_whatsapp_reply(event, gateway, None, text)
+            return
+        from huf.ai.gateway_webhook import send_gateway_reply
+
+        delivery = send_gateway_reply(gateway, event, text)
+        _record_reply_sent(event, delivery.provider_message_id)
+        event.db_set("status", "Succeeded")
+    except Exception:
+        message = _redact_error_text(frappe.get_traceback())
+        frappe.log_error(message, "Gateway flow completion failed")
+        try:
+            frappe.db.set_value("Gateway Event", {"flow_run": flow_run_name}, {"status": "Failed", "error_message": message[-500:]})
+        except Exception:
+            pass
 
 
 def process_gateway_event(event_name: str) -> dict:
@@ -2225,25 +2328,7 @@ def _process_gateway_event(event_name: str) -> dict:
             }
 
         if event.target_type == "Flow":
-            from huf.ai.flow_engine import create_flow_run
-
-            # TODO(#473-followup): Gateway trigger_type is temporarily removed from
-            # Flow Run options because the feature is incomplete. Re-enable once
-            # docs/gateway-todo.md checklist is done and adapters are live.
-            flow_run = create_flow_run(
-                flow_id=event.target_flow,
-                payload={"gateway_event": event.name, "message": event.message_text},
-                trigger_type="Gateway",
-            )
-            event.db_set({"flow_run": flow_run.name, "status": "Queued"})
-            frappe.enqueue(
-                "huf.ai.flow_engine.run_flow",
-                queue="default",
-                timeout=300,
-                flow_run_name=flow_run.name,
-                enqueue_after_commit=True,
-            )
-            return {"event_name": event.name, "status": "Queued", "flow_run_id": flow_run.name}
+            return _start_flow_for_event(event, gateway)
 
         raise frappe.ValidationError(_("Gateway event has no valid target."))
     except ConversationBusy as busy:
