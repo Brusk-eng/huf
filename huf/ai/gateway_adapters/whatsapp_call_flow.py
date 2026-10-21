@@ -425,7 +425,7 @@ async def _play_loop(
 
 
 # --------------------------------------------------------------------- worker entry (Frappe)
-def answer_inbound_call_job(gateway_name: str, call_id: str, caller: str, sdp_offer: str) -> dict[str, Any]:
+def answer_inbound_call_job(gateway_name: str, call_id: str, caller: str, sdp_key: str) -> dict[str, Any]:
 	"""RQ job: answer an admitted call with the Gateway's greeting. Experimental, flag-gated.
 
 	Production should run this in the ``huf-media`` sidecar (design section 4); the job form is the
@@ -434,13 +434,37 @@ def answer_inbound_call_job(gateway_name: str, call_id: str, caller: str, sdp_of
 	import frappe
 
 	from huf.ai.gateway_adapters import whatsapp_bridge as bridge
-	from huf.ai.gateway_adapters.whatsapp_calls import CallsGraph, WhatsAppCall, update_call_event
+	from huf.ai.gateway_adapters.whatsapp_calls import (
+		CallsGraph,
+		WhatsAppCall,
+		call_admission,
+		take_sdp_offer,
+		update_call_event,
+	)
 
 	gateway = frappe.get_doc("Gateway", gateway_name)
 	stub = WhatsAppCall(call_id=call_id, event="status", direction="USER_INITIATED", caller=caller)
 	if not getattr(gateway, "calling_enabled", 0):
 		return {"call_id": call_id, "skipped": "calling disabled"}
 	graph = CallsGraph(bridge.resolve_account(bridge.gateway_account(gateway_name)) or {})
+	admitted, reason = call_admission(gateway, caller)
+	if not admitted:
+		# the caller may have been revoked/blocked between the webhook and this job
+		try:
+			graph.reject(call_id)
+		except Exception:
+			pass
+		update_call_event(gateway_name, stub, "Rejected", reason, {"action": "reject", "reason": reason})
+		return {"call_id": call_id, "outcome": "rejected", "reason": reason}
+	sdp_offer = take_sdp_offer(sdp_key)
+	if not sdp_offer:
+		try:
+			graph.reject(call_id)
+		except Exception:
+			pass
+		update_call_event(gateway_name, stub, "Failed", "Call offer expired before it could be answered",
+			{"action": "reject", "reason": "offer_expired"})
+		return {"call_id": call_id, "outcome": "offer_expired"}
 	backend = get_media_backend()
 	if not backend["available"]:
 		try:
@@ -453,7 +477,10 @@ def answer_inbound_call_job(gateway_name: str, call_id: str, caller: str, sdp_of
 
 	clips = load_gateway_clips(gateway)
 	if not clips:
-		graph.reject(call_id)
+		try:
+			graph.reject(call_id)
+		except Exception:
+			pass
 		update_call_event(gateway_name, stub, "Failed", "No greeting audio configured", {"action": "reject", "reason": "no_greeting"})
 		return {"call_id": call_id, "outcome": "no_greeting"}
 	trace = asyncio.run(

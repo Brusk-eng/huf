@@ -327,6 +327,39 @@ def _event_key(gateway_name: str, call_id: str) -> str:
 	return _idempotency_key(gateway_name, f"call:{call_id}")
 
 
+SDP_CACHE_TTL_SECONDS = 120
+
+
+def _sdp_cache_key(gateway_name: str, call_id: str) -> str:
+	return f"huf_call_sdp:{gateway_name}:{call_id}"
+
+
+def stash_sdp_offer(gateway_name: str, call_id: str, sdp: str) -> str:
+	"""Keep the SDP offer in a short-TTL cache entry so it never lands in RQ job kwargs."""
+	import frappe
+
+	key = _sdp_cache_key(gateway_name, call_id)
+	frappe.cache.set_value(key, sdp or "", expires_in_sec=SDP_CACHE_TTL_SECONDS)
+	return key
+
+
+def take_sdp_offer(key: str) -> str:
+	import frappe
+
+	sdp = frappe.cache.get_value(key) or ""
+	try:
+		frappe.cache.delete_value(key)
+	except Exception:
+		pass
+	return sdp
+
+
+def _call_event_exists(gateway_name: str, call_id: str) -> bool:
+	import frappe
+
+	return bool(frappe.db.get_value("Gateway Event", {"idempotency_key": _event_key(gateway_name, call_id)}, "name"))
+
+
 def record_call_event(gateway_name: str, call: WhatsAppCall, status: str, note: str = "", actions: list | None = None) -> dict:
 	"""Create (or fetch) the Gateway Event for a call. Metadata only: never SDP or audio."""
 	import frappe
@@ -414,6 +447,10 @@ def handle_call(gateway: Any, call: WhatsAppCall, *, graph: CallsGraph | None = 
 
 	admitted, reason = call_admission(gateway, call.caller)
 	if not admitted:
+		if _call_event_exists(name, call.call_id):
+			# webhook retry: the reject was already sent and recorded
+			rec = record_call_event(name, call, "Rejected", reason)
+			return {"call_id": call.call_id, "outcome": "duplicate", **rec}
 		action = {"action": "reject", "reason": reason, "ok": False}
 		try:
 			(graph or CallsGraph(bridge.resolve_account(bridge.gateway_account(name)) or {})).reject(call.call_id)
@@ -437,7 +474,7 @@ def handle_call(gateway: Any, call: WhatsAppCall, *, graph: CallsGraph | None = 
 		gateway_name=name,
 		call_id=call.call_id,
 		caller=call.caller,
-		sdp_offer=call.sdp_offer,
+		sdp_key=stash_sdp_offer(name, call.call_id, call.sdp_offer),
 		enqueue_after_commit=True,
 	)
 	return {"call_id": call.call_id, "outcome": "queued", **rec}

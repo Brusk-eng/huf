@@ -216,6 +216,31 @@ class TestHandleCall(unittest.TestCase):
 		self.assertEqual(enqueue.call_args.args[0], "huf.ai.gateway_adapters.whatsapp_call_flow.answer_inbound_call_job")
 		graph.reject.assert_not_called()
 
+	def test_sdp_is_not_in_job_kwargs(self):
+		enqueue = MagicMock()
+		with (
+			patch.object(wc, "call_admission", return_value=(True, "")),
+			patch.object(wc, "record_call_event", return_value={"event_name": "E1"}),
+			patch.object(wc, "stash_sdp_offer", return_value="huf_call_sdp:GW:c1") as stash,
+		):
+			wc.handle_call(self.gateway(True), self.call(), enqueue=enqueue)
+		stash.assert_called_once()
+		kwargs = enqueue.call_args.kwargs
+		self.assertEqual(kwargs["sdp_key"], "huf_call_sdp:GW:c1")
+		self.assertNotIn("sdp_offer", kwargs)
+		self.assertNotIn(SDP, [str(v) for v in kwargs.values()])
+
+	def test_retry_for_unadmitted_caller_does_not_resend_reject(self):
+		graph = MagicMock()
+		with (
+			patch.object(wc, "call_admission", return_value=(False, "no")),
+			patch.object(wc, "_call_event_exists", return_value=True),
+			patch.object(wc, "record_call_event", return_value={"duplicate": True, "event_name": "E1"}),
+		):
+			out = wc.handle_call(self.gateway(True), self.call(), graph=graph)
+		graph.reject.assert_not_called()
+		self.assertEqual(out["outcome"], "duplicate")
+
 	def test_duplicate_connect_not_answered_twice(self):
 		enqueue = MagicMock()
 		with (
@@ -342,17 +367,64 @@ class TestMediaBackend(unittest.TestCase):
 			patch.object(flow, "get_media_backend", return_value={"available": False, "backend": "aiortc", "reason": "not_installed"}),
 			patch.object(wc, "CallsGraph", graph_cls),
 			patch.object(wc, "update_call_event") as upd,
+			patch.object(wc, "call_admission", return_value=(True, "")),
+			patch.object(wc, "take_sdp_offer", return_value=SDP),
 			patch("huf.ai.gateway_adapters.whatsapp_bridge.resolve_account", return_value={}),
 			patch("huf.ai.gateway_adapters.whatsapp_bridge.gateway_account", return_value="ACC"),
 		):
-			out = flow.answer_inbound_call_job("GW", "c1", "15550001111", SDP)
+			out = flow.answer_inbound_call_job("GW", "c1", "15550001111", "k")
 		self.assertEqual(out["outcome"], "media_unavailable")
 		graph_cls.return_value.reject.assert_called_once_with("c1")
 		self.assertEqual(upd.call_args.args[2], "Failed")
 
+	def _job_patches(self, graph_cls, **over):
+		gateway = SimpleNamespace(name="GW", calling_enabled=1, call_max_seconds=30)
+		return (
+			patch("frappe.get_doc", return_value=gateway),
+			patch.object(wc, "CallsGraph", graph_cls),
+			patch.object(wc, "update_call_event"),
+			patch.object(wc, "call_admission", return_value=over.get("admission", (True, ""))),
+			patch.object(wc, "take_sdp_offer", return_value=over.get("sdp", SDP)),
+			patch.object(flow, "get_media_backend", return_value={"available": True}),
+			patch.object(flow, "load_gateway_clips", return_value=over.get("clips", [])),
+			patch("huf.ai.gateway_adapters.whatsapp_bridge.resolve_account", return_value={}),
+			patch("huf.ai.gateway_adapters.whatsapp_bridge.gateway_account", return_value="ACC"),
+		)
+
+	def _run_job(self, **over):
+		from contextlib import ExitStack
+
+		graph_cls = MagicMock()
+		with ExitStack() as stack:
+			mocks = [stack.enter_context(p) for p in self._job_patches(graph_cls, **over)]
+			out = flow.answer_inbound_call_job("GW", "c1", "15550001111", "k")
+		return out, graph_cls, mocks
+
+	def test_job_rejects_caller_no_longer_admitted(self):
+		out, graph_cls, mocks = self._run_job(admission=(False, "Caller is blocked (Revoked)"))
+		self.assertEqual(out["outcome"], "rejected")
+		graph_cls.return_value.reject.assert_called_once_with("c1")
+		self.assertEqual(mocks[2].call_args.args[2], "Rejected")
+
+	def test_job_no_greeting_reject_failure_still_marks_failed(self):
+		graph_cls = MagicMock()
+		graph_cls.return_value.reject.side_effect = RuntimeError("graph down")
+		from contextlib import ExitStack
+
+		with ExitStack() as stack:
+			mocks = [stack.enter_context(p) for p in self._job_patches(graph_cls, clips=[])]
+			out = flow.answer_inbound_call_job("GW", "c1", "15550001111", "k")
+		self.assertEqual(out["outcome"], "no_greeting")
+		self.assertEqual(mocks[2].call_args.args[2], "Failed")
+
+	def test_job_expired_offer_is_rejected(self):
+		out, graph_cls, mocks = self._run_job(sdp="")
+		self.assertEqual(out["outcome"], "offer_expired")
+		graph_cls.return_value.reject.assert_called_once_with("c1")
+
 	def test_job_skips_when_disabled(self):
 		with patch("frappe.get_doc", return_value=SimpleNamespace(name="GW", calling_enabled=0)):
-			self.assertEqual(flow.answer_inbound_call_job("GW", "c1", "1", SDP), {"call_id": "c1", "skipped": "calling disabled"})
+			self.assertEqual(flow.answer_inbound_call_job("GW", "c1", "1", "k"), {"call_id": "c1", "skipped": "calling disabled"})
 
 
 class TestSimulator(unittest.TestCase):
@@ -409,6 +481,24 @@ class TestManagementApi(unittest.TestCase):
 		self.graph.set_settings.assert_called_once_with({"calling": {"status": "ENABLED", "call_icon_visibility": "DEFAULT"}})
 		bad = mgmt.set_calling_settings("GW", calls_status="MAYBE")
 		self.assertEqual(bad["error"], "invalid_request")
+
+	def _calling_off(self):
+		self.frappe.db.get_value.side_effect = lambda dt, name, field=None, *a, **k: (
+			0 if field == "calling_enabled" else "ACC-1"
+		)
+
+	def test_enabling_calling_refused_when_gateway_calling_off(self):
+		self._calling_off()
+		out = mgmt.set_calling_settings("GW", calls_status="ENABLED")
+		self.assertEqual(out["error"], "calling_disabled")
+		self.graph.set_settings.assert_not_called()
+		# turning it off is always allowed
+		self.assertTrue(mgmt.set_calling_settings("GW", calls_status="DISABLED")["success"])
+
+	def test_call_action_refused_when_gateway_calling_off(self):
+		self._calling_off()
+		self.assertEqual(mgmt.call_action("GW", "c1", "reject")["error"], "calling_disabled")
+		self.graph.action.assert_not_called()
 
 	def test_call_action_validates_before_graph(self):
 		self.graph.action.side_effect = ValueError("Unknown call action: x")

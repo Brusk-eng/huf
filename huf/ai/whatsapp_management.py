@@ -1491,6 +1491,22 @@ def _calls_graph(gateway_name: str | None) -> "wcalls.CallsGraph | dict[str, Any
 	return wcalls.CallsGraph(account)
 
 
+def _calling_gate(gateway_name: str | None) -> dict[str, Any] | None:
+	"""Calling can only be switched on / driven when the Gateway itself has calling enabled."""
+	enabled = False
+	try:
+		enabled = bool(frappe.db.get_value("Gateway", gateway_name, "calling_enabled")) if gateway_name else False
+	except Exception:
+		enabled = False
+	if enabled:
+		return None
+	return {
+		"success": False,
+		"error": "calling_disabled",
+		"message": "Enable calling on this Gateway before using WhatsApp Calling.",
+	}
+
+
 def _value_error(exc: ValueError) -> dict[str, Any]:
 	return {"success": False, "error": "invalid_request", "message": str(exc)}
 
@@ -1523,6 +1539,10 @@ def set_calling_settings(
 	graph = _calls_graph(gateway_name)
 	if isinstance(graph, dict):
 		return graph
+	if str(calls_status or "").upper() == "ENABLED":
+		gated = _calling_gate(gateway_name)
+		if gated:
+			return gated
 	try:
 		payload = wcalls.calling_settings_payload(
 			calls_status, call_icon_visibility, greeting_media_id, callback_permission_status
@@ -1542,6 +1562,9 @@ def call_action(
 	graph = _calls_graph(gateway_name)
 	if isinstance(graph, dict):
 		return graph
+	gated = _calling_gate(gateway_name)
+	if gated:
+		return gated
 	try:
 		return {"success": True, "result": graph.action(call_id or "", action or "", sdp)}
 	except ValueError as exc:
