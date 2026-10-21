@@ -880,6 +880,8 @@ def _create_pairing_request(
             "provider": gateway.provider,
             "external_id": str(sender_id),
             "pairing_sent_at": [">", add_to_date(now, minutes=-PAIRING_RESEND_COOLDOWN_MINUTES)],
+            # an expired code must never block issuing a fresh one
+            "state": ["!=", ENTRY_STATE_EXPIRED],
         },
         pluck="name",
         limit_page_length=1,
@@ -960,6 +962,12 @@ def _policy_admits(policy: str | None, gateway, entry_type: str, external_id: st
     return False
 
 
+def _mask_code(code: str) -> str:
+    """Keep the live code off the event row: only the last two characters stay visible."""
+    code = str(code or "")
+    return "*" * max(len(code) - 2, 0) + code[-2:]
+
+
 def _admission(gateway, context: dict[str, Any]) -> tuple[bool, str]:
     sender_id, conversation_id = str(context.get("sender_id") or ""), str(context.get("conversation_id") or "")
     is_room = bool(context.get("is_room"))
@@ -978,7 +986,7 @@ def _admission(gateway, context: dict[str, Any]) -> tuple[bool, str]:
             )
             if not code:
                 return False, "Sender pairing approval is required (pairing code was sent recently)"
-            return False, f"Sender pairing approval is required. Pairing code: {code}"
+            return False, f"Sender pairing approval is required. Pairing code: {_mask_code(code)}"
         return (policy == "Allow list" and _has_access_entry(gateway, "Sender", sender_id), "Sender is not approved for this gateway")
 
     room_ok = _policy_admits(gateway.room_policy, gateway, "Room", conversation_id)
@@ -1008,9 +1016,30 @@ def _approval_failure_key() -> str:
     return _counter_key("pairing_fail", frappe.session.user, int(time.time() // 60))
 
 
+def _approve_rate_gate() -> None:
+    """Per-admin (not per-IP) bucket: admins behind one proxy must not share a budget."""
+
+
+_approve_rate_limited = rate_limit(key="_approve_rl_user", limit=20, seconds=60, ip_based=False)(
+    _approve_rate_gate
+)
+
+
 @frappe.whitelist(methods=["POST"])
-@rate_limit(limit=20, seconds=60)
 def approve_gateway_pairing(code_or_entry_name: str, notes: str | None = None, gateway: str | None = None) -> dict:
+    frappe.form_dict["_approve_rl_user"] = frappe.session.user
+    try:
+        _approve_rate_limited()
+    except frappe.RateLimitExceededError:
+        try:
+            frappe.local.response_headers["Retry-After"] = "60"
+        except Exception:
+            pass
+        raise
+    return _approve_gateway_pairing(code_or_entry_name, notes, gateway)
+
+
+def _approve_gateway_pairing(code_or_entry_name: str, notes: str | None = None, gateway: str | None = None) -> dict:
     """Approve a pending Gateway Access Entry by its ``PAIR-XXXXXXXX`` code or doc name.
 
     Admin-only (System Manager / Huf Admin / ``system.integrations.manage``).
@@ -1341,7 +1370,66 @@ def ingest_gateway_event(
     return {"event_name": event.name, **route}
 
 
+STUCK_RUNNING_MINUTES = 15
+_TERMINAL_STATES = ("Succeeded", "Failed")
+
+
+def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int = 50) -> int:
+    """Mark events stuck in Running (a lost terminal write / killed worker) as Failed with a reason."""
+    try:
+        cutoff = add_to_date(now_datetime(), minutes=-minutes)
+        stuck = frappe.get_all(
+            "Gateway Event",
+            filters={"status": "Running", "modified": ["<", cutoff]},
+            pluck="name",
+            limit_page_length=limit,
+        )
+        for name in stuck:
+            frappe.db.set_value(
+                "Gateway Event",
+                name,
+                {
+                    "status": "Failed",
+                    "error_message": f"Stuck in Running for over {minutes} minutes; the worker "
+                    "finished or died without recording a result.",
+                },
+            )
+        if stuck:
+            frappe.db.commit()
+        return len(stuck)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Gateway stuck-event reaper failed")
+        return 0
+
+
+def _persist_terminal_state(event_name: str, result: Any) -> None:
+    """Commit, then verify a terminal result really reached the database; repair and log if not."""
+    frappe.db.commit()
+    if not isinstance(result, dict) or result.get("status") not in _TERMINAL_STATES:
+        return
+    expected = {"status": result["status"]}
+    if result.get("agent_run_id"):
+        expected["agent_run"] = result["agent_run_id"]
+    actual = frappe.db.get_value("Gateway Event", event_name, list(expected), as_dict=True) or {}
+    if all(actual.get(k) == v for k, v in expected.items()):
+        return
+    frappe.log_error(
+        f"Terminal write for {event_name} was lost (expected {expected}, found {dict(actual)}); repairing",
+        "Gateway event terminal write lost",
+    )
+    frappe.db.set_value("Gateway Event", event_name, expected)
+    frappe.db.commit()
+
+
 def process_gateway_event(event_name: str) -> dict:
+    """Run one queued event, then make sure its terminal state is committed and verified."""
+    reap_stuck_gateway_events()
+    result = _process_gateway_event(event_name)
+    _persist_terminal_state(event_name, result)
+    return result
+
+
+def _process_gateway_event(event_name: str) -> dict:
     """Start queued Huf work under the Gateway's configured service user."""
     event = frappe.get_doc("Gateway Event", event_name)
     if event.status != "Queued":

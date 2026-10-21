@@ -289,7 +289,11 @@ def _set_gateway_error(gateway_name: str, text: str, *, touch_event: bool = Fals
 			values["last_event_at"] = frappe.utils.now_datetime()
 		frappe.db.set_value("Gateway", gateway_name, values, update_modified=False)
 	except Exception:
-		pass
+		# Never raise from a diagnostics write, but never swallow it silently either.
+		try:
+			frappe.logger("huf").warning(f"Could not record Gateway last_error for {gateway_name}")
+		except Exception:
+			pass
 
 
 _WEBHOOK_SIGNAL_THROTTLE_SECONDS = 60

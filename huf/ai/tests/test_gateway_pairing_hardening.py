@@ -345,26 +345,21 @@ class TestPairingLifecycle(_GatewayFixture, IntegrationTestCase):
 		self.assertEqual(gsvc._create_pairing_request(gw, "15551230001"), code)
 		self.assertEqual(len(self.sent_texts()), 1)  # no spam on repeat messages
 
-	def test_expired_entry_is_marked_expired_and_reissued_after_cooldown(self):
+	def test_expired_entry_is_marked_expired_and_reissued_immediately(self):
 		a = self.make_gateway("A", pairing_ttl_minutes=30)
 		gw = self.gw(a)
 		first = gsvc._create_pairing_request(gw, "15551230001")
 		entry = frappe.db.get_value("Gateway Access Entry", {"gateway": a, "pairing_code": first}, "name")
 		frappe.db.set_value("Gateway Access Entry", entry, "expires_at", add_to_date(now_datetime(), minutes=-1))
 
-		# Expired inside the 10 minute cooldown: state changes, but no new code and no message.
-		self.assertEqual(gsvc._create_pairing_request(gw, "15551230001"), "")
-		self.assertEqual(self.entry_state(entry), "Expired")
-		self.assertEqual(len(self.sent_texts()), 1)
-		with self.assertRaises(frappe.ValidationError):
-			gsvc.approve_gateway_pairing(first, gateway=a)
-
-		# After the cooldown a NEW code is issued and sent.
-		frappe.db.set_value("Gateway Access Entry", entry, "pairing_sent_at", add_to_date(now_datetime(), minutes=-11))
+		# Expired inside the 10 minute cooldown: a NEW code is issued immediately and sent.
 		second = gsvc._create_pairing_request(gw, "15551230001")
 		self.assertRegex(second, r"^PAIR-[A-Z2-9]{8}$")
 		self.assertNotEqual(first, second)
+		self.assertEqual(self.entry_state(entry), "Expired")
 		self.assertEqual(len(self.sent_texts()), 2)
+		with self.assertRaises(frappe.ValidationError):
+			gsvc.approve_gateway_pairing(first, gateway=a)
 		self.assertIn(second, self.sent_texts()[1])
 		self.assertEqual(gsvc.approve_gateway_pairing(second, gateway=a)["state"], "Approved")
 
@@ -374,7 +369,7 @@ class TestPairingLifecycle(_GatewayFixture, IntegrationTestCase):
 		ctx = {"sender_id": "15551230001", "conversation_id": "15551230001"}
 		admitted, reason = gsvc._admission(gw, ctx)
 		self.assertFalse(admitted)
-		self.assertIn("Pairing code: PAIR-", reason)
+		self.assertRegex(reason, r"Pairing code: \*+[A-Z0-9]{2}$")
 		entry = frappe.db.get_value("Gateway Access Entry", {"gateway": a}, "name")
 		frappe.db.set_value("Gateway Access Entry", entry, "expires_at", add_to_date(now_datetime(), minutes=-1))
 		admitted, reason = gsvc._admission(gw, ctx)
@@ -415,7 +410,7 @@ class TestPairingLifecycle(_GatewayFixture, IntegrationTestCase):
 		self.make_entry(a, "15551230001", state="Revoked")
 		result = self.ingest(b, "15551230001", "hi")
 		self.assertEqual(result["status"], "Rejected")
-		self.assertIn("Pairing code: PAIR-", self.event_error(result)["error_message"])
+		self.assertRegex(self.event_error(result)["error_message"], r"Pairing code: \*+[A-Z0-9]{2}$")
 
 	def test_process_time_recheck_rejects_sender_revoked_after_queueing(self):
 		a = self.make_gateway("A", policy="Allow list")
@@ -485,7 +480,7 @@ class TestOptOut(_GatewayFixture, IntegrationTestCase):
 		self.ingest(a, "15551230009", "start")
 		self.assertFalse(gsvc.is_opted_out(a, "15551230009"))
 		result = self.ingest(a, "15551230009", "hello")
-		self.assertIn("Pairing code: PAIR-", self.event_error(result)["error_message"])
+		self.assertRegex(self.event_error(result)["error_message"], r"Pairing code: \*+[A-Z0-9]{2}$")
 
 	def test_keyword_must_be_the_whole_message(self):
 		a = self.make_gateway("A", policy="Allow list")

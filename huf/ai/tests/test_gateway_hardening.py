@@ -180,3 +180,119 @@ class TestWebhookLimits(unittest.TestCase):
 			with self.assertRaises(frappe.RateLimitExceededError):
 				gateway_webhook._ingest_rate_gate()
 		self.assertEqual(headers["Retry-After"], "60")
+
+
+class TestTerminalStatePersistence(unittest.TestCase):
+	def test_lost_terminal_write_is_repaired_and_logged(self):
+		result = {"status": "Failed", "agent_run_id": "AR-1"}
+		with (
+			patch.object(gateway_service.frappe.db, "commit") as commit,
+			patch.object(
+				gateway_service.frappe.db,
+				"get_value",
+				return_value={"status": "Running", "agent_run": None},
+			),
+			patch.object(gateway_service.frappe.db, "set_value") as set_value,
+			patch.object(gateway_service.frappe, "log_error") as log_error,
+		):
+			gateway_service._persist_terminal_state("GEV-1", result)
+		set_value.assert_called_once_with("Gateway Event", "GEV-1", {"status": "Failed", "agent_run": "AR-1"})
+		log_error.assert_called_once()
+		self.assertEqual(commit.call_count, 2)
+
+	def test_persisted_state_is_left_alone(self):
+		with (
+			patch.object(gateway_service.frappe.db, "commit"),
+			patch.object(
+				gateway_service.frappe.db,
+				"get_value",
+				return_value={"status": "Succeeded", "agent_run": "AR-1"},
+			),
+			patch.object(gateway_service.frappe.db, "set_value") as set_value,
+		):
+			gateway_service._persist_terminal_state(
+				"GEV-1", {"status": "Succeeded", "agent_run_id": "AR-1"}
+			)
+		set_value.assert_not_called()
+
+	def test_process_gateway_event_verifies_after_run(self):
+		with (
+			patch.object(gateway_service, "reap_stuck_gateway_events") as reap,
+			patch.object(gateway_service, "_process_gateway_event", return_value={"status": "Queued"}),
+			patch.object(gateway_service, "_persist_terminal_state") as persist,
+		):
+			out = gateway_service.process_gateway_event("GEV-1")
+		reap.assert_called_once()
+		persist.assert_called_once_with("GEV-1", {"status": "Queued"})
+		self.assertEqual(out, {"status": "Queued"})
+
+	def test_reaper_fails_stuck_running_events(self):
+		with (
+			patch.object(gateway_service.frappe, "get_all", return_value=["GEV-1", "GEV-2"]) as get_all,
+			patch.object(gateway_service.frappe.db, "set_value") as set_value,
+			patch.object(gateway_service.frappe.db, "commit"),
+		):
+			self.assertEqual(gateway_service.reap_stuck_gateway_events(), 2)
+		self.assertEqual(get_all.call_args.kwargs["filters"]["status"], "Running")
+		self.assertEqual(set_value.call_count, 2)
+		self.assertEqual(set_value.call_args.args[2]["status"], "Failed")
+
+
+class TestPairingFixes(unittest.TestCase):
+	def test_mask_code_keeps_last_two(self):
+		self.assertEqual(gateway_service._mask_code("PAIR-ABCD1234"), "*" * 11 + "34")
+		self.assertEqual(gateway_service._mask_code(""), "")
+
+	def test_admission_reason_does_not_leak_code(self):
+		gw = SimpleNamespace(direct_policy="Pairing")
+		with (
+			patch.object(gateway_service, "_sender_negative_state", return_value=None),
+			patch.object(gateway_service, "_has_access_entry", return_value=False),
+			patch.object(gateway_service, "_create_pairing_request", return_value="PAIR-ABCD1234"),
+		):
+			ok, reason = gateway_service._admission(gw, {"sender_id": "1"})
+		self.assertFalse(ok)
+		self.assertNotIn("PAIR-ABCD1234", reason)
+		self.assertTrue(reason.endswith("34"))
+
+	def test_approve_rate_limit_is_per_user_with_retry_after(self):
+		headers = {}
+		with (
+			patch.object(gateway_service.frappe, "form_dict", {}),
+			patch.object(gateway_service.frappe, "session", SimpleNamespace(user="a@x.com")),
+			patch.object(gateway_service.frappe, "local", SimpleNamespace(response_headers=headers)),
+			patch.object(
+				gateway_service, "_approve_rate_limited", side_effect=frappe.RateLimitExceededError("x")
+			),
+		):
+			with self.assertRaises(frappe.RateLimitExceededError):
+				gateway_service.approve_gateway_pairing("PAIR-1")
+			self.assertEqual(gateway_service.frappe.form_dict["_approve_rl_user"], "a@x.com")
+		self.assertEqual(headers["Retry-After"], "60")
+
+	def test_cooldown_ignores_expired_entries(self):
+		captured = []
+
+		def fake_get_all(doctype, **kw):
+			captured.append(kw.get("filters"))
+			return []
+
+		real_get_doc = frappe.get_doc
+
+		def fake_get_doc(*args, **kwargs):
+			if args and isinstance(args[0], dict):
+				return MagicMock()
+			return real_get_doc(*args, **kwargs)
+
+		gw = SimpleNamespace(
+			name="GW", provider="WhatsApp", pairing_ttl_minutes=60, integration_settings="", pairing_reply_enabled=0
+		)
+		with (
+			patch.object(gateway_service.frappe, "get_all", side_effect=fake_get_all),
+			patch.object(gateway_service, "_new_unique_pairing_code", return_value="PAIR-X"),
+			patch.object(gateway_service.frappe, "get_doc", side_effect=fake_get_doc),
+			patch.object(gateway_service.frappe.db, "get_value", return_value=None),
+		):
+			gateway_service._create_pairing_request(gw, "1")
+		cooldown = [f for f in captured if f and "pairing_sent_at" in f][0]
+		self.assertEqual(cooldown["state"], ["!=", gateway_service.ENTRY_STATE_EXPIRED])
