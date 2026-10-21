@@ -463,6 +463,11 @@ class TestApproveGatewayPairing(unittest.TestCase):
     the orphaned `gateway_pairing_tools.approve_pairing_code` and the
     Desk-only `approve_gateway_access_entry` (kept as a thin alias below)."""
 
+    def _admin(self, value):
+        patcher = patch("huf.ai.gateway_service._is_gateway_admin", return_value=value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @patch("huf.ai.gateway_service.now_datetime", return_value=datetime(2026, 7, 26, 0, 0, 0))
     @patch("huf.ai.gateway_service.frappe")
     def test_approve_by_pairing_code_clears_expires_at(self, mock_frappe, mock_now):
@@ -472,12 +477,13 @@ class TestApproveGatewayPairing(unittest.TestCase):
         entry = access_entry(expires_at=None)
         # frappe.get_all returns frappe._dict rows, and _find_pending_entry_by_code
         # reads row.pairing_code by attribute -- a plain dict here would raise.
-        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9K"})]
+        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9KXM4Q"})]
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.session.user = "admin@example.com"
 
-        result = gateway_service.approve_gateway_pairing("pair-7a9k")
+        result = gateway_service.approve_gateway_pairing("pair-7a9kxm4q", gateway="GW")
 
         assert result["state"] == "Approved"
         assert result["name"] == entry.name
@@ -499,6 +505,7 @@ class TestApproveGatewayPairing(unittest.TestCase):
         mock_frappe.db.exists.return_value = True
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.session.user = "admin@example.com"
 
         result = gateway_service.approve_gateway_pairing("ACCESS-LEGACY")
@@ -511,6 +518,7 @@ class TestApproveGatewayPairing(unittest.TestCase):
         mock_frappe.get_all.return_value = []
         mock_frappe.db.exists.return_value = False
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.ValidationError = ValueError
         mock_frappe.throw.side_effect = ValueError("No pending pairing request found")
 
@@ -522,14 +530,15 @@ class TestApproveGatewayPairing(unittest.TestCase):
         entry = access_entry(expires_at=datetime(2020, 1, 1))
         # frappe.get_all returns frappe._dict rows, and _find_pending_entry_by_code
         # reads row.pairing_code by attribute -- a plain dict here would raise.
-        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9K"})]
+        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9KXM4Q"})]
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.ValidationError = ValueError
         mock_frappe.throw.side_effect = ValueError("This pairing request is not active.")
 
         with self.assertRaises(ValueError):
-            gateway_service.approve_gateway_pairing("PAIR-7A9K")
+            gateway_service.approve_gateway_pairing("PAIR-7A9KXM4Q", gateway="GW")
         entry.db_set.assert_not_called()
 
     @patch("huf.ai.gateway_service.frappe")
@@ -537,24 +546,26 @@ class TestApproveGatewayPairing(unittest.TestCase):
         entry = access_entry(state="Approved")
         # frappe.get_all returns frappe._dict rows, and _find_pending_entry_by_code
         # reads row.pairing_code by attribute -- a plain dict here would raise.
-        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9K"})]
+        mock_frappe.get_all.return_value = [frappe._dict({"name": entry.name, "pairing_code": "PAIR-7A9KXM4Q"})]
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        self._admin(True)
         mock_frappe.ValidationError = ValueError
         mock_frappe.throw.side_effect = ValueError("This pairing request is not active.")
 
         with self.assertRaises(ValueError):
-            gateway_service.approve_gateway_pairing("PAIR-7A9K")
+            gateway_service.approve_gateway_pairing("PAIR-7A9KXM4Q", gateway="GW")
         entry.db_set.assert_not_called()
 
     @patch("huf.ai.gateway_service.frappe")
     def test_approval_denied_without_write_permission(self, mock_frappe):
-        mock_frappe.has_permission.return_value = False
+        mock_frappe.has_permission.return_value = True  # doctype write alone is not enough
+        self._admin(False)
         mock_frappe.PermissionError = PermissionError
         mock_frappe.throw.side_effect = PermissionError("Not permitted")
 
         with self.assertRaises(PermissionError):
-            gateway_service.approve_gateway_pairing("PAIR-7A9K")
+            gateway_service.approve_gateway_pairing("PAIR-7A9KXM4Q", gateway="GW")
 
 
 class TestApproveGatewayAccessEntryAlias(unittest.TestCase):
@@ -569,6 +580,8 @@ class TestApproveGatewayAccessEntryAlias(unittest.TestCase):
         mock_frappe.db.exists.return_value = True
         mock_frappe.get_doc.return_value = entry
         mock_frappe.has_permission.return_value = True
+        patch('huf.ai.gateway_service._is_gateway_admin', return_value=True).start()
+        self.addCleanup(patch.stopall)
         mock_frappe.session.user = "admin@example.com"
 
         result = gateway_service.approve_gateway_access_entry("ACCESS-001")
@@ -799,7 +812,9 @@ class TestGatewayEventFailureHandling(unittest.TestCase):
             sender_id="user1",
         )
         configured_gateway = gateway(name="Support Teams", provider="Microsoft Teams", execution_user="gateway-bot")
-        target_agent_doc = MagicMock(allow_guest=True)
+        # GW-08: the pre-gate authorizes as the Gateway's execution_user, so the
+        # agent must be accessible to it (here: owned by it), not just guest-open.
+        target_agent_doc = MagicMock(allow_guest=True, owner="gateway-bot")
         mock_frappe.get_doc.side_effect = [event, configured_gateway, target_agent_doc]
         mock_run = MagicMock(return_value={"agent_run_id": "AR-002", "response": "Hello back"})
 
@@ -966,7 +981,7 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
         ).insert(ignore_permissions=True)
         self._gateway_names.append(name)
 
-    def _make_entry(self, gateway_name: str, *, state="Pending", expires_at=None, pairing_code="PAIR-TEST") -> str:
+    def _make_entry(self, gateway_name: str, *, state="Pending", expires_at=None, pairing_code="PAIR-TESTTEST") -> str:
         doc = frappe.get_doc(
             {
                 "doctype": "Gateway Access Entry",
@@ -986,10 +1001,10 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
         gw = "Test Approve By Code"
         self._make_gateway(gw)
         entry_name = self._make_entry(
-            gw, expires_at=add_to_date(now_datetime(), minutes=60), pairing_code="PAIR-CAFE"
+            gw, expires_at=add_to_date(now_datetime(), minutes=60), pairing_code="PAIR-CAFEBEEF"
         )
 
-        result = gateway_service.approve_gateway_pairing("pair-cafe")
+        result = gateway_service.approve_gateway_pairing("pair-cafebeef", gateway=gw)
 
         assert result["state"] == "Approved"
         entry = frappe.get_doc("Gateway Access Entry", entry_name)
@@ -1000,7 +1015,7 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
     def test_approve_by_legacy_entry_name_still_works(self):
         gw = "Test Approve By Name"
         self._make_gateway(gw)
-        entry_name = self._make_entry(gw, pairing_code="PAIR-BEEF")
+        entry_name = self._make_entry(gw, pairing_code="PAIR-BEEFCAFE")
 
         result = gateway_service.approve_gateway_access_entry(entry_name)
 
@@ -1011,20 +1026,20 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
         gw = "Test Expired Entry"
         self._make_gateway(gw)
         entry_name = self._make_entry(
-            gw, expires_at=add_to_date(now_datetime(), minutes=-5), pairing_code="PAIR-DEAD"
+            gw, expires_at=add_to_date(now_datetime(), minutes=-5), pairing_code="PAIR-DEADBEEF"
         )
 
         with self.assertRaises(frappe.ValidationError):
-            gateway_service.approve_gateway_pairing("PAIR-DEAD")
+            gateway_service.approve_gateway_pairing("PAIR-DEADBEEF", gateway=gw)
         assert frappe.db.get_value("Gateway Access Entry", entry_name, "state") == "Pending"
 
     def test_already_approved_entry_is_rejected(self):
         gw = "Test Already Approved"
         self._make_gateway(gw)
-        self._make_entry(gw, state="Approved", pairing_code="PAIR-DONE")
+        self._make_entry(gw, state="Approved", pairing_code="PAIR-DONEDONE")
 
         with self.assertRaises(frappe.ValidationError):
-            gateway_service.approve_gateway_pairing("PAIR-DONE")
+            gateway_service.approve_gateway_pairing("PAIR-DONEDONE")
 
     def test_unknown_code_is_rejected(self):
         with self.assertRaises(frappe.ValidationError):
@@ -1052,3 +1067,176 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
 
         assert any(row["pairing_code"] == "PAIR-LIST" for row in pending)
         assert not any(row["pairing_code"] == "PAIR-LIST" for row in approved)
+
+
+class TestWhatsAppGatewayService(unittest.TestCase):
+    """T3: window-closed handling, conversation continuity, sender normalisation, media."""
+
+    @staticmethod
+    def _event(**overrides):
+        values = dict(
+            name="GATEWAY-EVENT-WA1",
+            status="Queued",
+            gateway="WA",
+            target_type="Agent",
+            target_agent="Support Agent",
+            message_text="hello",
+            thread_id="",
+            conversation_id="1234567890",
+            sender_id="1234567890",
+            provider_event_id="wamid.in",
+            reply_message_id="",
+            raw_payload={"message": {"type": "text", "text": {"body": "hello"}}, "quoted_message_id": "wamid.prev"},
+        )
+        values.update(overrides)
+        return MagicMock(**values)
+
+    def _process(self, mock_frappe, event, send_side_effect=None, send_return=None):
+        mock_frappe.ValidationError = frappe.ValidationError
+        mock_frappe.get_traceback.return_value = "tb"
+        configured = gateway(name="WA", provider="WhatsApp", execution_user="bot", whatsapp_account="")
+        mock_frappe.get_doc.side_effect = [event, configured, MagicMock(allow_guest=True, owner="bot")]
+        mock_run = MagicMock(return_value={"agent_run_id": "AR-1", "response": "hi back"})
+        with patch.dict(sys.modules, {"huf.ai.agent_integration": SimpleNamespace(run_agent_sync=mock_run)}), patch(
+            "huf.ai.gateway_webhook.send_gateway_parts", side_effect=send_side_effect, return_value=send_return
+        ), patch("huf.ai.gateway_service.is_opted_out", return_value=False), patch(
+            "huf.ai.gateway_service._save_whatsapp_media", return_value=[]
+        ):
+            result = gateway_service.process_gateway_event(event.name)
+        return result, mock_run
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_window_closed_marks_event_failed_with_operator_message(self, mock_frappe):
+        from huf.ai.gateway_adapters.whatsapp import WhatsAppWindowClosed
+
+        event = self._event()
+        result, _ = self._process(
+            mock_frappe, event, send_side_effect=WhatsAppWindowClosed("24-hour customer-service window is closed")
+        )
+        assert result["status"] == "Failed"
+        failed = [c.args[0] for c in event.db_set.call_args_list if isinstance(c.args[0], dict) and c.args[0].get("status") == "Failed"]
+        assert failed and "window is closed" in failed[-1]["error_message"]
+        mock_frappe.db.rollback.assert_not_called()  # handled, not re-raised -> no retry loop
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_fallback_template_delivery_is_noted_but_stays_succeeded(self, mock_frappe):
+        event = self._event()
+        delivery = SimpleNamespace(provider_message_id="wamid.t", provider_response={"fallback_template_sent": True})
+        result, _ = self._process(mock_frappe, event, send_return=delivery)
+        assert result["status"] == "Succeeded"
+        final = [c.args[0] for c in event.db_set.call_args_list if isinstance(c.args[0], dict) and c.args[0].get("status") == "Succeeded"]
+        assert final[-1]["error_message"] == (
+            "Fallback template sent; agent reply suppressed (24h window closed)"
+        )
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_normal_delivery_has_no_error_note(self, mock_frappe):
+        event = self._event()
+        delivery = SimpleNamespace(provider_message_id="wamid.o", provider_response={})
+        self._process(mock_frappe, event, send_return=delivery)
+        final = [c.args[0] for c in event.db_set.call_args_list if isinstance(c.args[0], dict) and c.args[0].get("status") == "Succeeded"]
+        assert "error_message" not in final[-1]
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_bridge_error_marks_event_failed(self, mock_frappe):
+        from huf.ai.gateway_adapters.whatsapp_bridge import BridgeError
+
+        event = self._event()
+        result, _ = self._process(
+            mock_frappe, event, send_side_effect=BridgeError({"success": False, "error": "no_account"})
+        )
+        assert result["status"] == "Failed"
+        assert "no_account" in result["error"]
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_quoted_reply_reuses_the_same_conversation_key(self, mock_frappe):
+        event = self._event()
+        _, mock_run = self._process(mock_frappe, event, send_return=SimpleNamespace(provider_message_id="wamid.out"))
+        assert mock_run.call_args.kwargs["external_id"] == "1234567890"
+        assert mock_run.call_args.kwargs["channel_id"] == "gateway:WA"
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_non_whatsapp_provider_never_resolves_whatsapp_errors(self, mock_frappe):
+        assert gateway_service._whatsapp_send_errors("Telegram") == ()
+        assert len(gateway_service._whatsapp_send_errors("WhatsApp")) == 2
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_has_access_entry_normalises_whatsapp_sender(self, mock_frappe):
+        mock_frappe.get_all.return_value = ["GAE-1"]
+        assert gateway_service._has_access_entry(gateway(name="WA", provider="WhatsApp"), "Sender", "+1 (234) 567-890")
+        assert mock_frappe.get_all.call_args.kwargs["filters"]["external_id"] == "1234567890"
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_has_access_entry_leaves_other_providers_untouched(self, mock_frappe):
+        mock_frappe.get_all.return_value = []
+        gateway_service._has_access_entry(gateway(), "Sender", "+42 ")
+        assert mock_frappe.get_all.call_args.kwargs["filters"]["external_id"] == "+42 "
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_save_whatsapp_media_attaches_private_sanitised_file(self, mock_frappe):
+        event = self._event(raw_payload={"message": {"type": "image", "image": {"id": "MID"}}})
+        file_doc = MagicMock(file_url="/private/files/x.jpg")
+        mock_frappe.get_doc.return_value.insert.return_value = file_doc
+        content = {"content": b"abc", "mime_type": "image/jpeg", "filename": "../../etc/pa ss<wd>.jpg"}
+        with patch("huf.ai.gateway_adapters.whatsapp_bridge.download_media", return_value=content) as dl:
+            saved = gateway_service._save_whatsapp_media(event, gateway(provider="WhatsApp", whatsapp_account="Acct"))
+        assert saved == ["/private/files/x.jpg"]
+        assert dl.call_args.args == ("Acct", "MID")
+        doc = mock_frappe.get_doc.call_args.args[0]
+        assert doc["is_private"] == 1
+        assert doc["attached_to_doctype"] == "Gateway Event"
+        assert doc["file_name"] == "pa_ss_wd_.jpg"
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_save_whatsapp_media_failure_is_non_fatal(self, mock_frappe):
+        event = self._event(raw_payload={"message": {"type": "image", "image": {"id": "MID"}}})
+        with patch("huf.ai.gateway_adapters.whatsapp_bridge.download_media", side_effect=ValueError("media_too_large")):
+            assert gateway_service._save_whatsapp_media(event, gateway(provider="WhatsApp")) == []
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_approval_welcome_window_closed_keeps_approval(self, mock_frappe):
+        from huf.ai.gateway_adapters.whatsapp import WhatsAppWindowClosed
+
+        assert gateway_service._whatsapp_send_errors("WhatsApp")[0] is WhatsAppWindowClosed
+        text = gateway_service._whatsapp_error_text(WhatsAppWindowClosed("window closed"))
+        assert "window closed" in text
+
+    @patch("huf.ai.gateway_service.frappe")
+    def test_test_send_reports_window_closed_explicitly(self, mock_frappe):
+        from huf.ai.gateway_adapters.whatsapp import WhatsAppWindowClosed
+
+        mock_frappe.has_permission.return_value = True
+        mock_frappe.get_doc.return_value = SimpleNamespace(
+            is_enabled=1, provider="WhatsApp", integration_settings="IS-1"
+        )
+        adapter = MagicMock()
+        adapter.send_reply.side_effect = WhatsAppWindowClosed("window closed for 1234567890")
+        with patch("huf.ai.gateway_webhook.get_gateway_adapter", return_value=adapter):
+            result = gateway_service.test_gateway_send("WA", "1234567890")
+        assert result["success"] is False
+        assert "window closed" in result["message"]
+
+
+class TestAgentRunFailureClassification(unittest.TestCase):
+    """FIX-E: failed/errored/empty agent runs are never sendable replies."""
+
+    def test_success_with_text_is_not_a_failure(self):
+        self.assertIsNone(gateway_service._agent_run_failure({"success": True, "response": "hi"}))
+        self.assertIsNone(gateway_service._agent_run_failure({"response": "hi", "agent_run_id": "r"}))
+
+    def test_failed_run_with_kind(self):
+        code, reason = gateway_service._agent_run_failure(
+            {"success": False, "error": "x ?key=abcSECRET123", "error_kind": "quota_exceeded"}
+        )
+        self.assertEqual(code, "provider_quota_exceeded")
+        self.assertNotIn("abcSECRET123", reason)
+
+    def test_failed_run_unknown_or_missing_kind(self):
+        self.assertEqual(gateway_service._agent_run_failure({"success": False, "error": "e"})[0], "agent_run_failed")
+        self.assertEqual(
+            gateway_service._agent_run_failure({"success": False, "error_kind": "unknown"})[0], "agent_run_failed"
+        )
+
+    def test_empty_or_non_dict_result(self):
+        self.assertEqual(gateway_service._agent_run_failure({"response": " "})[0], "agent_run_failed")
+        self.assertEqual(gateway_service._agent_run_failure(None)[0], "agent_run_failed")

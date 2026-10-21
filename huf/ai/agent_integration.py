@@ -26,6 +26,7 @@ from .conversation_manager import ConversationManager, safe_history_slice, safe_
 from .run import RunProvider
 from huf.ai.knowledge.context_builder import build_knowledge_context, inject_knowledge_context
 from huf.ai.providers.litellm import _normalize_model_name, ProviderUnavailableError
+from huf.ai.providers.errors import ProviderError, classify_status, redact_text
 from huf.ai.transaction import safe_commit, transaction_checkpoint
 from huf.ai.agent_access import (
     assert_agent_access,
@@ -2691,12 +2692,14 @@ def _execute_agent_run(
             "session_id": conv_manager.session_id
         }
 
-    except ProviderUnavailableError as e:
+    except (ProviderUnavailableError, ProviderError) as e:
         # Provider-level failure (connection refused, model not pulled, bad
-        # model prefix, empty response). Surface it as a failed run — never
-        # as assistant message content.
+        # model prefix, empty response, HTTP 404/429/401/5xx from a legacy
+        # provider module). Surface it as a failed run — never as assistant
+        # message content.
         error_msg = str(e)
-        log_error_msg = getattr(e, "log_message", error_msg)
+        error_kind = getattr(e, "kind", None) or "unknown"
+        log_error_msg = redact_text(getattr(e, "log_message", error_msg))
         run_doc.db_set("status", "Failed", update_modified=True)
         run_doc.db_set("error_message", error_msg)
         frappe.log_error(
@@ -2712,6 +2715,7 @@ def _execute_agent_run(
         return {
             "success": False,
             "error": error_msg,
+            "error_kind": error_kind,
             "agent_run_id": run_doc.name,
             "conversation_id": conversation.name,
             "session_id": conv_manager.session_id
@@ -2719,6 +2723,7 @@ def _execute_agent_run(
 
     except Exception as e:
         error_msg = str(e)
+        error_kind = classify_status(getattr(e, "status_code", None), f"{type(e).__name__} {error_msg}")
 
         if "ContextWindowExceededError" in error_msg:
             try:
@@ -2765,9 +2770,10 @@ def _execute_agent_run(
                     f"Failed to handle rate limit error in sync: {str(inner_e)}"
                 )
 
+        error_msg = redact_text(error_msg)
         run_doc.db_set("status", "Failed", update_modified=True)
         run_doc.db_set("error_message", error_msg)
-        frappe.log_error(f"Agent Run Error: {frappe.get_traceback()}", "Huf")
+        frappe.log_error(f"Agent Run Error: {redact_text(frappe.get_traceback())}", "Huf")
         _emit_run_lifecycle_event(run_doc, conversation, "failed", {"error": error_msg})
 
         # Handle Sub-Agent Failure Lifecycle Hook
@@ -2815,6 +2821,7 @@ def _execute_agent_run(
         return {
             "success": False,
             "error": error_msg,
+            "error_kind": error_kind,
             "agent_run_id": run_doc.name,
             "conversation_id": conversation.name,
             "session_id": conv_manager.session_id

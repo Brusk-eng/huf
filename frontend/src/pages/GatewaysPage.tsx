@@ -8,6 +8,7 @@ import {
   Copy,
   KeyRound,
   Link2,
+  MessageSquare,
   Network,
   Plus,
   Settings,
@@ -670,6 +671,15 @@ export default function GatewaysPage() {
                 { label: 'Route target', value: target || 'Unassigned' },
               ]}
               actions={[
+                ...(gateway.provider === 'WhatsApp'
+                  ? [
+                      {
+                        icon: MessageSquare,
+                        label: 'Manage WhatsApp',
+                        onClick: () => navigate(`/whatsapp?gateway=${encodeURIComponent(gateway.name)}`),
+                      },
+                    ]
+                  : []),
                 {
                   icon: Settings,
                   label: 'Configure gateway',
@@ -694,7 +704,7 @@ export default function GatewaysPage() {
                         <span className="line-clamp-1 text-destructive">{gateway.last_error}</span>
                       </>
                     ) : (
-                      <span>Last event: {formatTimeAgo(gateway.last_event_at)}</span>
+                      <span>Last event: {gateway.last_event_at ? formatTimeAgo(gateway.last_event_at) : 'No messages yet'}</span>
                     )}
                   </div>
                 ) : (

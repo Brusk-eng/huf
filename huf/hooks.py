@@ -232,9 +232,12 @@ has_permission = {
 # ---------------
 # Override standard doctype classes
 
-# override_doctype_class = {
-# 	"ToDo": "custom_app.overrides.CustomToDo"
-# }
+# Huf-owned WhatsApp templates must not be re-pushed or deleted on Meta by a Desk save/delete
+# (frappe_whatsapp's controller runs before doc_events hooks). Resolves lazily, and only when that
+# doctype exists, so sites without the optional connector app are unaffected.
+override_doctype_class = {
+	"WhatsApp Templates": "huf.ai.gateway_adapters.whatsapp_template_guard.GuardedWhatsAppTemplates",
+}
 
 # Document Events
 # ---------------
@@ -256,6 +259,12 @@ doc_events = {
         "after_rename": ["huf.ai.agent_hooks.run_hooked_agents", "huf.ai.automation_hooks.run_hooked_automations"],
         "on_trash": ["huf.ai.agent_hooks.run_hooked_agents", "huf.ai.automation_hooks.run_hooked_automations"],
         "after_delete": ["huf.ai.agent_hooks.run_hooked_agents", "huf.ai.automation_hooks.run_hooked_automations"],
+    },
+    "WhatsApp Templates": {
+        "before_validate": "huf.ai.gateway_adapters.whatsapp_template_guard.guard_template_write",
+        "validate": "huf.ai.gateway_adapters.whatsapp_template_guard.guard_template_write",
+        "before_save": "huf.ai.gateway_adapters.whatsapp_template_guard.guard_template_write",
+        "on_trash": "huf.ai.gateway_adapters.whatsapp_template_guard.guard_template_write",
     },
     "User": {
         "on_update": "huf.huf.doctype.huf_user_role.huf_user_role.sync_from_frappe_user",
@@ -323,11 +332,15 @@ scheduler_events = {
         "huf.ai.agent_chat.purge_trashed_conversations",
         "huf.ai.context_artifacts.purge_expired_context_artifacts",
         "huf.ai.gateway_service.purge_old_rejected_gateway_events",
+        "huf.ai.gateway_service.cleanup_stale_access_entries",
     ],
     "cron": {
         "*/1 * * * *": [
             "huf.ai.orchestration.scheduler.process_orchestrations",
             "huf.ai.agent_integration.recover_stalled_agent_runs",
+        ],
+        "*/10 * * * *": [
+            "huf.ai.gateway_service.reap_stuck_gateway_events",
         ],
         "*/5 * * * *": [
             "huf.ai.agent_run_analytics.refresh_rollups",

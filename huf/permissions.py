@@ -140,6 +140,10 @@ DEFAULT_ROLE_CAPABILITIES: dict[str, list[str]] = {
 		"chat.view_own",
 		"data.records.view_own",
 	],
+	# Least-privilege service role for gateway execution users. Deliberately
+	# NOT a superset of Huf User: no agent.create, no developer.keys.manage,
+	# no ssh.run, no code_execution.run. It only lets the user run agents.
+	"Huf Gateway User": ["agent.use"],
 }
 
 # Which Frappe Role backs each Huf Role.
@@ -149,6 +153,7 @@ HUF_ROLE_FRAPPE_ROLE_MAP: dict[str, str] = {
 	"Huf Manager": "Huf Manager",
 	"Huf User": "Huf User",
 	"Huf Viewer": "Huf Viewer",
+	"Huf Gateway User": "Huf Gateway User",
 }
 
 # Standard Frappe role constants.
@@ -206,6 +211,10 @@ def get_user_huf_role(user: str | None = None) -> str | None:
 		return "Huf User"
 	if "Huf Viewer" in user_roles:
 		return "Huf Viewer"
+	# Resolved last: a user with any higher Huf role keeps that role; the
+	# gateway role never adds anything on top of it.
+	if "Huf Gateway User" in user_roles:
+		return "Huf Gateway User"
 
 	return None
 

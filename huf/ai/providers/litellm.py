@@ -86,10 +86,16 @@ class ProviderUnavailableError(Exception):
     """Raised when the LLM provider cannot serve this request (conn refused, model missing,
     bad model prefix, auth). Distinct from content-level errors."""
 
-    def __init__(self, public_message: str, *, log_message: str | None = None):
+    def __init__(self, public_message: str, *, log_message: str | None = None,
+                 kind: str | None = None, status_code=None):
         super().__init__(public_message)
         self.public_message = public_message
         self.log_message = log_message or public_message
+        self.status_code = status_code
+        if kind is None:
+            from huf.ai.providers.errors import classify_text
+            kind = classify_text(f"{self.log_message} {public_message}")
+        self.kind = kind
 
 
 def _sanitize_provider_error_message(raw_message: str, normalized_model: str | None = None) -> str:

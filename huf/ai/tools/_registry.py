@@ -221,24 +221,88 @@ WHATSAPP_TOOLS = [
 		"tool_name": "whatsapp",
 		"description": (
 			"Manage WhatsApp Business messaging via the Meta Cloud API. Actions: "
-			"send_message (to/recipient/phone_number, message/text), "
-			"send_template (to/recipient, template_name, language_code), "
-			"list_messages (to, from, limit), get_account_info."
+			"send_message (to/recipient/phone_number, message/text; free-form sends outside the "
+			"24h window may be refused), "
+			"send_media (to, kind image|document|audio|video|sticker, link or media_id, caption, filename; same 24h window rules as send_message), "
+			"send_image / send_video / send_audio / send_document / send_sticker (media actions with the kind preset: to, link or media_id; caption for image, video and document; filename for document; voice=true for an audio voice note), "
+			"send_location (to, latitude, longitude, name, address), "
+			"send_contact (to, contact_name, contact_phone, contact_email, contact_org; or contacts as a JSON list), "
+			"send_reaction (to, message_id of the customer's message, emoji; remove=true removes the reaction), "
+			"send_buttons (to, body, buttons [{id, title}] up to 3, optional header and footer), "
+			"send_list (to, body, button_text, sections [{title, rows: [{id, title, description}]}] up to 10 rows, optional header and footer), "
+			"send_cta_url (to, body, display_text, url, optional header and footer). "
+			"All send_* media, location, contact, reaction and interactive actions are free-form: they need an open 24h window (or the server-side allow_proactive flag), are refused for contacts who opted out, and are validated against Meta's limits before sending; "
+			"send_template (to/recipient, template_name, language_code, parameters, header_params, button_params), "
+			"list_messages (to, from, limit), get_account_info, "
+			"list_templates (whatsapp_account, status; rows include review status and rejection reason), "
+			"create_template (template_name, category, language_code, body, sample_values, optional header_type/header/sample, "
+			"footer, buttons; saves a DRAFT that a human must approve before it is submitted to Meta - returns "
+			"status pending_review and the draft name; may be refused by server policy), "
+			"get_template_status (template_name: a template name or the draft name returned by create_template; "
+			"returns status, rejection reason, quality and draft approval state)."
 		),
 		"function_path": "huf.ai.tools.whatsapp.handle_action",
 		"category": "Communication Tools",
 		"parameters": [
-			_action("send_message|send_template|list_messages|get_account_info"),
+			_action(
+				"send_message|send_media|send_image|send_video|send_audio|send_document|send_sticker|send_location|send_contact|"
+				"send_reaction|send_buttons|send_list|send_cta_url|send_template|list_messages|get_account_info|list_templates|"
+				"create_template|get_template_status"
+			),
 			_p("to", description="Recipient phone number (E.164). Alias: recipient, phone_number."),
 			_p("recipient", description="Alias for 'to'."),
 			_p("phone_number", description="Alias for 'to'."),
 			_p("message", description="Message text for send_message. Alias: text."),
 			_p("text", description="Alias for 'message'."),
-			_p("template_name", description="Template name for send_template."),
-			_p("language_code", description="Template language code for send_template (default 'en')."),
+			_p("template_name", description="Template name for send_template, or the new template's name for create_template."),
+			_p(
+				"category",
+				description="Template category for create_template: MARKETING or UTILITY.",
+			),
+			_p("language_code", description="Template language code, e.g. 'en' or 'en_US' (default 'en')."),
+			_p("body", description="create_template: template body text (use {{1}}, {{2}} for variables). send_buttons / send_list / send_cta_url: the message text (buttons and cta_url max 1024, list max 4096)."),
+			_p("sample_values", description="Comma-separated example values for the body placeholders (create_template)."),
+			_p("header_type", description="Optional template header type for create_template: TEXT, IMAGE or DOCUMENT."),
+			_p("header", description="create_template: header text for a TEXT header (at most one {{1}} variable, 60 chars). send_buttons / send_list / send_cta_url: optional header text (max 60)."),
+			_p("sample", description="Header example: example value for a TEXT header variable, or an https URL of a sample file for IMAGE/DOCUMENT."),
+			_p("footer", description="Optional footer (60 chars, no variables) for create_template, send_buttons, send_list and send_cta_url."),
+			_p(
+				"buttons",
+				type="array",
+				description="create_template: buttons [{type: QUICK_REPLY|URL|PHONE_NUMBER, text (25 chars), url, example, phone_number}] (max 3 quick replies or 2 call-to-action buttons). send_buttons: reply buttons [{id (max 256), title (max 20, unique)}], 1 to 3.",
+			),
+			_p("header_params", type="array", description="send_template header parameter: one text value, or one {type: image|document, link} object."),
+			_p("button_params", type="array", description="send_template URL button parameters: [{index: 0, sub_type: 'url', text: '<url suffix>'}]."),
+			_p("kind", description="Media kind for send_media: image, document, audio, video or sticker (the send_image/send_video/... actions set it for you)."),
+			_p("link", description="Public https URL of the media (send_media, send_image, send_video, send_audio, send_document, send_sticker). Give link or media_id, not both."),
+			_p("media_id", description="Meta media id of already uploaded media, instead of link (media actions)."),
+			_p("caption", description="Caption for image, video and document (max 1024 characters). Not allowed for audio or stickers."),
+			_p("filename", description="Filename shown for a document (include the extension, e.g. report.pdf)."),
+			_p("voice", type="boolean", description="send_audio: true sends the audio as a voice note (must be Ogg/Opus)."),
+			_p("latitude", type="number", description="send_location: latitude in decimal degrees, -90 to 90."),
+			_p("longitude", type="number", description="send_location: longitude in decimal degrees, -180 to 180."),
+			_p("name", description="send_location: place name (max 100 characters)."),
+			_p("address", description="send_location: place address (max 300 characters)."),
+			_p("contact_name", description="send_contact: the person's full name (required unless contacts is given)."),
+			_p("contact_phone", description="send_contact: phone number in international format."),
+			_p("contact_email", description="send_contact: email address."),
+			_p("contact_org", description="send_contact: company name."),
+			_p("contacts", type="array", description="send_contact: full contact objects [{name: {formatted_name}, phones: [{phone, type}], emails, urls, org}] (alternative to the contact_* fields)."),
+			_p("message_id", description="send_reaction: id (wamid...) of the customer's message to react to; it must be at most 30 days old."),
+			_p("emoji", description="send_reaction: exactly one emoji. Use remove=true (or an empty emoji) to remove the reaction."),
+			_p("remove", type="boolean", description="send_reaction: true removes your reaction."),
+			_p("button_text", description="send_list: label of the button that opens the list (max 20 characters)."),
+			_p("sections", type="array", description="send_list: [{title (max 24), rows: [{id (max 200), title (max 24), description (max 72)}]}]. At most 10 rows in total; title required when there are several sections."),
+			_p("display_text", description="send_cta_url: button label (max 20 characters)."),
+			_p("url", description="send_cta_url: the https:// address the button opens. Alias of link for media actions."),
+			_p("reply_to", description="Optional wamid of a message to quote in the reply (not for reactions)."),
 			_p("limit", type="integer", description="Max messages to return for list_messages (default 20)."),
-			_p("phone_number_id", description="Override the configured WhatsApp Phone Number ID."),
-			_p("access_token", description="Override the configured Meta access token."),
+			_p("whatsapp_account", description="WhatsApp Account name to use for list_templates, create_template or send_message."),
+			_p("status", description="Filter for list_templates by approval status, e.g. APPROVED or PENDING."),
+			_p(
+				"gateway_name",
+				description="Gateway name for send_message; when the 24h customer-service window is open, free-form sends are allowed.",
+			),
 		],
 	},
 ]

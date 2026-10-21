@@ -14,6 +14,10 @@ class TestGatewayPairingTools(IntegrationTestCase):
 
     def setUp(self):
         frappe.set_user("Administrator")
+        # Gateway.validate reads the execution user's own role rows; a fresh site may not have this one yet.
+        if not frappe.db.exists("Role", "Huf Gateway User"):
+            frappe.get_doc({"doctype": "Role", "role_name": "Huf Gateway User"}).insert(ignore_permissions=True)
+        frappe.get_doc("User", "Administrator").add_roles("Huf Gateway User")
 
     def test_setup_gateway_validation_failure(self):
         res = setup_gateway("Telegram", "Invalid Bot", {})
@@ -25,7 +29,7 @@ class TestGatewayPairingTools(IntegrationTestCase):
         res = setup_gateway(
             provider="Telegram",
             gateway_name=test_gw,
-            credentials={"token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"},
+            credentials={"token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz", "webhook_secret": "test-webhook-secret"},
             direct_policy="Pairing",
         )
         self.assertTrue(res["success"])
@@ -43,7 +47,7 @@ class TestGatewayPairingTools(IntegrationTestCase):
         setup_gateway(
             provider="Telegram",
             gateway_name=gw_name,
-            credentials={"token": "987654321:ABCdefGHIjklMNOpqrsTUVwxyz"},
+            credentials={"token": "987654321:ABCdefGHIjklMNOpqrsTUVwxyz", "webhook_secret": "test-webhook-secret"},
             direct_policy="Pairing",
         )
 
@@ -51,12 +55,12 @@ class TestGatewayPairingTools(IntegrationTestCase):
 
         gw_doc = frappe.get_doc("Gateway", gw_name)
         code = _create_pairing_request(gw_doc, sender_id="user_12345")
-        self.assertTrue(code.startswith("PAIR-"))
+        self.assertRegex(code, r"^PAIR-[A-Z2-9]{8}$")
 
         pending = list_pairing_requests(gw_name)
         self.assertTrue(any(p["pairing_code"] == code for p in pending))
 
-        approval = approve_pairing_code(code, notes="Approved during automated test")
+        approval = approve_pairing_code(code, notes="Approved during automated test", gateway_name=gw_name)
         self.assertTrue(approval["success"])
         self.assertEqual(approval["state"], "Approved")
 
@@ -72,7 +76,7 @@ class TestGatewayPairingTools(IntegrationTestCase):
         setup_gateway(
             provider="Telegram",
             gateway_name=gw_name,
-            credentials={"token": "111222333:ABCdefGHIjklMNOpqrsTUVwxyz"},
+            credentials={"token": "111222333:ABCdefGHIjklMNOpqrsTUVwxyz", "webhook_secret": "test-webhook-secret"},
         )
 
         health = test_gateway_health(gw_name)
