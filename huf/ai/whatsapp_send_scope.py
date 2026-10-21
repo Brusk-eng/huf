@@ -111,7 +111,7 @@ def check_recipient(gateway: str, run_id: Optional[str], recipient: str) -> Opti
 	contact = current_contact(run_id)
 	if contact and number == contact:
 		return None
-	scope = conf["scope"]
+	scope = conf["scope"] if conf["scope"] in SCOPES else DEFAULT_SCOPE
 	allowed = (
 		scope == "Any number"
 		or (scope == "Allow-list" and number in conf["allowlist"])

@@ -30,6 +30,7 @@ class _Base(unittest.TestCase):
 		self.addCleanup(patch.stopall)
 		patch.object(whatsapp, "_run_gateway", return_value=GW).start()
 		patch.object(whatsapp, "_authorize", return_value=None).start()
+		patch.object(whatsapp, "_scope_refusal", return_value=None).start()
 		patch.object(whatsapp, "_send_message", self.sent).start()
 		patch.object(whatsapp, "_send_media", self.sent).start()
 		patch.object(whatsapp, "_send_template", self.sent).start()
