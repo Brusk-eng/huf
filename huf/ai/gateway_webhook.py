@@ -258,7 +258,13 @@ def _ingest_rate_gate() -> None:
 _ingest_rate_limited = rate_limit(key="gateway_name", limit=100, seconds=60)(_ingest_rate_gate)
 _RATE_LIMIT_WINDOW_SECONDS = 60
 MAX_BODY_BYTES = 3 * 1024 * 1024  # Meta's webhook payload cap
-MAX_MESSAGES_PER_PAYLOAD = 100
+MAX_MESSAGES_PER_PAYLOAD = 100  # calls handled per delivery
+# Policy for large deliveries (no silent drops): every message is ingested inline, up to this cap on
+# total work per request. Past it the first MAX_INGEST_PER_REQUEST are ingested and the webhook answers
+# HTTP 503 + Retry-After so Meta redelivers the whole payload; ingest is idempotent per message id, so
+# the redelivery skips what is stored and continues with the rest. Meta caps a delivery at ~3 MB.
+MAX_INGEST_PER_REQUEST = 500
+_DEFERRED_RETRY_AFTER_SECONDS = 30
 
 
 def _ingest_rate_gate() -> None:
@@ -555,6 +561,35 @@ def _handle_calls(gateway, calls) -> list[dict]:
 	return results
 
 
+def _savepoint(name: str) -> None:
+	try:
+		frappe.db.savepoint(name)
+	except Exception:
+		pass
+
+
+def _rollback_to_savepoint(name: str) -> None:
+	try:
+		frappe.db.rollback(save_point=name)
+	except Exception:
+		pass
+
+
+def _dead_letter(gateway_name: str, event, exc: BaseException) -> int:
+	"""Keep a deterministically failing message as a replayable Failed Gateway Event. Never raises."""
+	from huf.ai.gateway_service import store_ingest_dead_letter
+
+	_rollback_to_savepoint("gw_ingest")  # drop whatever the failed ingest left half-written
+	try:
+		store_ingest_dead_letter(
+			gateway_name, event.provider_event_id, _event_context(event), dict(event.raw_payload or {}), exc
+		)
+		return 1
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "WhatsApp gateway dead letter failed")
+		return 0
+
+
 def _supports_batch_parse(adapter) -> bool:
 	# Class-level lookup so duck-typed/mock adapters do not accidentally qualify.
 	return callable(getattr(type(adapter), "parse_payload", None))
@@ -572,12 +607,12 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		return {"success": False, "error": "Invalid payload"}
 
 	messages = list(parsed.messages)
-	over_cap = max(len(messages) - MAX_MESSAGES_PER_PAYLOAD, 0)
-	if over_cap:
-		messages = messages[:MAX_MESSAGES_PER_PAYLOAD]
+	deferred = max(len(messages) - MAX_INGEST_PER_REQUEST, 0)
+	if deferred:
+		messages = messages[:MAX_INGEST_PER_REQUEST]
 		_warn(
 			f"WhatsApp gateway {gateway.name}: payload carried {len(parsed.messages)} messages; "
-			f"processed the first {MAX_MESSAGES_PER_PAYLOAD}, ignored {over_cap}"
+			f"ingested {MAX_INGEST_PER_REQUEST}, answering 503 so the provider redelivers the other {deferred}"
 		)
 	if messages or getattr(parsed, "calls", ()):
 		_ingest_rate_gate()
@@ -585,9 +620,10 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 	ingested = duplicates = 0
 	results: list[dict] = []
 	first_transient = None
-	failed = 0
+	failed = dead_lettered = 0
 	account_name = None
 	for event in messages:
+		_savepoint("gw_ingest")
 		try:
 			result = ingest_gateway_event(
 				gateway.name,
@@ -602,7 +638,8 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			if isinstance(exc, _TRANSIENT_ERRORS):
 				first_transient = first_transient or exc  # re-raised below so Meta retries (deduped)
 			else:
-				failed += 1  # deterministic: a retry cannot succeed, so still ack 200
+				failed += 1  # deterministic: a retry cannot succeed, so still ack 200 ...
+				dead_lettered += _dead_letter(gateway.name, event, exc)  # ... but never lose the message
 			continue
 		results.append(result)
 		if result.get("duplicate"):
@@ -658,8 +695,14 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 
 	if first_transient is not None:
 		raise first_transient
+	if deferred:
+		frappe.local.response.http_status_code = 503
+		try:
+			frappe.local.response_headers["Retry-After"] = str(_DEFERRED_RETRY_AFTER_SECONDS)
+		except Exception:
+			pass
 	return {
-		"success": True,
+		"success": not deferred,
 		"messages": len(messages),
 		"ingested": ingested,
 		"duplicates": duplicates,
@@ -667,9 +710,13 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		"template_updates": len(parsed.template_updates),
 		"calls": len(call_results),
 		"forwarded": forwarded,
-		"ignored": parsed.ignored + over_cap,
-		"note": (f"Only the first {MAX_MESSAGES_PER_PAYLOAD} messages were processed" if over_cap else ""),
+		"ignored": parsed.ignored,
+		"deferred": deferred,
+		"note": (
+			f"{deferred} messages not processed yet; retry the delivery (503)" if deferred else ""
+		),
 		"failed": failed,
+		"dead_lettered": dead_lettered,
 		"results": results,
 	}
 

@@ -309,13 +309,13 @@ class TestWhatsAppIngress(unittest.TestCase):
 		)
 		self.mock_frappe.db.set_value.assert_not_called()
 
-	def test_batch_of_150_messages_is_capped_at_100(self):
+	def test_batch_of_150_messages_is_fully_processed(self):
 		result = self._call(_payload([_msg(f"wamid.{i}") for i in range(150)]))
 		self.assertTrue(result["success"])
-		self.assertEqual(self.ingest.call_count, 100)
-		self.assertEqual(result["ingested"], 100)
-		self.assertEqual([c.args[1] for c in self.ingest.call_args_list], [f"wamid.{i}" for i in range(100)])
-		self.assertIn("first 100", result["note"])
+		self.assertEqual(self.ingest.call_count, 150)
+		self.assertEqual(result["ingested"], 150)
+		self.assertEqual(result["ignored"], 0)
+		self.assertEqual(result["deferred"], 0)
 		self.gate.assert_called_once()  # the batch counts as one request against the budget
 
 	def test_burst_of_signed_posts_hits_the_rate_limit_with_retry_after(self):
