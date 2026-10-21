@@ -341,6 +341,8 @@ def _record_failed_status(gateway_name: str, status: dict) -> None:
 	try:
 		errors = status.get("errors") if isinstance(status.get("errors"), list) else []
 		first = errors[0] if errors and isinstance(errors[0], dict) else {}
+		if str(first.get("code")) in ("131060", "2593109"):
+			return  # informational (WP-11): no alert, no Failed marking
 		code = first.get("code") or "unknown"
 		title = first.get("title") or first.get("message") or "no detail"
 		recipient = str(status.get("recipient_id") or "")
@@ -555,6 +557,15 @@ def _handle_calls(gateway, calls) -> list[dict]:
 	return results
 
 
+def _apply_account_events(events) -> int:
+	"""account_update / user_preferences: routed by WABA/phone id, no Gateway Event row (WP-11)."""
+	if not events:
+		return 0
+	from huf.ai import whatsapp_account_events
+
+	return whatsapp_account_events.apply_account_events(events)
+
+
 def _supports_batch_parse(adapter) -> bool:
 	# Class-level lookup so duck-typed/mock adapters do not accidentally qualify.
 	return callable(getattr(type(adapter), "parse_payload", None))
@@ -639,6 +650,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			_record_failed_status(gateway.name, status)
 	routed_updates = [update for update in parsed.template_updates if _record_template_update(update, gateway.name)]
 	call_results = _handle_calls(gateway, getattr(parsed, "calls", ()) or ())
+	account_applied = _apply_account_events(getattr(parsed, "account_events", ()) or ())
 
 	forwarded = 0
 	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
@@ -666,6 +678,7 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		"statuses": len(parsed.statuses),
 		"template_updates": len(parsed.template_updates),
 		"calls": len(call_results),
+		"account_events": account_applied,
 		"forwarded": forwarded,
 		"ignored": parsed.ignored + over_cap,
 		"note": (f"Only the first {MAX_MESSAGES_PER_PAYLOAD} messages were processed" if over_cap else ""),

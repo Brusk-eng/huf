@@ -6,7 +6,7 @@ tuple, requests-style exception or response, or a string) into one dict:
 	code, subcode, kind, retryable, retry_after_hint, operator_text, user_msg, message,
 	http_status
 
-``kind`` is one of: auth, rate_limited, pair_rate_limited, window_closed, template,
+``kind`` is one of: auth, informational, rate_limited, pair_rate_limited, window_closed, template,
 media, recipient, permission, param, server, timeout, unknown.
 
 ``backoff_seconds(kind, attempt)`` and ``is_permanent(classification)`` form the retry
@@ -53,6 +53,9 @@ PAIR_RATE_LIMIT_DELAY_SECONDS = 6.0
 # code -> (kind, retryable, retry_after_hint_seconds, operator_text)
 _CODES: dict[int, tuple[str, bool, float | None, str]] = {
 	# --- auth (190 V)
+	# --- informational: expected, not an operator problem (131060 unsupported inbound type, 2593109 user-preference notice)
+	131060: ("informational", False, None, "Informational: Meta could not deliver this item; no action needed."),  # U
+	2593109: ("informational", False, None, "Informational: no action needed."),  # U
 	190: ("auth", False, None, "The access token is invalid or expired. Generate a new system user token and update the account."),
 	102: ("auth", False, None, "The API session expired. Generate a new access token."),  # M
 	# --- permission
@@ -330,6 +333,14 @@ def _classify(err: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- retry policy
+
+
+def is_informational(classification: Any) -> bool:
+	"""True for expected codes (131060, 2593109) that must not alert or mark a delivery Failed."""
+	try:
+		return classification.get("kind") == "informational"
+	except Exception:
+		return False
 
 
 def is_permanent(classification: dict[str, Any]) -> bool:

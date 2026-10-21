@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import frappe
+from huf.ai import whatsapp_account_events as account_events_mod
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 from huf.ai.gateway_adapters import whatsapp_calls as wc
 from huf.ai.gateway_adapters import whatsapp_errors as we
@@ -47,6 +48,7 @@ _TEMPLATE_FIELD_KINDS = {
 _MEDIA_TYPES = inbound.MEDIA_TYPES
 # Webhook fields whose content is ingested; a change on any other field yields zero events.
 _INGESTED_FIELDS = frozenset({"messages", "statuses", "calls"})
+_ACCOUNT_EVENT_FIELDS = frozenset({"account_update", "user_preferences"})
 
 
 def _log_ignored(reason: str) -> None:
@@ -121,6 +123,7 @@ class WhatsAppParsed:
 	ignored: int
 	unknown_phone_ids: tuple[str, ...] = ()
 	calls: tuple[wc.WhatsAppCall, ...] = ()  # `calls` webhook field (normalised, metadata + in-memory SDP)
+	account_events: tuple[dict, ...] = ()  # account_update / user_preferences, routed by WABA id or phone id
 
 
 def _requests_post(url: str, *, json: dict, headers: dict, timeout: int) -> Any:
@@ -222,6 +225,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		ignored = 0
 		unknown_phone_ids: list[str] = []
 		calls: list[wc.WhatsAppCall] = []
+		account_events: list[dict] = []
 
 		for entry in _as_list(payload.get("entry")):
 			for change in _as_list(entry.get("changes") if isinstance(entry, dict) else None):
@@ -237,6 +241,12 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					# the WABA id (entry[].id) is what routes a template update to its WhatsApp Account
 					waba_id = str(entry.get("id") or "") if isinstance(entry, dict) else ""
 					template_updates.append({**value, "kind": _TEMPLATE_FIELD_KINDS[field], "waba_id": waba_id})
+					continue
+				if field in _ACCOUNT_EVENT_FIELDS and account_events_mod.is_relevant(field, value):
+					# no phone metadata on account_update: routed by the WABA id (entry[].id), like templates
+					waba_id = str(entry.get("id") or "") if isinstance(entry, dict) else ""
+					meta = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+					account_events.append({**value, "field": field, "waba_id": waba_id, "phone_id": str(meta.get("phone_number_id") or "")})
 					continue
 				if field not in _INGESTED_FIELDS:
 					# standby/echo/account_review/... : never ingest, only count and log (no payload content)
@@ -275,7 +285,7 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 					else:
 						messages.append(event)
 
-		return WhatsAppParsed(tuple(messages), tuple(statuses), tuple(template_updates), ignored, tuple(unknown_phone_ids), tuple(calls))
+		return WhatsAppParsed(tuple(messages), tuple(statuses), tuple(template_updates), ignored, tuple(unknown_phone_ids), tuple(calls), tuple(account_events))
 
 	def normalize_inbound(self, request: GatewayInboundRequest) -> NormalizedGatewayEvent:
 		"""Return the first message event; ValueError only if nothing actionable exists."""
@@ -701,6 +711,9 @@ class WhatsAppGatewayAdapter(GatewayAdapter):
 		)
 
 	def _graph_send(self, data: dict[str, Any]) -> OutboundDelivery:
+		refusal = account_events_mod.send_refusal(self._phone_number_id)
+		if refusal:
+			raise WhatsAppSendError(refusal["message"], {"kind": "gateway_disconnected", "retryable": False, "message": refusal["message"]})
 		url = f"{self._graph_url}/{self._phone_number_id}/messages"
 		headers = {
 			"Authorization": f"Bearer {self._access_token}",
