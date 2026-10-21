@@ -6,7 +6,7 @@
 Single consolidated tool that performs WhatsApp Cloud API actions via an
 `action` parameter.
 
-Actions: send_message, send_media, send_image, send_video, send_audio, send_document, send_sticker,
+Actions: send_message, send_media, send_image, send_video, send_audio, send_voice_note, send_document, send_sticker,
 send_location, send_contact, send_reaction, send_buttons, send_list, send_cta_url, send_template,
 list_messages, get_account_info, list_templates, create_template, get_template_status.
 
@@ -191,6 +191,8 @@ def handle_action(action: str, **kwargs: Any) -> str:
 		return _send_message(kwargs)
 	elif action == "send_media":
 		return _send_media(kwargs)
+	elif action == "send_voice_note":
+		return _send_voice_note(kwargs)
 	elif action in _MEDIA_ACTIONS:
 		return _send_media({**kwargs, "kind": _MEDIA_ACTIONS[action]})
 	elif action == "send_location":
@@ -216,7 +218,7 @@ def handle_action(action: str, **kwargs: Any) -> str:
 	else:
 		return _error(
 			f"Unknown action '{action}'. Supported actions: send_message, send_media, send_image, send_video, "
-			"send_audio, send_document, send_sticker, send_location, send_contact, send_reaction, send_buttons, "
+			"send_audio, send_voice_note, send_document, send_sticker, send_location, send_contact, send_reaction, send_buttons, "
 			"send_list, send_cta_url, send_template, list_messages, get_account_info, list_templates, "
 			"create_template, get_template_status"
 		)
@@ -460,6 +462,16 @@ def _send_media(kwargs: dict) -> str:
 		),
 		"media",
 	)
+
+
+def _send_voice_note(kwargs: dict) -> str:
+	"""Send audio as a voice note (``audio.voice: true``); only Ogg/Opus is accepted."""
+	link = kwargs.get("link") or kwargs.get("url")
+	if link and not kwargs.get("media_id"):
+		errors = wm.validate_voice_link(link)
+		if errors:
+			return json.dumps(wt.validation_error(errors), default=str)
+	return _send_media({**kwargs, "kind": "audio", "voice": True})
 
 
 def _send_location(kwargs: dict) -> str:

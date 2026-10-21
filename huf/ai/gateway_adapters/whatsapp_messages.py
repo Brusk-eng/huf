@@ -209,6 +209,29 @@ def validate_media_file(kind: Any, mime: Any, size: int, head: bytes = b"", voic
 	return errors
 
 
+VOICE_LINK_EXTENSIONS = (".ogg", ".opus", ".oga")
+
+
+def validate_voice_link(link: Any) -> list[dict[str, str]]:
+	"""A voice note sent by public link must point at an Ogg/Opus file (the mime type is only known after upload)."""
+	path = _text(link).split("?", 1)[0].split("#", 1)[0].lower()
+	if path.endswith(VOICE_LINK_EXTENSIONS):
+		return []
+	return [err("link", "voice_needs_ogg_opus", "A voice note must be an Ogg file with the Opus codec (.ogg/.opus).")]
+
+
+def build_voice_note_payload(
+	to: str, link: Any = None, media_id: Any = None, reply_to: str | None = None
+) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+	"""Audio message with ``audio.voice: true`` (Meta: voice messages must be Ogg/Opus, mono, <= 16 MB)."""
+	link = _text(link)
+	if link and not media_id:
+		errors = validate_voice_link(link)
+		if errors:
+			return None, errors
+	return build_media_payload(to, "audio", link=link, media_id=media_id, voice=True, reply_to=reply_to)
+
+
 def validate_upload(
 	mime: Any, content: bytes, kind: Any = None, voice: bool = False
 ) -> tuple[str, list[dict[str, str]]]:

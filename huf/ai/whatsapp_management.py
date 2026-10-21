@@ -796,6 +796,31 @@ def _send_media_impl(gateway_name, to, kind, link, file_url, caption, filename, 
 @frappe.whitelist(methods=["POST"])
 @rate_limit(limit=60, seconds=60)
 @_bridge_guard
+def send_voice_note(
+	gateway_name: str | None = None,
+	to: str | None = None,
+	link: str | None = None,
+	file_url: str | None = None,
+	media_id: str | None = None,
+	reply_to: str | None = None,
+) -> dict[str, Any]:
+	"""Send an audio message as a WhatsApp voice note (``audio.voice: true``); Ogg/Opus mono only, <= 16 MB.
+
+	Non-Ogg/Opus input is rejected client-side: a ``link`` must end in .ogg/.opus and an uploaded ``file_url``
+	must be audio/ogg (checked again against its real mime type on upload).
+	"""
+	if link and not media_id:
+		errors = wm.validate_voice_link(link)
+		if errors:
+			return wt.validation_error(errors)
+	if file_url and not link and not media_id and not str(file_url).lower().endswith(wm.VOICE_LINK_EXTENSIONS):
+		return wt.validation_error([wm.err("file_url", "voice_needs_ogg_opus", "A voice note must be an Ogg file with the Opus codec.")])
+	return _send_media_impl(gateway_name, to, "audio", link, file_url, None, None, media_id, True, reply_to)
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+@_bridge_guard
 def upload_media_file(
 	gateway_name: str | None = None, file_url: str | None = None, kind: str | None = None, voice: Any = None
 ) -> dict[str, Any]:

@@ -1237,6 +1237,26 @@ def post_media_upload(
 		raise BridgeError(_err("upload_failed", message="Unexpected response from WhatsApp.")) from exc
 
 
+def send_voice_note(
+	account_name: str,
+	to: str,
+	link: str | None = None,
+	media_id: str | None = None,
+	reply_to: str | None = None,
+	trusted: bool = False,
+	http_post: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+	"""Send audio as a voice note (``audio.voice: true``); rejects anything that is not Ogg/Opus before any call."""
+	if link and not media_id:
+		errors = wm.validate_voice_link(link)
+		if errors:
+			raise BridgeError(wt.validation_error(errors))
+	return send_media(
+		account_name, to, "audio", link=link, media_id=media_id, reply_to=reply_to, trusted=trusted,
+		voice=True, http_post=http_post,
+	)
+
+
 def upload_media(
 	account_name: str, content: bytes, mime_type: str, filename: str = "", kind: str | None = None,
 	voice: bool = False, trusted: bool = False, http_post: Callable[..., Any] | None = None,
