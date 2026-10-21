@@ -42,6 +42,7 @@ def _settings(**flags):
 		whatsapp,
 		_run_gateway=MagicMock(return_value="GW-1"),
 		_authorize=MagicMock(return_value=None),
+		_scope_refusal=MagicMock(return_value=None),  # recipient scope has its own suite (test_whatsapp_send_scope)
 		_server_flag=MagicMock(side_effect=lambda gateway, name: whatsapp._is_truthy(flags.get(name))),
 	)
 
