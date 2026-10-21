@@ -446,8 +446,10 @@ class TestIndexesWithoutBridge(IntegrationTestCase):
 class TestReplyDeliveryTracking(_Base):
 	def setUp(self):
 		super().setUp()
-		self.gw = self.make_gateway("D", secret="d-secret", phone="5559990001")
-		self.other = self.make_gateway("E", secret="e-secret", phone="5559990002")
+		# unique per run so a committed leftover gateway can never collide on phone_number_id
+		uniq = f"{int(self.suffix, 16):08d}"[-8:]
+		self.gw = self.make_gateway("D", secret="d-secret", phone=f"5559{uniq}1")
+		self.other = self.make_gateway("E", secret="e-secret", phone=f"5559{uniq}2")
 		self.agent = frappe.get_doc(
 			{
 				"doctype": "Agent",

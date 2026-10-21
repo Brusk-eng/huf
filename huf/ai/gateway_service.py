@@ -1370,6 +1370,12 @@ def ingest_gateway_event(
     return {"event_name": event.name, **route}
 
 
+def _commit_unless_testing() -> None:
+    """Make state durable for the worker; skipped under the test runner so test rollback still cleans up."""
+    if not frappe.flags.in_test:
+        frappe.db.commit()
+
+
 STUCK_RUNNING_MINUTES = 15
 _TERMINAL_STATES = ("Succeeded", "Failed")
 
@@ -1395,7 +1401,7 @@ def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int =
                 },
             )
         if stuck:
-            frappe.db.commit()
+            _commit_unless_testing()
         return len(stuck)
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Gateway stuck-event reaper failed")
@@ -1404,7 +1410,7 @@ def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int =
 
 def _persist_terminal_state(event_name: str, result: Any) -> None:
     """Commit, then verify a terminal result really reached the database; repair and log if not."""
-    frappe.db.commit()
+    _commit_unless_testing()
     if not isinstance(result, dict) or result.get("status") not in _TERMINAL_STATES:
         return
     expected = {"status": result["status"]}
@@ -1418,7 +1424,7 @@ def _persist_terminal_state(event_name: str, result: Any) -> None:
         "Gateway event terminal write lost",
     )
     frappe.db.set_value("Gateway Event", event_name, expected)
-    frappe.db.commit()
+    _commit_unless_testing()
 
 
 def process_gateway_event(event_name: str) -> dict:
@@ -1509,7 +1515,7 @@ def _process_gateway_event(event_name: str) -> dict:
 
             fallback_note = ""
             _maybe_mark_read_typing(event, gateway)
-            frappe.db.commit()  # keep Running status and saved media across a retry rollback
+            _commit_unless_testing()  # keep Running status and saved media across a retry rollback
             result = _run_agent_with_retry(
                 run_agent_sync,
                 agent_name=event.target_agent,

@@ -183,6 +183,17 @@ class TestWebhookLimits(unittest.TestCase):
 
 
 class TestTerminalStatePersistence(unittest.TestCase):
+	def setUp(self):
+		self._in_test = frappe.flags.get("in_test")
+		frappe.flags.in_test = False
+		self.addCleanup(lambda: setattr(frappe.flags, "in_test", self._in_test))
+
+	def test_commits_are_skipped_under_the_test_runner(self):
+		frappe.flags.in_test = True
+		with patch.object(gateway_service.frappe.db, "commit") as commit:
+			gateway_service._commit_unless_testing()
+		commit.assert_not_called()
+
 	def test_lost_terminal_write_is_repaired_and_logged(self):
 		result = {"status": "Failed", "agent_run_id": "AR-1"}
 		with (
