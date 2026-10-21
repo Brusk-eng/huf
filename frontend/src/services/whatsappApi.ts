@@ -284,6 +284,9 @@ export function errorText(res: WhatsAppError): string {
     edit_limit_30d: 'The edit limit for the last 30 days has been used up.',
     status_not_editable: 'This template cannot be edited in its current state.',
     edit_blocked: "Meta won't let this template be edited right now. Try again later or create a new version.",
+    media_link_unreachable: "WhatsApp can't download this link. Upload the file instead.",
+    media_link_wrong_type: 'This link is a web page or the wrong kind of file. Upload the file instead.',
+    media_link_too_large: 'The file at this link is larger than WhatsApp allows. Upload a smaller file.',
     no_template_id: 'This template is not linked to WhatsApp yet. Sync templates first.',
   };
   if (res.errors?.length) return res.errors.map((e) => e.message).join(' ');

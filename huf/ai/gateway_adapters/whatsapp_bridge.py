@@ -1039,8 +1039,12 @@ def send_media(
 	trusted: bool = False,
 	voice: bool | None = None,
 	http_post: Callable[..., Any] | None = None,
+	http_get: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
 	"""Send an image/document/audio/video/sticker; exactly one Graph call.
+
+	A ``link`` is preflighted first (:func:`preflight_media_link`): Meta fetches links asynchronously, so a
+	dead or hotlink-protected URL would otherwise return a message id and never be delivered.
 
 	A plain image/document/audio/video by public ``link`` is an Outgoing ``WhatsApp Message`` (frappe_whatsapp
 	reads ``attach``/``message`` and performs the send). It cannot send an uploaded ``media_id``, a sticker, a
@@ -1052,6 +1056,8 @@ def send_media(
 	media, errors = wt.validate_media_request(kind, link, media_id, caption, filename, voice)
 	if errors:
 		raise BridgeError(wt.validation_error(errors))
+	if not media["media_id"]:
+		_preflight_link(media["kind"], media["link"], http_get)
 	if media["media_id"] or media["kind"] == "sticker" or media["voice"] or media["filename"]:
 		payload = wt.build_media_payload(normalize_phone(to), media, reply_to)
 		return _send_payload(account_name, payload, trusted, http_post)
@@ -1201,10 +1207,12 @@ def send_reaction(
 
 def send_sticker(
 	account_name: str, to: str, link: str | None = None, media_id: str | None = None, reply_to: str | None = None,
-	trusted: bool = False, http_post: Callable[..., Any] | None = None,
+	trusted: bool = False, http_post: Callable[..., Any] | None = None, http_get: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
 	_account_or_error(account_name)
 	payload = _built(wm.build_sticker_payload(normalize_phone(to), link, media_id, reply_to))
+	if not media_id:
+		_preflight_link("sticker", link, http_get)
 	return _send_payload(account_name, payload, trusted, http_post)
 
 
@@ -1448,45 +1456,171 @@ _SAMPLE_MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 
-def _check_sample_hop(url: str) -> None:
-	"""SSRF guard for ONE hop of a sample fetch: https only, no private/loopback/link-local host."""
+def _check_hop(url: str, fail: Callable[[str, str], Any], label: str) -> None:
+	"""SSRF guard for ONE hop of a fetch: https only, no private/loopback/link-local host. ``fail(code, msg)`` raises."""
 	parsed = urlparse(url)
 	host = parsed.hostname or ""
 	if host and parsed.netloc.lower() in _test_hosts():  # tests only (see _test_hosts)
 		return
 	if parsed.scheme != "https":
-		raise _sample_problem("sample_not_https", "The sample URL must be https (a redirect to a non-https URL was refused).")
+		fail(f"{label}_not_https", f"The {label} URL must be https (a redirect to a non-https URL was refused).")
 	if not host or _is_private_host(host):
-		raise _sample_problem("sample_private_host", "The sample URL (or a redirect target) points to a private or local address.")
+		fail(f"{label}_private_host", f"The {label} URL (or a redirect target) points to a private or local address.")
 
 
-def _fetch_sample(sample: str, get: Callable[..., Any]) -> Any:
-	"""GET a sample URL following up to 3 redirects by hand, checking EVERY hop (SSRF). Returns the 2xx response."""
-	url, seen = sample, []
+def _check_sample_hop(url: str) -> None:
+	def fail(code: str, message: str) -> None:
+		raise _sample_problem(code, message)
+
+	_check_hop(url, fail, "sample")
+
+
+def _follow_redirects(
+	url: str, get: Callable[..., Any], fail: Callable[[str, str], Any], label: str, **get_kwargs: Any
+) -> tuple[Any, int]:
+	"""GET ``url`` following up to 3 redirects by hand, checking EVERY hop (SSRF). Returns ``(response, hops)``.
+
+	Non-2xx answers, loops and too many redirects go through ``fail(code, message)`` (which raises);
+	``"<label>_unreachable"`` is the code used for them. A 3xx without a ``Location`` also fails.
+	"""
+	unreachable = f"{label}_unreachable"
+	seen = []
+	code: Any = None
 	for hop in range(_SAMPLE_MAX_REDIRECTS + 1):
-		_check_sample_hop(url)
+		_check_hop(url, fail, label)
 		seen.append(url)
 		try:
-			resp = get(url, timeout=30, allow_redirects=False)
+			resp = get(url, allow_redirects=False, **get_kwargs)
 		except Exception as exc:
-			raise _sample_problem("sample_unreachable", f"Could not fetch the sample: {_redact(exc)}") from exc
+			fail(unreachable, f"Could not fetch the {label}: {_redact(exc)}")
 		code = getattr(resp, "status_code", 200)
 		if isinstance(code, int) and code in _REDIRECT_STATUSES:
 			headers = getattr(resp, "headers", None) or {}
 			location = str(headers.get("Location") or headers.get("location") or "").strip()
 			if not location:
-				raise _sample_problem("sample_unreachable", f"The sample URL answered HTTP {code} without a Location header.")
+				fail(unreachable, f"The {label} URL answered HTTP {code} without a Location header.")
 			url = urljoin(url, location)
 			if url in seen:
-				raise _sample_problem("sample_unreachable", "The sample URL redirects in a loop.")
+				fail(unreachable, f"The {label} URL redirects in a loop.")
 			continue
-		if not isinstance(code, int) or code >= 300:
-			via = f" after {hop} redirect{'s' if hop != 1 else ''}" if hop else ""
-			raise _sample_problem("sample_unreachable", f"The sample URL answered HTTP {code}{via}.")
-		return resp
-	raise _sample_problem(
-		"sample_unreachable", f"The sample URL redirected more than {_SAMPLE_MAX_REDIRECTS} times (last status HTTP {code})."
-	)
+		return resp, hop
+	fail(unreachable, f"The {label} URL redirected more than {_SAMPLE_MAX_REDIRECTS} times (last status HTTP {code}).")
+
+
+def _fetch_sample(sample: str, get: Callable[..., Any]) -> Any:
+	"""GET a sample URL following up to 3 redirects by hand, checking EVERY hop (SSRF). Returns the 2xx response."""
+
+	def fail(code: str, message: str) -> None:
+		raise _sample_problem(code, message)
+
+	resp, hop = _follow_redirects(sample, get, fail, "sample", timeout=30)
+	code = getattr(resp, "status_code", 200)
+	if not isinstance(code, int) or code >= 300:
+		via = f" after {hop} redirect{'s' if hop != 1 else ''}" if hop else ""
+		fail("sample_unreachable", f"The sample URL answered HTTP {code}{via}.")
+	return resp
+
+
+_LINK_PEEK_BYTES = 2048
+_LINK_BUDGET_SECONDS = 10
+_LINK_EXTENSIONS = {
+	"image": (".jpg", ".jpeg", ".png"),
+	"video": (".mp4", ".3gp", ".3gpp"),
+	"audio": (".aac", ".amr", ".mp3", ".m4a", ".mp4", ".ogg", ".oga", ".opus"),
+	"document": (".pdf", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"),
+	"sticker": (".webp",),
+}
+_LINK_MIME_PREFIX = {"image": "image/", "video": "video/", "audio": "audio/", "sticker": "image/"}
+_GENERIC_MIMES = ("application/octet-stream", "binary/octet-stream", "")
+_LINK_HINT = "Upload the file instead (file_url): that is the reliable way to send media."
+
+
+def _link_problem(code: str, message: str) -> BridgeError:
+	return BridgeError(_err(code, message=message, hint=_LINK_HINT))
+
+
+def _link_mime_ok(kind: str, mime: str, path: str) -> bool:
+	if mime in ("text/html", "application/xhtml+xml"):
+		return False
+	if mime in _GENERIC_MIMES:
+		return path.lower().endswith(_LINK_EXTENSIONS[kind])
+	if kind in _LINK_MIME_PREFIX:
+		return mime.startswith(_LINK_MIME_PREFIX[kind]) and (kind != "sticker" or mime == "image/webp")
+	return mime in wm.MEDIA_RULES["document"][1] or (mime.startswith("application/") and not mime.endswith(("+xml", "javascript")))
+
+
+def preflight_media_link(kind: str, link: str, http_get: Callable[..., Any] | None = None) -> None:
+	"""Check that Meta will be able to download ``link`` BEFORE any Graph call; raises :class:`BridgeError`.
+
+	Meta fetches a media ``link`` asynchronously after accepting the send, so an unreachable or wrong
+	link still returns a message id and is then silently never delivered. This fetches the link the way
+	template header samples are fetched (https only, up to 3 redirects, every hop SSRF-checked, short
+	timeout) and requires HTTP 200, a content type that matches ``kind`` (never HTML) and the Meta size cap.
+	Codes: ``media_link_unreachable``, ``media_link_wrong_type``, ``media_link_too_large``.
+	"""
+	import time
+
+	kind = str(kind or "").strip().lower()
+	if kind not in wm.MEDIA_RULES:
+		return
+
+	def fail(code: str, message: str) -> None:
+		# SSRF / transport failures from the shared redirect helper all read as "not reachable" to the caller.
+		raise _link_problem("media_link_unreachable", "The media link is not publicly reachable; WhatsApp could not download it.")
+
+	resp, _hops = _follow_redirects(link, http_get or _default_get, fail, "media link", timeout=10, stream=True)
+	try:
+		code = getattr(resp, "status_code", 200)
+		if code != 200:
+			fail("media_link_unreachable", "")
+		headers = getattr(resp, "headers", None) or {}
+		mime = wm.normalize_mime(headers.get("Content-Type") or headers.get("content-type"))
+		path = urlparse(link).path
+		peek = b""
+		if hasattr(resp, "iter_content"):
+			started = time.monotonic()
+			total = 0
+			limit = wm.MEDIA_RULES[kind][0]
+			try:
+				declared = int(headers.get("Content-Length") or headers.get("content-length") or 0)
+			except (TypeError, ValueError):
+				declared = 0
+			for chunk in resp.iter_content(chunk_size=64 * 1024):
+				if not peek:
+					peek = bytes(chunk[:_LINK_PEEK_BYTES])
+				total += len(chunk)
+				if declared or total > limit or time.monotonic() - started > _LINK_BUDGET_SECONDS:
+					break  # size is known from the header, over the cap, or the time budget is spent
+			size = declared or total
+		else:
+			content = getattr(resp, "content", b"") or b""
+			peek, size = bytes(content[:_LINK_PEEK_BYTES]), len(content)
+	finally:
+		close = getattr(resp, "close", None)
+		if callable(close):
+			close()
+	head = peek.lstrip()[:15].lower()
+	if head.startswith((b"<!doctype", b"<html")) or not _link_mime_ok(kind, mime, path):
+		raise _link_problem(
+			"media_link_wrong_type",
+			f"The media link does not point to a {kind} file (it returned a web page or another type of file).",
+		)
+	limit = wm.MEDIA_RULES[kind][0]
+	label = f"{limit // _MB} MB"
+	if kind == "sticker":
+		limit = wm.STICKER_ANIMATED_MAX if wm.webp_is_animated(peek) else wm.STICKER_STATIC_MAX
+		label = f"{limit // 1024} KB"
+	if size > limit:
+		raise _link_problem("media_link_too_large", f"The {kind} at this link is larger than WhatsApp allows ({label}).")
+
+
+def _preflight_link(kind: str, link: str | None, http_get: Callable[..., Any] | None) -> None:
+	"""Preflight a media link send. Skipped under tests unless a fake ``http_get`` is injected (no real network)."""
+	if not link:
+		return
+	if http_get is None and getattr(frappe.flags, "in_test", False):
+		return
+	preflight_media_link(kind, link, http_get)
 
 
 def _read_header_sample(
