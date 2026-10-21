@@ -45,7 +45,8 @@ describe('MessageDetailSheet', () => {
     expect(screen.getByText('Received')).toBeInTheDocument();
     expect(screen.queryByRole('list')).toBeNull();
     expect(screen.getByText('Customer')).toBeInTheDocument();
-    expect(screen.getByText('None', { selector: 'span' })).toBeInTheDocument();
+    expect(screen.queryByText('None')).toBeNull();
+    expect(screen.getAllByText('\u2014').length).toBe(2);
   });
 
   it('falls back to a placeholder for non-text content', () => {

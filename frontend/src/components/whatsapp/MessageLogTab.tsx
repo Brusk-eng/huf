@@ -183,7 +183,6 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                 <TableHead>Message</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Agent</TableHead>
-                <TableHead>Gateway</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -196,7 +195,12 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                     data-event={m.event ?? undefined}
                     aria-current={eventName && m.event === eventName ? 'true' : undefined}
                     className={`cursor-pointer ${eventName && m.event === eventName ? 'bg-paper-deep' : ''}`}
+                    tabIndex={0}
                     onClick={() => setSelected(m)}
+                    onKeyDown={(e) => {
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelected(m); }
+                    }}
                   >
                     <TableCell className="whitespace-nowrap font-mono text-xs text-steel">{m.creation}</TableCell>
                     <TableCell><Badge variant={m.direction === 'in' ? 'pill-neutral' : 'pill-success'}>{m.direction === 'in' ? 'In' : 'Out'}</Badge></TableCell>
@@ -227,7 +231,6 @@ export function MessageLogTab({ gateway, bridgeAvailable }: { gateway?: string; 
                         <span className="text-steel">{sentByLabel(m.sent_by, title ?? m.agent)}</span>
                       )}
                     </TableCell>
-                    <TableCell className="text-xs text-steel">{m.gateway}</TableCell>
                   </TableRow>
                 );
               })}

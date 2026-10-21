@@ -19,6 +19,8 @@ export function StatusTicks({ status }: { status?: string | null }) {
   );
 }
 
+const Empty = () => <span className="text-steel">&mdash;</span>;
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="space-y-0.5">
@@ -76,9 +78,9 @@ export function MessageDetailSheet({
               <Field label="Time">{item.creation}</Field>
               <Field label="Gateway">{item.gateway}</Field>
               <Field label="Type">{item.content_type || 'text'}</Field>
-              <Field label="Template">{item.template ? <Badge variant="chip">{item.template}</Badge> : 'None'}</Field>
+              <Field label="Template">{item.template ? <Badge variant="chip">{item.template}</Badge> : <Empty />}</Field>
               <Field label="Handled by">{sentByLabel(item.sent_by, agentTitle ?? item.agent)}</Field>
-              <Field label="Message ID"><span className="break-all font-mono">{item.message_id || 'None'}</span></Field>
+              <Field label="Message ID"><span className="break-all font-mono">{item.message_id || <Empty />}</span></Field>
             </dl>
             <div className="flex flex-wrap gap-3 text-xs">
               {runPath && <Link to={runPath} className="text-signal-ink underline">Open agent run</Link>}
