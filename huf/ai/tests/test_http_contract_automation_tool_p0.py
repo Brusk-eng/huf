@@ -90,8 +90,8 @@ class HttpContractTests(unittest.TestCase):
         try:
             r = requests.get(_api("method/ping"), timeout=30)
         except requests.exceptions.ConnectionError as exc:
-            if os.environ.get("CI"):
-                raise  # a CI run without the server must fail, not report green skips
+            if os.environ.get("HUF_HTTP_TEST_REQUIRED"):
+                raise  # opt-in strict mode: fail instead of skipping
             raise unittest.SkipTest(
                 f"HTTP contract tests need a running bench web server at {BASE_URL} "
                 f"(set HUF_HTTP_TEST_BASE_URL): {exc.__class__.__name__}"

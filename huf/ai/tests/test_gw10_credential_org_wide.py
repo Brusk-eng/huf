@@ -10,6 +10,7 @@ See: Tracks/safwan-erooth.IntegrationsGatewaysAudit/findings/GW-10-decision.md
 
 import frappe
 from frappe.tests import IntegrationTestCase
+from huf.ai.tests.factories import ensure_ai_model
 from huf.ai.tools.credentials import require_credential, update_last_error
 
 
@@ -75,6 +76,7 @@ class TestGW10OrgWideCredentialScope(IntegrationTestCase):
 		self.integration_doc.insert()
 
 		# Create an Agent with the non-admin test user as owner
+		ensure_ai_model("gpt-4", "OpenAI")
 		self.agent_name = "test_agent_gw10"
 		if frappe.db.exists("Agent", self.agent_name):
 			frappe.delete_doc("Agent", self.agent_name)
