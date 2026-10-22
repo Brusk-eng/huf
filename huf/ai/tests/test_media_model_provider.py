@@ -11,6 +11,7 @@ Run with:
     bench --site <site> run-tests --app huf --module huf.ai.tests.test_media_model_provider
 """
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -82,36 +83,36 @@ PROVIDERS = {
 
 
 class TestImageModelProvider(IntegrationTestCase):
-	async def _call(self, agent, models, providers=None):
+	def _call(self, agent, models, providers=None):
 		fake = MagicMock()
-		fake.image_generation.return_value = MagicMock(data=[])
 		with (
 			patch("frappe.get_doc", side_effect=_router(agent, models, providers or PROVIDERS)),
 			patch("huf.ai.agent_access.assert_agent_access"),
-			patch.dict("sys.modules", {"litellm": fake}),
+			patch("litellm.image_generation", return_value=MagicMock(data=[])) as image_generation,
 		):
-			result = await media.handle_generate_image(prompt="a cat", agent_name="WA Agent")
+			fake.image_generation = image_generation
+			result = asyncio.run(media.handle_generate_image(prompt="a cat", agent_name="WA Agent"))
 		return fake, result
 
-	async def test_cross_provider_image_model_uses_its_provider_key(self):
+	def test_cross_provider_image_model_uses_its_provider_key(self):
 		agent = _agent(image_generation_model="gemini-img")
 		models = {"gemini-img": _Doc(model_name="gemini-2.5-flash-image", provider="Google")}
-		fake, _ = await self._call(agent, models)
+		fake, _ = self._call(agent, models)
 		kwargs = fake.image_generation.call_args.kwargs
 		self.assertEqual(kwargs["api_key"], "key-google")
 		self.assertTrue(kwargs["model"].startswith("gemini/"), kwargs["model"])
 
-	async def test_fallback_to_agent_provider_when_unset(self):
+	def test_fallback_to_agent_provider_when_unset(self):
 		agent = _agent(provider="OpenAI")
-		fake, _ = await self._call(agent, {})
+		fake, _ = self._call(agent, {})
 		kwargs = fake.image_generation.call_args.kwargs
 		self.assertEqual(kwargs["api_key"], "key-openai")
 
-	async def test_missing_key_on_image_model_provider_names_provider(self):
+	def test_missing_key_on_image_model_provider_names_provider(self):
 		providers = dict(PROVIDERS, Google=_provider("Google", None))
 		agent = _agent(image_generation_model="gemini-img")
 		models = {"gemini-img": _Doc(model_name="gemini-2.5-flash-image", provider="Google")}
-		fake, result = await self._call(agent, models, providers)
+		fake, result = self._call(agent, models, providers)
 		self.assertFalse(result["success"])
 		self.assertIn("Google", result["error"])
 		self.assertIn("API key", result["error"])
