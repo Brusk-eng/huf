@@ -802,8 +802,7 @@ class _FakeCache:
 
 
 class TestWritePathBugFix(unittest.TestCase):
-	"""Regression coverage for TRK-20260924-4fb7 (Tracks/safwan-erooth
-	.ProcedureWritePathBugs): a write ``tool.call`` node with a valid ``recovery`` mode
+	"""Regression coverage for TRK-20260924-4fb7 (the ProcedureWritePathBugs workspace track): a write ``tool.call`` node with a valid ``recovery`` mode
 	and a content-derived ``idempotency_key`` must actually execute, end to end, through
 	``execute_procedure`` -- this is exactly the path that was previously impossible in
 	any form (schema forbade ``recovery``; nothing ever populated ``idempotency_key``).

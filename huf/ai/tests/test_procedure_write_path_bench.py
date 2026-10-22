@@ -2,7 +2,7 @@
 # For license information, please see license.txt
 
 """Real bench-based end-to-end regression test for TRK-20260924-4fb7
-(Tracks/safwan-erooth.ProcedureWritePathBugs).
+(the ProcedureWritePathBugs workspace track).
 
 Unlike test_procedure_proposal.py / test_procedure_runtime.py (frappe-free, run with
 plain pytest against hand-stubbed modules), this file needs a real bench and a real site
@@ -18,8 +18,7 @@ Run with:
 Does not call any LLM: the "Agent Run" this test builds is a hand-inserted Agent Run +
 Agent Tool Call pair with status="Completed", exactly the shape a real completed run
 would have -- this fix touches propose/accept/runtime, not the LLM call itself, so a
-live LLM key is not needed to prove it end to end (see Tracks/safwan-erooth
-.ProcedureWritePathBugs/README.md "Evidence / how to reproduce" for the equivalent
+live LLM key is not needed to prove it end to end (see the ProcedureWritePathBugs workspace track "Evidence / how to reproduce" for the equivalent
 manual walkthrough this test automates, including the real Google Gemini key run that
 originally found both bugs).
 """

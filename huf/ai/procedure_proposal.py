@@ -76,7 +76,7 @@ from huf.ai.procedure_versioning import compute_fingerprint
 # ConvertToProcedureDialog.tsx has no field for a human to change this before accepting --
 # the schema/runtime accept any of RECOVERY_MODES on a hand-edited graph, so the door is
 # open, but nothing in the current UI walks through it (see
-# Tracks/safwan-erooth.ProcedureWritePathBugs/README.md, "Not done"). Every auto-proposed
+# the ProcedureWritePathBugs workspace track, "Not done"). Every auto-proposed
 # write node gets this default until that UI affordance exists.
 _DEFAULT_RECOVERY = "abort"
 
