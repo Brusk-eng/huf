@@ -67,6 +67,7 @@ class _Base(unittest.TestCase):
 			patch.object(voice, "_synthesize", self.synth),
 			patch.object(voice, "_convert", self.convert),
 			patch.object(voice, "_claim", return_value=True),
+			patch.object(voice, "_conversation", return_value="CONV-1"),
 			patch.object(gateway_service, "is_opted_out", return_value=False),
 			patch.object(gateway_service, "_attempt_reply_parts", self.text_send),
 			patch("huf.ai.gateway_webhook.touch_last_event"),
@@ -188,3 +189,28 @@ class TestHelpers(unittest.TestCase):
 		self.assertTrue(voice.is_voice_note(SimpleNamespace(raw_payload=VOICE_PAYLOAD)))
 		self.assertFalse(voice.is_voice_note(SimpleNamespace(raw_payload=None)))
 		self.assertFalse(voice.is_voice_note(SimpleNamespace(raw_payload="not json")))
+
+
+class TestGatewayValidation(unittest.TestCase):
+	def _validate(self, mode, provider="WhatsApp"):
+		import frappe
+		from huf.huf.doctype.gateway.gateway import Gateway
+
+		values = {"voice_reply_mode": mode}
+		fake = SimpleNamespace(get=lambda k, d=None: values.get(k, d), provider=provider)
+		return frappe, lambda: Gateway._validate_reply_settings(fake)
+
+	def test_valid_modes_pass(self):
+		for mode in ("", "Off", "Voice only", "Text and voice"):
+			_, run = self._validate(mode)
+			run()
+
+	def test_unknown_mode_rejected(self):
+		frappe, run = self._validate("Shout")
+		with self.assertRaises(frappe.ValidationError):
+			run()
+
+	def test_non_whatsapp_rejected(self):
+		frappe, run = self._validate("Voice only", provider="Telegram")
+		with self.assertRaises(frappe.ValidationError):
+			run()
