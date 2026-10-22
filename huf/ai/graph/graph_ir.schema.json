@@ -265,7 +265,16 @@
         "lookup",
         "batch",
         "distinct",
-        "coalesce"
+        "coalesce",
+        "lower",
+        "upper",
+        "trim",
+        "replace",
+        "contains",
+        "starts_with",
+        "split_first",
+        "regex_extract",
+        "concat"
       ]
     },
     "NodeCommon": {
