@@ -273,7 +273,10 @@ def _acquire_run_lock(flow_run_name: str) -> bool:
 
 def _release_run_lock(flow_run_name: str) -> None:
 	try:
-		frappe.cache().delete_value(_run_lock_key(flow_run_name))
+		# ``delete`` (raw key), not ``delete_value``: the lock is taken with a raw
+		# ``SET NX``, while ``delete_value`` removes the site-prefixed key, so the lock
+		# would otherwise survive until its TTL and silently block approve/resume.
+		frappe.cache().delete(_run_lock_key(flow_run_name))
 	except Exception:
 		pass
 
@@ -958,13 +961,14 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 		agent_name=config.get("agent_name") or config.get("agent"),
 	)
 
-	# Check MCP tool info: prefer the explicit config, fall back to lookup
-	# by tool name for backward compatibility with existing flow definitions.
+	# Check MCP tool info: prefer the explicit config, else a unique raw-name lookup.
 	mcp_server = config.get("mcp_server")
 	if not mcp_server:
-		mcp_tool_entry = frappe.db.get_value("MCP Server Tool", {"tool_name": tool_name, "enabled": 1}, "parent")
-		if mcp_tool_entry:
-			mcp_server = mcp_tool_entry
+		from huf.ai.mcp_client import find_unique_mcp_server_for_tool
+
+		# Raw tool name only counts when a single server owns it; an ambiguous name is
+		# never attributed to an arbitrary server (set ``mcp_server`` on the node).
+		mcp_server = find_unique_mcp_server_for_tool(tool_name)
 
 	invocation_ctx = RunContext(
 		conversation_id=_conversation_of(flow_run, run_ctx),
@@ -999,7 +1003,14 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 			# from sync flow-engine code.
 			import asyncio
 
-			coro = execute_mcp_tool(server_name=mcp_server, tool_name=tool_name, arguments=args)
+			# A Requires Approval tool only runs when the node is explicitly marked
+			# ``approved`` (the flow author places it behind a human.approval step).
+			coro = execute_mcp_tool(
+				server_name=mcp_server,
+				tool_name=tool_name,
+				arguments=args,
+				approved=config.get("approved") is True,
+			)
 			loop = asyncio.new_event_loop()
 			asyncio.set_event_loop(loop)
 			try:
@@ -1008,6 +1019,17 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 				loop.close()
 			if not isinstance(result, dict):
 				result = {"success": True, "result": result}
+			elif "success" not in result and ("content" in result or "isError" in result):
+				# A raw MCP tools/call payload has no ``success`` key; without this a
+				# call that ran is recorded as Failed (and an on_error route would
+				# then retry a side-effecting tool).
+				is_error = bool(result.get("isError"))
+				texts = [c.get("text", "") for c in (result.get("content") or []) if isinstance(c, dict)]
+				result = {
+					"success": not is_error,
+					"result": result,
+					"error": " ".join(t for t in texts if t) or "MCP tool reported an error" if is_error else "",
+				}
 		else:
 			with tool_run_context(invocation_ctx):
 				result = execute_tool(tool_name, args)
