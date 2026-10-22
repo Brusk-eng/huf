@@ -7,6 +7,8 @@ Usage:
 The output module exposes:
     MODELS   -- list[dict]: curated AI Model seed records (LiteLLM-backed
                 candidates + EXTRA_MODELS), aliases flagged is_latest_alias.
+    RETIRED  -- dict[str, tuple[str, str]]: confirmed-retired model_name ->
+                (provider, replacement), applied by the refresh patch.
 
 Candidates past their LiteLLM deprecation_date are left out of MODELS.
 
@@ -514,6 +516,74 @@ EXTRA_MODELS: list[dict] = [
     _e("poolside/laguna-s-2.1:free", "OpenRouter", "Text", 262144),
 ]
 
+# --------------------------------------------------------------------------
+# Models CONFIRMED gone as of 2026-10-22, as model_name -> (provider,
+# replacement). huf.patches.v1.refresh_model_catalogue repoints configuration
+# rows to the replacement (same provider) and deletes the old row once nothing
+# references it. Only shutdowns confirmed by the provider (or IDs absent from
+# a provider's live list / never valid) belong here; merely deprecated or
+# unverified models are simply no longer seeded and are left alone on sites.
+# --------------------------------------------------------------------------
+RETIRED: dict[str, tuple[str, str]] = {
+    # Google -- Gemini 2.5 closed to new users 2026-09-18 (API returns 404
+    # "no longer available to new users"); text-embedding-004 shut 2026-01-14.
+    # ai.google.dev/gemini-api/docs/deprecations
+    "gemini-2.5-pro": ("Google", "gemini-pro-latest"),
+    "gemini-2.5-flash": ("Google", "gemini-flash-latest"),
+    "gemini-2.5-flash-lite": ("Google", "gemini-flash-lite-latest"),
+    "text-embedding-004": ("Google", "gemini-embedding-2"),
+    # OpenAI -- shut down 2026-08-10 / 2026-05-12.
+    # developers.openai.com/api/docs/deprecations
+    "gpt-5.2-chat-latest": ("OpenAI", "chat-latest"),
+    "gpt-5.3-chat-latest": ("OpenAI", "chat-latest"),
+    "dall-e-2": ("OpenAI", "gpt-image-2"),
+    "dall-e-3": ("OpenAI", "gpt-image-2"),
+    # Anthropic -- dotted IDs from the old hand list were never valid
+    # (Anthropic IDs use dashes); platform.claude.com models overview.
+    "claude-opus-4.8": ("Anthropic", "claude-opus-4-8"),
+    "claude-haiku-4.5": ("Anthropic", "claude-haiku-4-5"),
+    # Groq -- shut down 2025-12-31 .. 2026-09-14. console.groq.com/docs/deprecations
+    "groq/llama-3.3-70b-versatile": ("Groq", "groq/openai/gpt-oss-120b"),
+    "groq/llama-3.1-8b-instant": ("Groq", "groq/openai/gpt-oss-20b"),
+    "groq/meta-llama/llama-4-maverick-17b-128e-instruct": ("Groq", "groq/openai/gpt-oss-120b"),
+    "groq/meta-llama/llama-4-scout-17b-16e-instruct": ("Groq", "groq/openai/gpt-oss-120b"),
+    "groq/qwen/qwen3-32b": ("Groq", "groq/openai/gpt-oss-120b"),
+    "groq/qwen/qwen3.6-27b": ("Groq", "groq/qwen/qwen3.8-27b"),
+    "groq/playai-tts": ("Groq", "groq/canopylabs/orpheus-v1-english"),
+    # Mistral -- whole families retired (open-codestral-mamba 2025-06-06,
+    # pixtral-large 2026-05-31, all magistral/devstral by 2026-07-31,
+    # mistral-medium-2505 2026-08-31). docs.mistral.ai models overview.
+    "codestral-mamba-latest": ("Mistral", "codestral-latest"),
+    "pixtral-large-latest": ("Mistral", "mistral-medium-latest"),
+    "magistral-medium-latest": ("Mistral", "mistral-medium-latest"),
+    "magistral-small-latest": ("Mistral", "mistral-small-latest"),
+    "devstral-latest": ("Mistral", "mistral-medium-latest"),
+    "devstral-medium-latest": ("Mistral", "mistral-medium-latest"),
+    "devstral-small-latest": ("Mistral", "mistral-small-latest"),
+    "mistral-medium-3": ("Mistral", "mistral-medium-latest"),
+    # xAI -- grok-4-1-fast-* retired 2026-05-15 (redirected to grok-4.3).
+    # docs.x.ai/docs/migration/may-15-retirement
+    "grok-4-1-fast": ("xAI", "grok-4.3"),
+    # OpenRouter -- slugs absent from the live /api/v1/models list (2026-10-22).
+    "google/gemini-2.5-flash-lite-preview-06-17": ("OpenRouter", "~google/gemini-flash-latest"),
+    "google/gemini-3-pro-preview": ("OpenRouter", "google/gemini-3.1-pro-preview"),
+    "openai/chat-latest": ("OpenRouter", "openai/gpt-chat-latest"),
+    "openai/gpt-5.3-chat-latest": ("OpenRouter", "openai/gpt-chat-latest"),
+    "openai/gpt-5.2-chat-latest": ("OpenRouter", "openai/gpt-chat-latest"),
+    "openai/gpt-5-codex": ("OpenRouter", "openai/gpt-5.3-codex"),
+    "openai/gpt-oss-20b:free": ("OpenRouter", "openai/gpt-oss-20b"),
+    "x-ai/grok-4": ("OpenRouter", "~x-ai/grok-latest"),
+    "moonshotai/kimi-k2.7": ("OpenRouter", "~moonshotai/kimi-latest"),
+    "qwen/qwen3-coder-plus": ("OpenRouter", "qwen/qwen3-coder"),
+    "nvidia/nemotron-3-nano-30b-a3b:free": ("OpenRouter", "nvidia/nemotron-3-super-120b-a12b:free"),
+    "nvidia/nemotron-nano-12b-v2-vl:free": ("OpenRouter", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"),
+    "nvidia/nemotron-nano-9b-v2:free": ("OpenRouter", "nvidia/nemotron-3-super-120b-a12b:free"),
+    "poolside/laguna-m.1:free": ("OpenRouter", "poolside/laguna-s-2.1:free"),
+    "inclusionai/ling-3.0-flash:free": ("OpenRouter", "openrouter/free"),
+    "tencent/hy3:free": ("OpenRouter", "openrouter/free"),
+}
+
+
 def modalities_for(entry: dict) -> list[str]:
     mode = entry.get("mode")
     mods: list[str] = []
@@ -638,6 +708,14 @@ def build(as_of: datetime.date, model_cost: dict) -> tuple[list[dict], dict]:
             raise SystemExit(f"ALIASES names a model that is not seeded: {name}")
         models[name]["is_latest_alias"] = True
 
+    for old, (provider, new) in RETIRED.items():
+        if old in models:
+            raise SystemExit(f"RETIRED model is still seeded: {old}")
+        if new not in models:
+            raise SystemExit(f"RETIRED[{old!r}] -> {new!r} is not a seeded model")
+        if models[new]["provider"] != provider:
+            raise SystemExit(f"RETIRED[{old!r}] crosses providers ({provider} -> {models[new]['provider']})")
+
     sorted_models = sorted(models.values(), key=lambda m: (m["provider"], m["model_name"]))
 
     stats = {
@@ -656,7 +734,8 @@ def render(models: list[dict], as_of: datetime.date, litellm_version: str) -> st
     lines.append('"""Auto-generated AI Model catalogue. DO NOT EDIT BY HAND.')
     lines.append("")
     lines.append("Single source of truth for the seeded AI Model catalogue: consumed by")
-    lines.append("huf/install.py::create_demo_ai_models (after_migrate upsert).")
+    lines.append("huf/install.py::create_demo_ai_models (after_migrate upsert) and")
+    lines.append("huf.patches.v1.refresh_model_catalogue (retire + repoint).")
     lines.append("")
     lines.append("Generated by: scripts/gen_model_catalogue.py")
     lines.append(f"litellm model table: {litellm_version}")
@@ -676,6 +755,12 @@ def render(models: list[dict], as_of: datetime.date, litellm_version: str) -> st
                 parts.append(f'"{field}": {m[field]!r}')
         lines.append("    {" + ", ".join(parts) + "},")
     lines.append("]")
+    lines.append("")
+    lines.append("# Confirmed-retired model_name -> (provider, replacement model_name).")
+    lines.append("RETIRED = {")
+    for name in sorted(RETIRED):
+        lines.append(f"    {name!r}: {RETIRED[name]!r},")
+    lines.append("}")
     lines.append("")
     return "\n".join(lines)
 

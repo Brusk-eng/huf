@@ -20,6 +20,8 @@ from pathlib import Path
 
 import frappe
 
+from huf.ai.model_catalogue import RETIRED
+
 logger = frappe.logger("huf")
 
 HUB_AGENT_NAME = "Hub Orchestrator"
@@ -39,12 +41,8 @@ PREFERRED_MODELS = [
     "command-a-03-2025",
 ]
 
-DEPRECATED_MODELS = {
-    "gemini-2.5-flash",
-    "google/gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "google/gemini-2.5-flash-lite-preview-06-17",
-}
+# Retired models are never auto-selected (single source: the catalogue).
+DEPRECATED_MODELS = frozenset(RETIRED)
 
 # Model names matching these are not chat models; never auto-select them.
 _NON_CHAT_MARKERS = ("embedding", "whisper", "dall-e", "gpt-image", "tts", "image", "alternate")
