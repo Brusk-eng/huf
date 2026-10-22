@@ -59,9 +59,21 @@ class TestRegistryShape(unittest.TestCase):
 		"coalesce",
 	}
 
-	def test_registry_is_exactly_eleven_ops(self):
-		self.assertEqual(set(T.REGISTRY), self.EXPECTED_OPS)
-		self.assertEqual(len(T.REGISTRY), 11)
+	TEXT_OPS = {
+		"lower",
+		"upper",
+		"trim",
+		"replace",
+		"contains",
+		"starts_with",
+		"split_first",
+		"regex_extract",
+		"concat",
+	}
+
+	def test_registry_is_exactly_the_documented_ops(self):
+		self.assertEqual(set(T.REGISTRY), self.EXPECTED_OPS | self.TEXT_OPS)
+		self.assertEqual(len(T.REGISTRY), 20)
 
 	def test_unknown_op_is_typed_failure_not_exception(self):
 		result = run("does_not_exist", {"rows": []})

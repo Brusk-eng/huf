@@ -44,6 +44,7 @@ from frappe.utils import now_datetime
 from frappe.desk.doctype.notification_log.notification_log import enqueue_create_notification
 from frappe.desk.doctype.notification_settings.notification_settings import is_email_notifications_enabled
 
+from huf.ai import flow_create_doc, flow_state
 from huf.ai.flow_eval import safe_eval_expression
 from huf.ai.flow_orchestrator import (
 	build_flow_context_system_message,
@@ -70,6 +71,7 @@ from huf.ai.graph.executor import (
 )
 from huf.ai.graph.expressions import evaluate_bool, parse_expression
 from huf.ai.graph.transforms import Limits as TransformLimits
+from huf.ai.graph.templates import TemplateError
 from huf.ai.graph.transforms import run_transform
 from huf.ai.output_budget import OutputBudget, OutputBudgetExceeded, enforce_output_budget
 from huf.ai.tool_invocation import RunContext
@@ -806,13 +808,22 @@ def _execute_node(flow_run, node: dict, settings: dict) -> dict:
 	if not executor:
 		frappe.throw(_("Unknown node type: {0}").format(node_type))
 
-	return executor(flow_run, node, config, settings)
+	try:
+		return executor(flow_run, node, config, settings)
+	except TemplateError as exc:
+		# Authoring error in a {"$template": ...} value: fail this node (so on_error applies).
+		return {"status": "failed", "error": f"Template error: {exc}"}
 
 
 def _exec_trigger_webhook(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""Execute trigger.webhook node - mostly a passthrough for UI clarity."""
 	ctx = _context_of(flow_run, settings)
 	return {"status": "success", "output": ctx.as_dict()}
+
+
+def _exec_trigger_unset(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""trigger.unset is a placeholder with no trigger configured; it is not runnable."""
+	return {"status": "failed", "error": "trigger.unset is not runnable: configure a trigger for this flow"}
 
 
 def _exec_trigger_schedule(flow_run, node: dict, config: dict, settings: dict) -> dict:
@@ -1323,6 +1334,18 @@ def _exec_http_request(flow_run, node: dict, config: dict, settings: dict) -> di
 		return {"status": "failed", "error": str(e)}
 
 
+def _expression_context(ctx: GraphContext) -> dict:
+	"""The ``context`` seen by condition expressions and expression edges.
+
+	The flat run context, plus ``context["outputs"]`` -- earlier nodes' outputs by node id
+	(e.g. ``context["outputs"]["has_order"]``). A flat key literally named ``outputs`` wins. The
+	extra key is added to a copy only; it is never written back to the run context.
+	"""
+	merged = dict(ctx.as_dict())
+	merged.setdefault("outputs", dict(ctx.node_outputs))
+	return merged
+
+
 def _exec_condition(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""
 	Execute condition node - evaluates a boolean expression and routes to
@@ -1349,7 +1372,7 @@ def _exec_condition(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	ctx = _context_of(flow_run, settings)
 
 	try:
-		result = safe_eval_expression(expression, ctx.as_dict())
+		result = safe_eval_expression(expression, _expression_context(ctx))
 		chosen_node = true_node if result else false_node
 
 		if not chosen_node:
@@ -1675,9 +1698,95 @@ def _exec_output(flow_run, node: dict, config: dict, settings: dict) -> dict:
 #: life -- an already-running or paused run using one of these types must
 #: still be able to advance. Remove an entry here only once no such pinned
 #: run can still be outstanding.
+# ---------------------------------------------------------------------------
+# Per-key flow state (state.get / state.set / state.delete)
+# ---------------------------------------------------------------------------
+
+
+def _state_node(flow_run, node: dict, config: dict, settings: dict, allowed: set, op):
+	"""Shared shell: validate config keys, resolve inputs, scope to the *running* flow."""
+	unknown = sorted(set(config) - allowed)
+	if unknown:
+		return {"status": "failed", "error": f"{node.get('type')}: unsupported config {unknown}"}
+	flow_id = getattr(flow_run, "flow_id", None)
+	ctx = _context_of(flow_run, settings)
+	resolved = {k: ctx.resolve(v) for k, v in config.items()}
+	try:
+		output = op(flow_id, resolved)
+	except flow_state.FlowStateError as exc:
+		return {"status": "failed", "error": f"{node.get('type')}: {exc}"}
+	return {"status": "success", "result": output, "output": output}
+
+
+def _exec_state_get(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.get``: config ``key`` (required), ``default``. Output ``{"found": bool, "value": ...}``."""
+
+	def op(flow_id, cfg):
+		found, value = flow_state.get_state(flow_id, cfg.get("key"))
+		return {"found": found, "value": value if found else cfg.get("default")}
+
+	return _state_node(flow_run, node, config, settings, {"key", "default"}, op)
+
+
+def _exec_state_set(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.set``: config ``key``, ``value``, ``ttl_seconds`` (default 24h). Output ``{"stored": true}``."""
+
+	def op(flow_id, cfg):
+		flow_state.set_state(flow_id, cfg.get("key"), cfg.get("value"), cfg.get("ttl_seconds"))
+		return {"stored": True}
+
+	return _state_node(flow_run, node, config, settings, {"key", "value", "ttl_seconds"}, op)
+
+
+def _exec_state_delete(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.delete``: config ``key``. Output ``{"deleted": bool}``."""
+
+	def op(flow_id, cfg):
+		return {"deleted": flow_state.delete_state(flow_id, cfg.get("key"))}
+
+	return _state_node(flow_run, node, config, settings, {"key"}, op)
+
+
+# ---------------------------------------------------------------------------
+# doc.create -- insert an allow-listed document as the run's user
+# ---------------------------------------------------------------------------
+
+_WRITES_KEY = "_doc_create_count"
+
+
+def _exec_doc_create(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""
+	``doc.create``: config ``doctype`` (literal) and ``fields`` (object of values / references).
+	Output ``{"doctype", "name"}`` so later nodes can use ``{"$from": "<node>.name"}``.
+
+	Policy lives in :mod:`huf.ai.flow_create_doc` (allow-list, field validation, no
+	``ignore_permissions``). Each created document also counts against the graph contract's
+	``limits.max_writes`` for the run (absent or 0 means no writes are allowed).
+	"""
+	unknown = sorted(set(config) - {"doctype", "fields"})
+	if unknown or "doctype" not in config or "fields" not in config:
+		return {"status": "failed", "error": "doc.create requires exactly doctype and fields (got unsupported keys: %s)" % unknown}
+	ctx = _context_of(flow_run, settings)
+	run_ctx = _run_context(settings)
+	limits = ((run_ctx.definition.get("contract") or {}).get("limits") or {}) if run_ctx is not None else {}
+	max_writes = limits.get("max_writes") or 0
+	done = ctx.data.get(_WRITES_KEY) or 0
+	if done >= max_writes:
+		return {"status": "failed", "error": f"doc.create exceeds contract limits.max_writes ({max_writes})"}
+	try:
+		result = flow_create_doc.create_document(config["doctype"], ctx.resolve(config["fields"]))
+	except flow_create_doc.CreateDocError as exc:
+		return {"status": "failed", "error": f"doc.create: {exc}"}
+	except frappe.PermissionError as exc:
+		return {"status": "failed", "error": f"doc.create: permission denied ({exc})"}
+	ctx.set(_WRITES_KEY, done + 1)
+	return {"status": "success", "result": result, "output": result}
+
+
 _NODE_EXECUTORS = {
 	"trigger.webhook": _exec_trigger_webhook,
 	"trigger.schedule": _exec_trigger_schedule,
+	"trigger.unset": _exec_trigger_unset,
 	"trigger.doc-event": _exec_trigger_doc_event,
 	"agent.run": _exec_agent_run,
 	"tool.call": _exec_tool_call,
@@ -1693,6 +1802,10 @@ _NODE_EXECUTORS = {
 	"parallel": _exec_parallel,
 	"validate": _exec_validate,
 	"output": _exec_output,
+	"state.get": _exec_state_get,
+	"state.set": _exec_state_set,
+	"state.delete": _exec_state_delete,
+	"doc.create": _exec_doc_create,
 }
 
 _NODE_TYPES = tuple(_NODE_EXECUTORS)
@@ -1808,7 +1921,7 @@ def _evaluate_edges(
 
 	outgoing.sort(key=lambda e: e.get("priority", 0), reverse=True)
 
-	ctx = context.as_dict() if context is not None else _load_context(flow_run)
+	ctx = _expression_context(context) if context is not None else _load_context(flow_run)
 	node_status = node_result.get("status", "success") if isinstance(node_result, dict) else "success"
 
 	for edge in outgoing:
