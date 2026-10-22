@@ -165,6 +165,12 @@ function mapFrontendNodeTypeToBackend(node: FlowNode): BackendNodeType {
         case 'http-request': return 'http_request';
         case 'transform': return 'transform';
         case 'loop': return 'loop';
+        case 'state-get': return 'state.get';
+        case 'state-set': return 'state.set';
+        case 'state-delete': return 'state.delete';
+        case 'doc-create': return 'doc.create';
+        // A backend node type this UI cannot edit: write back its original type.
+        case 'unknown': return (node.data.actionConfig as { backend_type: string }).backend_type as BackendNodeType;
         default: return 'tool.call'; // fallback for unmapped action types
     }
 }
@@ -191,6 +197,7 @@ function extractNodeConfig(
         if (allowed) config = Object.fromEntries(Object.entries(config).filter(([k]) => allowed.includes(k)));
     } else if (data?.actionConfig && data.actionConfig.type) {
         config = omitType(data.actionConfig) as Record<string, unknown>;
+        if (data.actionConfig.type === 'unknown') delete config.backend_type;
     }
 
     // Self-routing node types fold their outgoing edges into their own config, per the
@@ -281,6 +288,11 @@ const REQUIRED_CONFIG_KEYS: Partial<Record<string, string[]>> = {
     'router.llm': ['prompt'],
     'human.approval': ['message'],
     'condition': ['expression'],
+    'state.get': ['key'],
+    'state.set': ['key'],
+    'state.delete': ['key'],
+    'doc.create': ['doctype'],
+    'transform': ['op'],
 };
 
 /** Computed from the real stored config, so the "unconfigured" warning survives reload. */
@@ -320,6 +332,7 @@ function buildNodeData(node: BackendNode): FlowNodeData {
     } else if (frontendType === 'action') {
         base.actionConfig = {
             type: mapBackendActionType(node.type),
+            ...(mapBackendActionType(node.type) === 'unknown' ? { backend_type: node.type } : {}),
             ...node.config,
         } as FlowNodeData['actionConfig'];
     }
@@ -341,6 +354,10 @@ function getDefaultLabel(backendType: string): string {
         'http_request': 'HTTP request',
         'transform': 'Transform data',
         'loop': 'Loop',
+        'state.get': 'Get state',
+        'state.set': 'Set state',
+        'state.delete': 'Delete state',
+        'doc.create': 'Create document',
         'output': 'End',
     };
     return labels[backendType] || backendType;
@@ -360,6 +377,10 @@ function getDefaultIcon(backendType: string): string {
         'http_request': 'Globe',
         'transform': 'Repeat',
         'loop': 'RotateCw',
+        'state.get': 'Database',
+        'state.set': 'Save',
+        'state.delete': 'Trash2',
+        'doc.create': 'FilePlus',
         'output': 'CheckCircle2',
     };
     return icons[backendType] || 'Play';
@@ -375,8 +396,13 @@ function mapBackendActionType(backendType: string): string {
         'http_request': 'http-request',
         'transform': 'transform',
         'loop': 'loop',
+        'state.get': 'state-get',
+        'state.set': 'state-set',
+        'state.delete': 'state-delete',
+        'doc.create': 'doc-create',
     };
-    return map[backendType] || 'tool-call';
+    // Never coerce an unrecognised type into a tool call (that would silently rewrite it on save).
+    return map[backendType] || 'unknown';
 }
 
 export function mapBackendStatusToFrontend(status: string): FlowStatus {

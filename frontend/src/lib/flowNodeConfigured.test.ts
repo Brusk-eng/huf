@@ -29,11 +29,16 @@ describe('actionHasConfiguredContent', () => {
     expect(check({ type: 'human.approval', assigned_user: [] })).toBe(false);
   });
 
-  it('treats transform mappings as configuration', () => {
-    expect(
-      check({ type: 'transform', transformations: [{ source_field: 'a', target_field: 'b' }] }),
-    ).toBe(true);
-    expect(check({ type: 'transform', transformations: [] })).toBe(false);
+  it('treats a chosen transform op as configuration', () => {
+    expect(check({ type: 'transform', op: 'lower', input: {} })).toBe(true);
+    expect(check({ type: 'transform', input: {} })).toBe(false);
+  });
+
+  it('treats new node fields as configuration', () => {
+    expect(check({ type: 'state-get', key: 'cart' })).toBe(true);
+    expect(check({ type: 'state-set', key: '' })).toBe(false);
+    expect(check({ type: 'doc-create', doctype: 'ToDo', fields: {} })).toBe(true);
+    expect(check({ type: 'doc-create', doctype: ' ' })).toBe(false);
   });
 
   it('is false when there is no action config at all', () => {

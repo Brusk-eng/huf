@@ -14,6 +14,9 @@ import {
   Bot,
   Wrench,
   Trash2,
+  Database,
+  Save,
+  FilePlus,
   type LucideIcon,
 } from 'lucide-react';
 import { FlowNodeData } from '../../types/flow.types';
@@ -47,7 +50,11 @@ const iconMap: Record<string, LucideIcon> = {
   FileText,
   Calendar,
   Bot,
-  Wrench
+  Wrench,
+  Database,
+  Save,
+  Trash2,
+  FilePlus
 };
 
 type ActionNodeProps = NodeProps<FlowNodeData>;
