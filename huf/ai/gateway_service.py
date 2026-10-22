@@ -936,6 +936,12 @@ def _record_opt_out_linked(gateway, event, sender_id: str, display_name: str | N
         _record_opt_out(gateway, other, display_name)
 
 
+def _record_opt_in_linked(gateway, sender_id: str) -> None:
+    """START clears the opt-out under every id linked to the sender (phone and BSUID), like STOP set it."""
+    for linked in _linked_sender_ids(gateway.name, gateway.provider, sender_id):
+        _record_opt_in(gateway, linked)
+
+
 def _record_opt_in(gateway, sender_id: str) -> None:
     row = _live_sender_entry(gateway, sender_id)
     if not row or row["state"] != ENTRY_STATE_OPTED_OUT:
@@ -1003,7 +1009,7 @@ def _handle_consent_event(event, gateway, context: dict[str, Any]) -> dict | Non
 
     if state == ENTRY_STATE_OPTED_OUT:
         if _text_matches_keywords(gateway, text, "opt_in_keywords", DEFAULT_OPT_IN_KEYWORDS):
-            _record_opt_in(gateway, sender_id)
+            _record_opt_in_linked(gateway, sender_id)
             _send_plain_reply(gateway, sender_id, conversation_id, DEFAULT_OPT_IN_REPLY)
             return _reject_event(event, "Sender opted back in (START); no agent run")
         return _reject_event(event, "Sender has opted out")
