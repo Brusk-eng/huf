@@ -647,8 +647,7 @@ class TestBuildProcedureDocumentPayload(unittest.TestCase):
 
 
 class TestWriteNodeGetsRecoveryAndIdempotencyKey(unittest.TestCase):
-	"""Regression coverage for TRK-20260924-4fb7 (Tracks/safwan-erooth
-	.ProcedureWritePathBugs), Bug 2: propose -> accept must produce a write ``tool.call``
+	"""Regression coverage for TRK-20260924-4fb7 (the ProcedureWritePathBugs workspace track), Bug 2: propose -> accept must produce a write ``tool.call``
 	node the runtime can actually execute -- a ``recovery`` mode and a non-empty,
 	content-derived ``idempotency_key`` -- not a graph that looks fine until
 	``run_agent_procedure_run`` fails it closed.
