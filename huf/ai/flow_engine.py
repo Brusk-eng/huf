@@ -70,6 +70,7 @@ from huf.ai.graph.executor import (
 )
 from huf.ai.graph.expressions import evaluate_bool, parse_expression
 from huf.ai.graph.transforms import Limits as TransformLimits
+from huf.ai.graph.templates import TemplateError
 from huf.ai.graph.transforms import run_transform
 from huf.ai.output_budget import OutputBudget, OutputBudgetExceeded, enforce_output_budget
 from huf.ai.tool_invocation import RunContext
@@ -804,7 +805,11 @@ def _execute_node(flow_run, node: dict, settings: dict) -> dict:
 	if not executor:
 		frappe.throw(_("Unknown node type: {0}").format(node_type))
 
-	return executor(flow_run, node, config, settings)
+	try:
+		return executor(flow_run, node, config, settings)
+	except TemplateError as exc:
+		# Authoring error in a {"$template": ...} value: fail this node (so on_error applies).
+		return {"status": "failed", "error": f"Template error: {exc}"}
 
 
 def _exec_trigger_webhook(flow_run, node: dict, config: dict, settings: dict) -> dict:

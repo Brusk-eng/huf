@@ -38,6 +38,26 @@
         }
       }
     },
+    "Template": {
+      "description": "String templating: {name} placeholders are replaced from vars ({{ and }} are literal braces). An undeclared placeholder fails the node; a null var renders as the empty string.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "$template"
+      ],
+      "properties": {
+        "$template": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "vars": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Value"
+          }
+        }
+      }
+    },
     "Literal": {
       "description": "A JSON literal: string, number, boolean, or null. Not an array or object -- those are composed explicitly where allowed (see Value).",
       "type": [
@@ -52,6 +72,9 @@
       "anyOf": [
         {
           "$ref": "#/$defs/Reference"
+        },
+        {
+          "$ref": "#/$defs/Template"
         },
         {
           "$ref": "#/$defs/Literal"
