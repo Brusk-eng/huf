@@ -63,6 +63,7 @@ from typing import Optional, Any
 import frappe
 import requests
 
+from huf.ai import whatsapp_send_file as send_file
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 from huf.ai.gateway_adapters import whatsapp_messages as wm
 from huf.ai.gateway_adapters import whatsapp_templates as wt
@@ -627,6 +628,8 @@ def _send_media(kwargs: dict) -> str:
 	recipient = _recipient(kwargs)
 	if not recipient:
 		return _error("Recipient phone number ('to') is required", definite=True)
+	if kwargs.get("file_url") or kwargs.get("file_id"):
+		return _send_media_file(kwargs, recipient)
 	media, errors = wt.validate_media_request(
 		kwargs.get("kind") or kwargs.get("media_type"),
 		kwargs.get("link") or kwargs.get("url"),
@@ -649,10 +652,76 @@ def _send_media(kwargs: dict) -> str:
 	)
 
 
+def _file_error(e: "send_file.FileSendError") -> str:
+	return _refused(e.code, e.message)
+
+
+def _upload_for_send(kwargs: dict, prepared: dict) -> str:
+	"""Upload the bytes to Meta (bridge account, else the gateway's own credentials) and return the media id."""
+	mime, content, filename = prepared["mime"], prepared["content"], prepared["filename"]
+	acct = _resolve_bridge_account(kwargs)
+	try:
+		if acct:
+			res = bridge.upload_media(acct["name"], content, mime, filename, kind=prepared["kind"], voice=prepared["voice"])
+			return str(res["media_id"])
+		phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
+		if not phone_number_id or not access_token:
+			raise send_file.FileSendError("credentials_missing", "WhatsApp credentials not found for this gateway.")
+		return bridge.post_media_upload(
+			_graph_root(kwargs["gateway_name"]), phone_number_id, access_token, content, wm.normalize_mime(mime), filename
+		)
+	except bridge.BridgeError as e:
+		raise send_file.FileSendError(str((e.payload or {}).get("error") or "upload_failed"), str((e.payload or {}).get("message") or "Upload to WhatsApp failed.")) from e
+	except frappe.PermissionError as e:
+		raise send_file.FileSendError("permission_denied", "Not permitted to send WhatsApp messages") from e
+
+
+def _send_media_file(kwargs: dict, recipient: str) -> str:
+	"""Send a Huf File: ownership check, limits, gates, upload to Meta, then the normal send by media id."""
+	if kwargs.get("link") or kwargs.get("url") or kwargs.get("media_id"):
+		return json.dumps(wt.validation_error([wm.err("file_url", "one_source", "Provide exactly one of file_url, file_id, link or media_id.")]), default=str)
+	if (kwargs.get("file_url") or "") and (kwargs.get("file_id") or ""):
+		return json.dumps(wt.validation_error([wm.err("file_url", "one_source", "Provide exactly one of file_url or file_id.")]), default=str)
+	refusal = _free_form_refusal(kwargs, recipient, "media")
+	if refusal:
+		return refusal
+	voice = _is_truthy(kwargs.get("voice"))
+	try:
+		resolved = send_file.resolve_file(kwargs.get("file_url"), kwargs.get("file_id"), _effective_run_id())
+		prepared = send_file.prepare_upload(resolved, kwargs.get("kind") or kwargs.get("media_type"), voice)
+		first, rest = send_file.split_caption(str(kwargs.get("caption") or ""))
+		filename = (kwargs.get("filename") or "").strip() or prepared["filename"]
+		_, errors = wm.validate_media_message(prepared["kind"], "", "pending", first, filename, prepared["voice"])
+		if errors:
+			return json.dumps(wt.validation_error(errors), default=str)
+		media_id = _upload_for_send(kwargs, prepared)
+	except send_file.FileSendError as e:
+		return _file_error(e)
+	except Exception as e:
+		return _error(f"Failed to prepare WhatsApp media: {str(e)}", definite=True)
+	send_kwargs = {k: v for k, v in kwargs.items() if k not in ("file_url", "file_id", "link", "url")}
+	raw = _send_media({
+		**send_kwargs, "kind": prepared["kind"], "media_id": media_id, "caption": first,
+		"filename": filename, "voice": prepared["voice"],
+	})
+	if rest:
+		try:
+			ok = json.loads(raw).get("success")
+		except ValueError:
+			ok = False
+		if ok:
+			follow = json.loads(_send_message({**send_kwargs, "message": rest}))
+			if not follow.get("success"):
+				body = json.loads(raw)
+				body.setdefault("data", {})["caption_overflow_sent"] = False
+				return json.dumps(body, default=str)
+	return raw
+
+
 def _send_voice_note(kwargs: dict) -> str:
 	"""Send audio as a voice note (``audio.voice: true``); only Ogg/Opus is accepted."""
 	link = kwargs.get("link") or kwargs.get("url")
-	if link and not kwargs.get("media_id"):
+	if link and not kwargs.get("media_id") and not (kwargs.get("file_url") or kwargs.get("file_id")):
 		errors = wm.validate_voice_link(link)
 		if errors:
 			return json.dumps(wt.validation_error(errors), default=str)
