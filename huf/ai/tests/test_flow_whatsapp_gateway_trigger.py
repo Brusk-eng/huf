@@ -5,8 +5,8 @@
 
 There is no ``trigger.whatsapp`` node. The only gateway trigger is a Gateway route/default whose target is
 a Flow: ``process_gateway_event`` then starts a Flow Run (``trigger_type == "Gateway"``) whose payload is
-``{"gateway_event", "message"}``. Documented gap: that payload carries no sender id or conversation id, so a
-Flow cannot address a reply to the sender without looking the Gateway Event up itself.
+``{"gateway_event", "message", "gateway", "sender_id", "conversation_id"}`` so a Flow can address a reply and key
+per-conversation state (``input.sender_id`` / ``input.conversation_id``).
 
 The send half drives the real ``huf.ai.tools.whatsapp`` tool from a ``tool.call`` node, so the free-form 24h
 window / proactive gate of the tool applies exactly as it does for an agent. Only Meta (HTTP) is faked.
@@ -124,9 +124,17 @@ class TestFlowWhatsAppGatewayTrigger(fs.TestWhatsAppMultiGateway):
 		self.assertEqual(flow_run.flow_id, flow_id)
 		self.assertEqual(flow_run.trigger_type, "Gateway")
 		payload = json.loads(flow_run.trigger_payload)
-		self.assertEqual(payload, {"gateway_event": event.name, "message": "start the flow"})
-		# documented gap: nothing in the payload identifies the sender or conversation
-		self.assertNotIn("sender_id", payload)
+		self.assertEqual(
+			payload,
+			{
+				"gateway_event": event.name,
+				"message": "start the flow",
+				"gateway": self.gateway_a.name,
+				"sender_id": event.sender_id,
+				"conversation_id": event.conversation_id,
+			},
+		)
+		self.assertTrue(payload["sender_id"])
 		self.assertEqual(self.agent_calls, [], "a Flow-routed event must not run an agent")
 
 	def test_flow_route_needs_flow_run_permission_for_the_execution_user(self):
