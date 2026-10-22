@@ -967,6 +967,15 @@
         },
         {
           "$ref": "#/$defs/TriggerUnsetNode"
+        },
+        {
+          "$ref": "#/$defs/StateGetNode"
+        },
+        {
+          "$ref": "#/$defs/StateSetNode"
+        },
+        {
+          "$ref": "#/$defs/StateDeleteNode"
         }
       ]
     },
@@ -1108,6 +1117,103 @@
                 "policy": {
                   "type": "string",
                   "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "StateGetNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/NodeCommon"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "state.get"
+            },
+            "config": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "$ref": "#/$defs/Value"
+                },
+                "default": {
+                  "$ref": "#/$defs/Value"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "StateSetNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/NodeCommon"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "state.set"
+            },
+            "config": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key",
+                "value"
+              ],
+              "properties": {
+                "key": {
+                  "$ref": "#/$defs/Value"
+                },
+                "value": {
+                  "$ref": "#/$defs/Value"
+                },
+                "ttl_seconds": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2592000
+                    },
+                    {
+                      "$ref": "#/$defs/Value"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "StateDeleteNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/NodeCommon"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "state.delete"
+            },
+            "config": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "$ref": "#/$defs/Value"
                 }
               }
             }

@@ -1588,7 +1588,13 @@ def _process_gateway_event(event_name: str) -> dict:
             # docs/gateway-todo.md checklist is done and adapters are live.
             flow_run = create_flow_run(
                 flow_id=event.target_flow,
-                payload={"gateway_event": event.name, "message": event.message_text},
+                payload={
+                    "gateway_event": event.name,
+                    "message": event.message_text,
+                    "gateway": event.gateway,
+                    "sender_id": event.sender_id,
+                    "conversation_id": event.conversation_id,
+                },
                 trigger_type="Gateway",
             )
             event.db_set({"flow_run": flow_run.name, "status": "Queued"})

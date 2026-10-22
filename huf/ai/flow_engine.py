@@ -44,6 +44,7 @@ from frappe.utils import now_datetime
 from frappe.desk.doctype.notification_log.notification_log import enqueue_create_notification
 from frappe.desk.doctype.notification_settings.notification_settings import is_email_notifications_enabled
 
+from huf.ai import flow_state
 from huf.ai.flow_eval import safe_eval_expression
 from huf.ai.flow_orchestrator import (
 	build_flow_context_system_message,
@@ -1648,6 +1649,55 @@ def _exec_output(flow_run, node: dict, config: dict, settings: dict) -> dict:
 #: life -- an already-running or paused run using one of these types must
 #: still be able to advance. Remove an entry here only once no such pinned
 #: run can still be outstanding.
+# ---------------------------------------------------------------------------
+# Per-key flow state (state.get / state.set / state.delete)
+# ---------------------------------------------------------------------------
+
+
+def _state_node(flow_run, node: dict, config: dict, settings: dict, allowed: set, op):
+	"""Shared shell: validate config keys, resolve inputs, scope to the *running* flow."""
+	unknown = sorted(set(config) - allowed)
+	if unknown:
+		return {"status": "failed", "error": f"{node.get('type')}: unsupported config {unknown}"}
+	flow_id = getattr(flow_run, "flow_id", None)
+	ctx = _context_of(flow_run, settings)
+	resolved = {k: ctx.resolve(v) for k, v in config.items()}
+	try:
+		output = op(flow_id, resolved)
+	except flow_state.FlowStateError as exc:
+		return {"status": "failed", "error": f"{node.get('type')}: {exc}"}
+	return {"status": "success", "result": output, "output": output}
+
+
+def _exec_state_get(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.get``: config ``key`` (required), ``default``. Output ``{"found": bool, "value": ...}``."""
+
+	def op(flow_id, cfg):
+		found, value = flow_state.get_state(flow_id, cfg.get("key"))
+		return {"found": found, "value": value if found else cfg.get("default")}
+
+	return _state_node(flow_run, node, config, settings, {"key", "default"}, op)
+
+
+def _exec_state_set(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.set``: config ``key``, ``value``, ``ttl_seconds`` (default 24h). Output ``{"stored": true}``."""
+
+	def op(flow_id, cfg):
+		flow_state.set_state(flow_id, cfg.get("key"), cfg.get("value"), cfg.get("ttl_seconds"))
+		return {"stored": True}
+
+	return _state_node(flow_run, node, config, settings, {"key", "value", "ttl_seconds"}, op)
+
+
+def _exec_state_delete(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.delete``: config ``key``. Output ``{"deleted": bool}``."""
+
+	def op(flow_id, cfg):
+		return {"deleted": flow_state.delete_state(flow_id, cfg.get("key"))}
+
+	return _state_node(flow_run, node, config, settings, {"key"}, op)
+
+
 _NODE_EXECUTORS = {
 	"trigger.webhook": _exec_trigger_webhook,
 	"trigger.schedule": _exec_trigger_schedule,
@@ -1666,6 +1716,9 @@ _NODE_EXECUTORS = {
 	"parallel": _exec_parallel,
 	"validate": _exec_validate,
 	"output": _exec_output,
+	"state.get": _exec_state_get,
+	"state.set": _exec_state_set,
+	"state.delete": _exec_state_delete,
 }
 
 _NODE_TYPES = tuple(_NODE_EXECUTORS)
