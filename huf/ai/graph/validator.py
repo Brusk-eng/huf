@@ -127,6 +127,11 @@ FLOW_ONLY_NODE_TYPES: frozenset[str] = frozenset(
 		"trigger.webhook",
 		"trigger.schedule",
 		"trigger.doc-event",
+		"trigger.unset",
+		"state.get",
+		"state.set",
+		"state.delete",
+		"doc.create",
 	}
 )
 

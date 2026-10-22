@@ -24,11 +24,26 @@ class FakeResponse:
 		return self._body
 
 
+def _bound():
+	return patch.multiple(
+		whatsapp, _run_gateway=MagicMock(return_value="GW-1"),
+		_authorize=MagicMock(return_value=None),
+		_scope_refusal=MagicMock(return_value=None),
+	)
+
+
 class TestWhatsAppSendTemplate(unittest.TestCase):
+	def setUp(self):
+		for p in (
+			patch.object(whatsapp, "_get_whatsapp_credentials", return_value=("PN1", "token")),
+			patch.object(whatsapp.bridge, "is_available", return_value=False),
+			_bound(),
+		):
+			p.start()
+		self.addCleanup(patch.stopall)
+
 	def _kwargs(self, **overrides):
 		kwargs = {
-			"phone_number_id": "PN1",
-			"access_token": "token",
 			"to": "15551234567",
 			"template_name": "order_update",
 			"language_code": "en_US",
@@ -74,9 +89,27 @@ class TestWhatsAppSendTemplate(unittest.TestCase):
 		self.assertIn("list", result["error"])
 
 	def test_send_template_requires_recipient_and_name(self):
-		result = json.loads(whatsapp.handle_action("send_template", phone_number_id="PN1", access_token="t"))
+		result = json.loads(whatsapp.handle_action("send_template"))
 		self.assertFalse(result["success"])
 
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+class TestWhatsAppSendTemplateRecordName(unittest.TestCase):
+	def test_record_name_and_language_required_pass_through_bridge(self):
+		acct = {"name": "ACC"}
+		kw = {"to": "15551234567", "template_name": "invalid_wash_day-en"}
+		with _bound(), patch.object(whatsapp, "_resolve_bridge_account", return_value=acct), patch.object(
+			whatsapp.bridge, "send_template", return_value={"message_id": "w1", "name": "m"}
+		) as send:
+			result = json.loads(whatsapp.handle_action("send_template", **kw))
+		self.assertTrue(result["success"])
+		self.assertEqual(send.call_args.args[2], "invalid_wash_day-en")
+		err = whatsapp.bridge.BridgeError({"success": False, "error": "language_required", "languages": ["en", "hi"]})
+		with _bound(), patch.object(whatsapp, "_resolve_bridge_account", return_value=acct), patch.object(
+			whatsapp.bridge, "send_template", side_effect=err
+		):
+			result = json.loads(whatsapp.handle_action("send_template", **{**kw, "template_name": "invalid_wash_day"}))
+		self.assertEqual(result["error"], "language_required")

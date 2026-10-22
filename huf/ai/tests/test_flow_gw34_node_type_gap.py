@@ -260,3 +260,11 @@ class TestExecParallel(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+class TestTriggerUnsetExecutor(unittest.TestCase):
+	def test_trigger_unset_fails_closed_instead_of_unknown_node_type(self):
+		node = {"id": "start", "type": "trigger.unset", "config": {}}
+		result = flow_engine._exec_trigger_unset(_FakeFlowRun(), node, {}, _settings_for([node]))
+		self.assertEqual(result["status"], "failed")
+		self.assertIn("not runnable", result["error"])

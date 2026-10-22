@@ -44,6 +44,8 @@ from frappe.utils import now_datetime
 from frappe.desk.doctype.notification_log.notification_log import enqueue_create_notification
 from frappe.desk.doctype.notification_settings.notification_settings import is_email_notifications_enabled
 
+from huf.ai import flow_create_doc, flow_state
+from huf.ai.graph.permissions import envelope_declares
 from huf.ai.flow_eval import safe_eval_expression
 from huf.ai.flow_orchestrator import (
 	build_flow_context_system_message,
@@ -70,6 +72,7 @@ from huf.ai.graph.executor import (
 )
 from huf.ai.graph.expressions import evaluate_bool, parse_expression
 from huf.ai.graph.transforms import Limits as TransformLimits
+from huf.ai.graph.templates import TemplateError
 from huf.ai.graph.transforms import run_transform
 from huf.ai.output_budget import OutputBudget, OutputBudgetExceeded, enforce_output_budget
 from huf.ai.tool_invocation import RunContext
@@ -273,7 +276,10 @@ def _acquire_run_lock(flow_run_name: str) -> bool:
 
 def _release_run_lock(flow_run_name: str) -> None:
 	try:
-		frappe.cache().delete_value(_run_lock_key(flow_run_name))
+		# ``delete`` (raw key), not ``delete_value``: the lock is taken with a raw
+		# ``SET NX``, while ``delete_value`` removes the site-prefixed key, so the lock
+		# would otherwise survive until its TTL and silently block approve/resume.
+		frappe.cache().delete(_run_lock_key(flow_run_name))
 	except Exception:
 		pass
 
@@ -289,6 +295,7 @@ def create_flow_run(
 	mode: str | None = None,
 	conversation_mode: str | None = None,
 	trigger_type: str = "Manual",
+	ignore_permissions: bool = False,
 ) -> "frappe.Document":
 	"""
 	Create a new FlowRun document from a FlowDefinition.
@@ -302,12 +309,18 @@ def create_flow_run(
 	    mode: Override mode (normal/agentic). If None, uses definition settings.
 	    conversation_mode: Override conversation_mode. If None, uses definition settings.
 	    trigger_type: Manual / Webhook / Schedule / Doc Event
+	    ignore_permissions: for trusted callers that already authorised the route (Gateway)
 
 	Returns:
 	    Flow Run document
 	"""
 	defn_doc = frappe.get_doc("Flow Definition", flow_id)
 	defn = json.loads(defn_doc.definition_json) if isinstance(defn_doc.definition_json, str) else defn_doc.definition_json
+
+	from huf.huf.doctype.flow_definition.activation_rules import entry_is_unset
+
+	if entry_is_unset(defn):
+		frappe.throw(_("Flow {0} has no trigger configured (trigger.unset is not runnable)").format(flow_id))
 
 	version = PinnedVersion.pin(defn)
 
@@ -345,7 +358,7 @@ def create_flow_run(
 	# Authenticated callers are already verified by the public API.
 	# Webhook triggers run as Guest after HMAC validation, so the internal
 	# Flow Run record must be created on behalf of the system.
-	if frappe.session.user == "Guest":
+	if ignore_permissions or frappe.session.user == "Guest":
 		flow_run.insert(ignore_permissions=True)
 	else:
 		if not frappe.has_permission("Flow Run", "create", doc=flow_run):
@@ -588,13 +601,32 @@ def _build_program(nodes_map: dict, edges_list: list, settings) -> GraphProgram:
 	return GraphProgram(version, specs, version.graph.get("entry"), settings=dict(settings or {}))
 
 
-def _build_router(flow_run, settings, edges_list: list, state: ExecutionState) -> Router:
-	"""One routing path for every node type (structural knots 3 and 4)."""
+def _build_router(
+	flow_run, settings, edges_list: list, state: ExecutionState, unhandled_failures: list | None = None
+) -> Router:
+	"""One routing path for every node type (structural knots 3 and 4).
+
+	``unhandled_failures`` collects ``"<node id>: <error>"`` for every failed node whose
+	chosen successor is not one of its ``on_failure`` edges (an ``on_error`` target is
+	one), so the run can still end ``Failed`` after an ``always`` edge ran cleanup nodes.
+	"""
 	run_ctx = _run_context(settings)
 	is_agentic = (run_ctx.mode if run_ctx is not None else "normal") == "agentic"
 	orch_policy = (settings or {}).get("orchestrator_call_policy", "after_each_node")
 
 	def default_resolver(node: NodeSpec, outcome: Outcome, context: GraphContext):
+		chosen = _resolve_default(node, outcome, context)
+		if outcome.status == "failed" and unhandled_failures is not None:
+			# No edge chosen -> the executor falls back to the node's ``on_error``.
+			handled = (chosen is None and bool(node.raw.get("on_error"))) or any(
+				e.get("from") == node.id and e.get("to") == chosen and e.get("type") == "on_failure"
+				for e in edges_list
+			)
+			if not handled:
+				unhandled_failures.append(f"Node '{node.id}' failed: {outcome.error or 'unknown error'}")
+		return chosen
+
+	def _resolve_default(node: NodeSpec, outcome: Outcome, context: GraphContext):
 		node_result = outcome.extra or {"status": outcome.status}
 		if is_agentic and _should_call_orchestrator(orch_policy, state.completed_nodes):
 			candidates = _get_outgoing_edges(node.id, edges_list)
@@ -705,7 +737,8 @@ def _execute_loop(flow_run, nodes_map: dict, edges_list: list, settings: dict):
 	"""
 	program = _build_program(nodes_map, edges_list, settings)
 	state = _flow_state(flow_run)
-	router = _build_router(flow_run, settings, edges_list, state)
+	unhandled_failures: list = []
+	router = _build_router(flow_run, settings, edges_list, state, unhandled_failures)
 	handler = _make_node_handler(flow_run, settings)
 	handlers = {node_type: handler for node_type in _NODE_TYPES}
 
@@ -744,7 +777,14 @@ def _execute_loop(flow_run, nodes_map: dict, edges_list: list, settings: dict):
 		_fail_flow_run(flow_run, result.error)
 		return result
 
-	_complete_flow_run(flow_run)
+	if unhandled_failures:
+		# A failure no on_failure/on_error route handled: cleanup nodes may have run
+		# via an ``always`` edge, but the run is still Failed (first failure wins).
+		_publish_flow_event(flow_run, "flow_error", {"error": unhandled_failures[0]})
+		_fail_flow_run(flow_run, unhandled_failures[0])
+		return result
+
+	_complete_flow_run(flow_run, reply_text=_flow_reply_text(flow_run, settings, result))
 	_publish_flow_event(flow_run, "flow_completed", {"node_id": result.node_id, "status": "Success"})
 	return result
 
@@ -769,13 +809,22 @@ def _execute_node(flow_run, node: dict, settings: dict) -> dict:
 	if not executor:
 		frappe.throw(_("Unknown node type: {0}").format(node_type))
 
-	return executor(flow_run, node, config, settings)
+	try:
+		return executor(flow_run, node, config, settings)
+	except TemplateError as exc:
+		# Authoring error in a {"$template": ...} value: fail this node (so on_error applies).
+		return {"status": "failed", "error": f"Template error: {exc}"}
 
 
 def _exec_trigger_webhook(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""Execute trigger.webhook node - mostly a passthrough for UI clarity."""
 	ctx = _context_of(flow_run, settings)
 	return {"status": "success", "output": ctx.as_dict()}
+
+
+def _exec_trigger_unset(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""trigger.unset is a placeholder with no trigger configured; it is not runnable."""
+	return {"status": "failed", "error": "trigger.unset is not runnable: configure a trigger for this flow"}
 
 
 def _exec_trigger_schedule(flow_run, node: dict, config: dict, settings: dict) -> dict:
@@ -886,6 +935,36 @@ def _exec_agent_run(flow_run, node: dict, config: dict, settings: dict) -> dict:
 		return {"status": "failed", "error": str(e)}
 
 
+def _bound_gateway(flow_run, config: dict, run_id: str = ""):
+	"""Trusted gateway for the WhatsApp tool: the gateway that started this flow, else the node's ``gateway``.
+
+	Model/tool arguments never select it; empty means the tool fails closed (gateway_context_required).
+	"""
+	from huf.ai.tools.whatsapp import trusted_gateway
+
+	gateway = ""
+	contact = ""
+	try:
+		payload = flow_run.get("trigger_payload")
+		payload = json.loads(payload) if isinstance(payload, str) else (payload or {})
+		event = payload.get("gateway_event") if isinstance(payload, dict) else None
+		if event:
+			row = frappe.db.get_value("Gateway Event", event, ["gateway", "sender_id"], as_dict=True) or {}
+			gateway = row.get("gateway") or ""
+			contact = row.get("sender_id") or ""
+	except Exception:
+		gateway, contact = "", ""
+	if not gateway:
+		# A node-configured gateway is the flow author's choice: they need write access to it.
+		gateway = str(config.get("gateway") or "")
+		author = getattr(flow_run, "owner", None)
+		if gateway and not (
+			author and frappe.db.exists("Gateway", gateway) and frappe.has_permission("Gateway", "write", doc=gateway, user=author)
+		):
+			gateway = ""  # fail closed: the tool reports gateway_context_required
+	return trusted_gateway(gateway, run_id=run_id, contact=contact)
+
+
 def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""Execute tool.call node - deterministic tool execution.
 
@@ -926,13 +1005,14 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 		agent_name=config.get("agent_name") or config.get("agent"),
 	)
 
-	# Check MCP tool info: prefer the explicit config, fall back to lookup
-	# by tool name for backward compatibility with existing flow definitions.
+	# Check MCP tool info: prefer the explicit config, else a unique raw-name lookup.
 	mcp_server = config.get("mcp_server")
 	if not mcp_server:
-		mcp_tool_entry = frappe.db.get_value("MCP Server Tool", {"tool_name": tool_name, "enabled": 1}, "parent")
-		if mcp_tool_entry:
-			mcp_server = mcp_tool_entry
+		from huf.ai.mcp_client import find_unique_mcp_server_for_tool
+
+		# Raw tool name only counts when a single server owns it; an ambiguous name is
+		# never attributed to an arbitrary server (set ``mcp_server`` on the node).
+		mcp_server = find_unique_mcp_server_for_tool(tool_name)
 
 	invocation_ctx = RunContext(
 		conversation_id=_conversation_of(flow_run, run_ctx),
@@ -967,7 +1047,14 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 			# from sync flow-engine code.
 			import asyncio
 
-			coro = execute_mcp_tool(server_name=mcp_server, tool_name=tool_name, arguments=args)
+			# A Requires Approval tool only runs when the node is explicitly marked
+			# ``approved`` (the flow author places it behind a human.approval step).
+			coro = execute_mcp_tool(
+				server_name=mcp_server,
+				tool_name=tool_name,
+				arguments=args,
+				approved=config.get("approved") is True,
+			)
 			loop = asyncio.new_event_loop()
 			asyncio.set_event_loop(loop)
 			try:
@@ -976,8 +1063,19 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 				loop.close()
 			if not isinstance(result, dict):
 				result = {"success": True, "result": result}
+			elif "success" not in result and ("content" in result or "isError" in result):
+				# A raw MCP tools/call payload has no ``success`` key; without this a
+				# call that ran is recorded as Failed (and an on_error route would
+				# then retry a side-effecting tool).
+				is_error = bool(result.get("isError"))
+				texts = [c.get("text", "") for c in (result.get("content") or []) if isinstance(c, dict)]
+				result = {
+					"success": not is_error,
+					"result": result,
+					"error": " ".join(t for t in texts if t) or "MCP tool reported an error" if is_error else "",
+				}
 		else:
-			with tool_run_context(invocation_ctx):
+			with tool_run_context(invocation_ctx), _bound_gateway(flow_run, config, getattr(run_doc, "name", "") or ""):
 				result = execute_tool(tool_name, args)
 
 		is_success = result.get("success", False) if isinstance(result, dict) else bool(result)
@@ -1237,6 +1335,18 @@ def _exec_http_request(flow_run, node: dict, config: dict, settings: dict) -> di
 		return {"status": "failed", "error": str(e)}
 
 
+def _expression_context(ctx: GraphContext) -> dict:
+	"""The ``context`` seen by condition expressions and expression edges.
+
+	The flat run context, plus ``context["outputs"]`` -- earlier nodes' outputs by node id
+	(e.g. ``context["outputs"]["has_order"]``). A flat key literally named ``outputs`` wins. The
+	extra key is added to a copy only; it is never written back to the run context.
+	"""
+	merged = dict(ctx.as_dict())
+	merged.setdefault("outputs", dict(ctx.node_outputs))
+	return merged
+
+
 def _exec_condition(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""
 	Execute condition node - evaluates a boolean expression and routes to
@@ -1263,7 +1373,7 @@ def _exec_condition(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	ctx = _context_of(flow_run, settings)
 
 	try:
-		result = safe_eval_expression(expression, ctx.as_dict())
+		result = safe_eval_expression(expression, _expression_context(ctx))
 		chosen_node = true_node if result else false_node
 
 		if not chosen_node:
@@ -1589,9 +1699,103 @@ def _exec_output(flow_run, node: dict, config: dict, settings: dict) -> dict:
 #: life -- an already-running or paused run using one of these types must
 #: still be able to advance. Remove an entry here only once no such pinned
 #: run can still be outstanding.
+# ---------------------------------------------------------------------------
+# Per-key flow state (state.get / state.set / state.delete)
+# ---------------------------------------------------------------------------
+
+
+def _state_node(flow_run, node: dict, config: dict, settings: dict, allowed: set, op):
+	"""Shared shell: validate config keys, resolve inputs, scope to the *running* flow."""
+	unknown = sorted(set(config) - allowed)
+	if unknown:
+		return {"status": "failed", "error": f"{node.get('type')}: unsupported config {unknown}"}
+	flow_id = getattr(flow_run, "flow_id", None)
+	ctx = _context_of(flow_run, settings)
+	resolved = {k: ctx.resolve(v) for k, v in config.items()}
+	try:
+		output = op(flow_id, resolved)
+	except flow_state.FlowStateError as exc:
+		return {"status": "failed", "error": f"{node.get('type')}: {exc}"}
+	return {"status": "success", "result": output, "output": output}
+
+
+def _exec_state_get(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.get``: config ``key`` (required), ``default``. Output ``{"found": bool, "value": ...}``."""
+
+	def op(flow_id, cfg):
+		found, value = flow_state.get_state(flow_id, cfg.get("key"))
+		return {"found": found, "value": value if found else cfg.get("default")}
+
+	return _state_node(flow_run, node, config, settings, {"key", "default"}, op)
+
+
+def _exec_state_set(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.set``: config ``key``, ``value``, ``ttl_seconds`` (default 24h). Output ``{"stored": true}``."""
+
+	def op(flow_id, cfg):
+		flow_state.set_state(flow_id, cfg.get("key"), cfg.get("value"), cfg.get("ttl_seconds"))
+		return {"stored": True}
+
+	return _state_node(flow_run, node, config, settings, {"key", "value", "ttl_seconds"}, op)
+
+
+def _exec_state_delete(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""``state.delete``: config ``key``. Output ``{"deleted": bool}``."""
+
+	def op(flow_id, cfg):
+		return {"deleted": flow_state.delete_state(flow_id, cfg.get("key"))}
+
+	return _state_node(flow_run, node, config, settings, {"key"}, op)
+
+
+# ---------------------------------------------------------------------------
+# doc.create -- insert an allow-listed document as the run's user
+# ---------------------------------------------------------------------------
+
+_WRITES_KEY = "_doc_create_count"
+
+
+def _exec_doc_create(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""
+	``doc.create``: config ``doctype`` (literal) and ``fields`` (object of values / references).
+	Output ``{"doctype", "name"}`` so later nodes can use ``{"$from": "<node>.name"}``.
+
+	Policy lives in :mod:`huf.ai.flow_create_doc` (allow-list, field validation, no
+	``ignore_permissions``). Each created document also counts against the graph contract's
+	``limits.max_writes`` for the run (absent or 0 means no writes are allowed).
+	"""
+	unknown = sorted(set(config) - {"doctype", "fields"})
+	if unknown or "doctype" not in config or "fields" not in config:
+		return {"status": "failed", "error": "doc.create requires exactly doctype and fields (got unsupported keys: %s)" % unknown}
+	ctx = _context_of(flow_run, settings)
+	run_ctx = _run_context(settings)
+	limits = ((run_ctx.definition.get("contract") or {}).get("limits") or {}) if run_ctx is not None else {}
+	max_writes = limits.get("max_writes") or 0
+	envelope = ((run_ctx.definition.get("contract") or {}).get("permission_envelope") or {}) if run_ctx is not None else {}
+	doctype = config["doctype"]
+	try:  # the site allow-list first: its message is the clearer one for an unsupported doctype
+		flow_create_doc.check_doctype(doctype, flow_create_doc.allowed_doctypes(frappe.conf))
+	except flow_create_doc.CreateDocError as exc:
+		return {"status": "failed", "error": f"doc.create: {exc}"}
+	if not isinstance(doctype, str) or not envelope_declares(envelope, ptype="create", doctype=doctype):
+		return {"status": "failed", "error": f"doc.create: contract permission_envelope.write does not grant {doctype!r}"}
+	done = ctx.data.get(_WRITES_KEY) or 0
+	if done >= max_writes:
+		return {"status": "failed", "error": f"doc.create exceeds contract limits.max_writes ({max_writes})"}
+	try:
+		result = flow_create_doc.create_document(config["doctype"], ctx.resolve(config["fields"]))
+	except flow_create_doc.CreateDocError as exc:
+		return {"status": "failed", "error": f"doc.create: {exc}"}
+	except frappe.PermissionError as exc:
+		return {"status": "failed", "error": f"doc.create: permission denied ({exc})"}
+	ctx.set(_WRITES_KEY, done + 1)
+	return {"status": "success", "result": result, "output": result}
+
+
 _NODE_EXECUTORS = {
 	"trigger.webhook": _exec_trigger_webhook,
 	"trigger.schedule": _exec_trigger_schedule,
+	"trigger.unset": _exec_trigger_unset,
 	"trigger.doc-event": _exec_trigger_doc_event,
 	"agent.run": _exec_agent_run,
 	"tool.call": _exec_tool_call,
@@ -1607,6 +1811,10 @@ _NODE_EXECUTORS = {
 	"parallel": _exec_parallel,
 	"validate": _exec_validate,
 	"output": _exec_output,
+	"state.get": _exec_state_get,
+	"state.set": _exec_state_set,
+	"state.delete": _exec_state_delete,
+	"doc.create": _exec_doc_create,
 }
 
 _NODE_TYPES = tuple(_NODE_EXECUTORS)
@@ -1722,7 +1930,7 @@ def _evaluate_edges(
 
 	outgoing.sort(key=lambda e: e.get("priority", 0), reverse=True)
 
-	ctx = context.as_dict() if context is not None else _load_context(flow_run)
+	ctx = _expression_context(context) if context is not None else _load_context(flow_run)
 	node_status = node_result.get("status", "success") if isinstance(node_result, dict) else "success"
 
 	for edge in outgoing:
@@ -2127,16 +2335,46 @@ def _verify_approval_permission(waiting: dict):
 				)
 
 
-def _complete_flow_run(flow_run):
+def _flow_reply_text(flow_run, settings, result) -> str | None:
+	"""The text a Gateway-triggered run replies with: its final ``output`` node value (or ``reply`` in context)."""
+	try:
+		ctx = _context_of(flow_run, settings)
+		node_id = getattr(result, "node_id", None)
+		nodes = {n.get("id"): n for n in _pinned_version(flow_run).graph.get("nodes", [])}
+		value = None
+		if (nodes.get(node_id) or {}).get("type") == "output":
+			value = ctx.node_outputs.get(node_id)
+		if value is None:
+			value = ctx.data.get("reply")
+		if isinstance(value, dict):
+			value = value.get("reply") or value.get("text") or value.get("message")
+		return str(value) if isinstance(value, (str, int, float)) and str(value).strip() else None
+	except Exception:
+		return None
+
+
+def _sync_gateway_event(flow_run, status: str, reply_text: str | None = None, error: str = ""):
+	"""Gateway-triggered runs hand their outcome to the gateway reply pipeline."""
+	if getattr(flow_run, "trigger_type", None) != "Gateway":
+		return
+	from huf.ai.gateway_service import finish_flow_event
+
+	finish_flow_event(flow_run.name, status, reply_text, error)
+	commit_if_background()
+
+
+def _complete_flow_run(flow_run, reply_text: str | None = None):
 	"""Mark a flow run as successfully completed."""
 	flow_run.db_set({"status": "Success", "completed_at": now_datetime()})
 	commit_if_background()
+	_sync_gateway_event(flow_run, "Success", reply_text)
 
 
 def _fail_flow_run(flow_run, error_msg: str):
 	"""Mark a flow run as failed."""
 	flow_run.db_set({"status": "Failed", "last_error": error_msg, "completed_at": now_datetime()})
 	commit_if_background()
+	_sync_gateway_event(flow_run, "Failed", error=error_msg)
 	_publish_flow_event(flow_run, "flow_failed", {"error": error_msg})
 
 

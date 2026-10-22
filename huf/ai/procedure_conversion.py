@@ -50,7 +50,7 @@ BLOCKING_NODE_TYPES: frozenset[str] = frozenset({"agent.run", "router.llm", "rou
 # at all (its entry is always exactly one non-trigger node), so these are stripped and
 # their `next` pointer becomes the Procedure's entry, rather than being treated as a
 # reason to refuse.
-TRIGGER_NODE_TYPES: frozenset[str] = frozenset({"trigger.webhook", "trigger.schedule", "trigger.doc-event"})
+TRIGGER_NODE_TYPES: frozenset[str] = frozenset({"trigger.webhook", "trigger.schedule", "trigger.doc-event", "trigger.unset"})
 
 _GRAPH_FIELDS = ("schema_version", "profile", "fingerprint", "entry", "nodes", "contract")
 
@@ -249,6 +249,14 @@ def analyze_conversion(flow_graph: dict, *, classify_tool=default_tool_classifie
 				else "This flow does not pass validation on its own terms."
 			),
 			validation_errors=flow_validation.errors,
+		)
+
+	from huf.huf.doctype.flow_definition.activation_rules import entry_is_unset
+
+	if entry_is_unset(flow_graph):
+		return ConversionResult(
+			convertible=False,
+			reason="This flow has no trigger configured yet (its entry is an unset trigger), so there is nothing to convert.",
 		)
 
 	blocking = find_blocking_nodes(flow_graph)

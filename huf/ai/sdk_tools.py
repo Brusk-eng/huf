@@ -82,8 +82,24 @@ def _merge_run_context(args_dict: dict, ctx) -> dict:
 
     tool_call_id = getattr(ctx, "tool_call_id", None)
     if tool_call_id:
-        args_dict.setdefault("call_id", tool_call_id)
+        # Overwrite: the model must not choose the id that scopes idempotency and audit linkage.
+        args_dict["call_id"] = tool_call_id
 
+    return args_dict
+
+
+def _pin_code_execution_identity(args_dict: dict, ctx) -> dict:
+    """Overwrite ``conversation`` / ``agent_run`` (run_python's audit linkage) from the run
+    context, discarding model-supplied values for them and for the ``*_id`` aliases."""
+    huf_ctx = _frappe_run_context_dict(ctx)
+    for key in ("conversation", "agent_run", "conversation_id", "agent_run_id"):
+        args_dict.pop(key, None)
+    if huf_ctx.get("conversation_id"):
+        args_dict["conversation"] = huf_ctx["conversation_id"]
+        args_dict["conversation_id"] = huf_ctx["conversation_id"]
+    if huf_ctx.get("agent_run_id"):
+        args_dict["agent_run"] = huf_ctx["agent_run_id"]
+        args_dict["agent_run_id"] = huf_ctx["agent_run_id"]
     return args_dict
 
 
@@ -619,6 +635,7 @@ def create_agent_tools(agent, model_name: str = None, desktop_ctx: dict | None =
                 # predates this refactor and is left untouched.
                 _tool_doc_dict["reference_doctype"] = function_doc.reference_doctype
                 _tool_doc_dict["agent"] = function_doc.agent
+                _tool_doc_dict["agent_doc"] = agent
                 extra_args = build_extra_args(_tool_doc_dict)
                 extra_args.pop("tool_name", None)
 
@@ -925,6 +942,11 @@ def create_function_tool(
 
                 if _extra_args:
                     args_dict.update(_extra_args)
+
+                if tool_type == "Code Execution":
+                    # Audit linkage comes only from the server-side run context;
+                    # whatever the model sent for it is discarded.
+                    _pin_code_execution_identity(args_dict, ctx)
 
                 if pin_run_context:
                     # N8: only this path can mint the token the Desktop handlers require, so

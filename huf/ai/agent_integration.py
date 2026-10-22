@@ -26,6 +26,7 @@ from .conversation_manager import ConversationManager, safe_history_slice, safe_
 from .run import RunProvider
 from huf.ai.knowledge.context_builder import build_knowledge_context, inject_knowledge_context
 from huf.ai.providers.litellm import _normalize_model_name, ProviderUnavailableError
+from huf.ai.providers.errors import ProviderError, classify_status, redact_text
 from huf.ai.transaction import safe_commit, transaction_checkpoint
 from huf.ai.run_control import touch_run_alive
 from huf.ai.agent_access import (
@@ -808,6 +809,35 @@ def _normalize_tool_args_json(args):
     return json.dumps(args)
 
 
+def _resolve_mcp_server_for_run(agent_run, tool_name):
+    """MCP server that supplied `tool_name` to this run's agent (agent + skill servers only)."""
+    try:
+        agent = frappe.db.get_value("Agent Run", agent_run, "agent") if agent_run else None
+        if not agent:
+            return None
+        servers = frappe.get_all(
+            "Agent MCP Server",
+            filters={"parent": agent, "parenttype": "Agent", "enabled": 1},
+            pluck="mcp_server",
+            order_by="idx asc",
+        )
+        try:
+            from huf.ai.skills.loader import get_agent_skill_mcp_servers
+
+            servers += get_agent_skill_mcp_servers(agent)
+        except Exception as exc:  # skills are optional for attribution
+            logger.debug(f"Skill MCP server lookup skipped: {exc!s}")
+        seen = set()
+        servers = [s for s in servers if s and not (s in seen or seen.add(s))]
+
+        from huf.ai.mcp_client import resolve_mcp_tool_server
+
+        return resolve_mcp_tool_server(tool_name, servers)
+    except Exception as exc:
+        logger.debug(f"MCP server attribution failed for {tool_name}: {exc!s}")
+        return None
+
+
 def process_tool_call(agent_run, conversation, name=None, args=None, result=None, error=None, is_output=False, tool_call_id=None):
     """Process tool call - handle requests (insert) and outputs (update) separately"""
     try:
@@ -866,7 +896,7 @@ def process_tool_call(agent_run, conversation, name=None, args=None, result=None
             mcp_server = None
 
             if name:
-                mcp_tool_entry = frappe.db.get_value("MCP Server Tool", {"tool_name": name, "enabled": 1}, "parent")
+                mcp_tool_entry = _resolve_mcp_server_for_run(agent_run, name)
                 if mcp_tool_entry:
                     is_mcp_tool = 1
                     mcp_server = mcp_tool_entry
@@ -2724,12 +2754,14 @@ def _execute_agent_run(
             "session_id": conv_manager.session_id
         }
 
-    except ProviderUnavailableError as e:
+    except (ProviderUnavailableError, ProviderError) as e:
         # Provider-level failure (connection refused, model not pulled, bad
-        # model prefix, empty response). Surface it as a failed run — never
-        # as assistant message content.
+        # model prefix, empty response, HTTP 404/429/401/5xx from a legacy
+        # provider module). Surface it as a failed run — never as assistant
+        # message content.
         error_msg = str(e)
-        log_error_msg = getattr(e, "log_message", error_msg)
+        error_kind = getattr(e, "kind", None) or "unknown"
+        log_error_msg = redact_text(getattr(e, "log_message", error_msg))
         _guarded_finish_started_run(run_doc.name, "Failed", error_message=error_msg)
         frappe.log_error(
             title="Huf Provider",
@@ -2744,6 +2776,7 @@ def _execute_agent_run(
         return {
             "success": False,
             "error": error_msg,
+            "error_kind": error_kind,
             "agent_run_id": run_doc.name,
             "conversation_id": conversation.name,
             "session_id": conv_manager.session_id
@@ -2751,6 +2784,7 @@ def _execute_agent_run(
 
     except Exception as e:
         error_msg = str(e)
+        error_kind = classify_status(getattr(e, "status_code", None), f"{type(e).__name__} {error_msg}")
 
         if "ContextWindowExceededError" in error_msg:
             try:
@@ -2797,8 +2831,9 @@ def _execute_agent_run(
                     f"Failed to handle rate limit error in sync: {str(inner_e)}"
                 )
 
+        error_msg = redact_text(error_msg)
         _guarded_finish_started_run(run_doc.name, "Failed", error_message=error_msg)
-        frappe.log_error(f"Agent Run Error: {frappe.get_traceback()}", "Huf")
+        frappe.log_error(f"Agent Run Error: {redact_text(frappe.get_traceback())}", "Huf")
         _emit_run_lifecycle_event(run_doc, conversation, "failed", {"error": error_msg})
 
         # Handle Sub-Agent Failure Lifecycle Hook
@@ -2846,6 +2881,7 @@ def _execute_agent_run(
         return {
             "success": False,
             "error": error_msg,
+            "error_kind": error_kind,
             "agent_run_id": run_doc.name,
             "conversation_id": conversation.name,
             "session_id": conv_manager.session_id
