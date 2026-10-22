@@ -10,55 +10,60 @@ Actions: send_message, send_media, send_image, send_video, send_audio, send_voic
 send_location, send_contact, send_reaction, send_buttons, send_list, send_cta_url, send_template,
 list_messages, get_account_info, list_templates, create_template, get_template_status.
 
+Gateway binding (fail closed)
+-----------------------------
+The model never chooses the gateway or the WhatsApp account. ``gateway_name`` and
+``whatsapp_account`` are not part of the tool schema and any such key supplied in a call is
+popped and discarded in ``handle_action``. The gateway is derived server-side from the current
+agent run (its conversation channel ``gateway:<name>``). A run that is not bound to an enabled
+WhatsApp gateway (a chat run, a flow run, a forged context) is refused with
+``gateway_context_required``; there is no fallback to a default account or to the first
+Integration Settings row. Sends are authorised for the run's own gateway (the gateway admitted the sender), so its execution
+user needs no Gateway write; template creation still requires write authority
+(``whatsapp_management._send_authority``); reads require Gateway read authority.
+
 Privilege gating (A8)
 ---------------------
-Two flags gate privileged behaviour. They are read server-side from the
-active WhatsApp Integration Settings ``credentials`` rows and are off by
-default. The LLM controls tool-call kwargs, so any ``allow_proactive`` or
-``allow_whatsapp_management`` key supplied in a call is popped and discarded
-in ``handle_action``. A setting counts only when its value is truthy: ``1``,
-``"1"``, ``"true"`` or ``"yes"`` (case-insensitive). ``"false"``,
-``"0"``, ``""`` and missing rows do not count. Any error while reading the
-settings fails closed (flag off).
+Three per-gateway flags (Check fields on the run's own Gateway) gate privileged behaviour. They
+are off by default and are never read from tool arguments: any ``allow_proactive``,
+``allow_whatsapp_management`` or ``auto_submit_templates`` key supplied in a call is popped and
+discarded. Any error while reading a flag fails closed (flag off).
 
-* ``allow_proactive``: permits free-form ``send_message`` to a number with no
-  open 24h customer-service window (see below).
-* ``allow_whatsapp_management``: permits ``create_template`` (only this
-  flag; ``allow_proactive`` does not), and also permits proactive free-form
-  sends. ``create_template`` only saves a DRAFT that a human must approve
-  in the console; nothing reaches Meta from the agent.
-* ``auto_submit_templates``: when also truthy, ``create_template`` submits to
-  Meta directly (still requires ``allow_whatsapp_management``).
+* ``agent_allow_proactive``: permits free-form sends to a number with no open 24h
+  customer-service window (see below).
+* ``agent_allow_template_management``: permits ``create_template`` only. It does NOT permit
+  proactive sends. ``create_template`` saves a DRAFT that a human must approve in the console;
+  nothing reaches Meta from the agent.
+* ``agent_auto_submit_templates``: when also set, ``create_template`` submits to Meta directly
+  (still requires ``agent_allow_template_management``).
 
-Credentials (``access_token``, ``phone_number_id``) are never tool
-parameters: tool arguments are persisted in Agent Tool Call, so any such
-keys supplied in a call are popped and discarded.
+Credentials (``access_token``, ``phone_number_id``) are never tool parameters: tool arguments
+are persisted in Agent Tool Call, so any such keys supplied in a call are popped and discarded.
 
-``send_media`` (image/document/audio/video/sticker by public ``link`` or uploaded ``media_id``) and every
-other non-text type (``send_image``/``send_video``/``send_audio``/``send_document``/``send_sticker`` are
-``send_media`` with the kind preset; ``send_location``, ``send_contact``, ``send_reaction``, ``send_buttons``,
-``send_list``, ``send_cta_url``) are free-form too and follow exactly the same proactive logic and flags as
-``send_message``. In addition, when a ``gateway_name`` is given, a contact who opted out (STOP) is refused with
-``opted_out`` whatever the flags say.
+``send_media`` (image/document/audio/video/sticker by public ``link`` or uploaded ``media_id``)
+and every other non-text type (``send_image``/``send_video``/``send_audio``/``send_document``/
+``send_sticker`` are ``send_media`` with the kind preset; ``send_location``, ``send_contact``,
+``send_reaction``, ``send_buttons``, ``send_list``, ``send_cta_url``) are free-form too and
+follow exactly the same proactive logic and flags as ``send_message``. A contact who opted out
+(STOP) is refused with ``opted_out`` whatever the flags say.
 
-A free-form ``send_message`` is proactive unless ``gateway_name`` is given
-and ``bridge.window_state(gateway_name, to)`` reports an open window. When a
-gateway is named, the message is sent from that gateway's own WhatsApp
-account (resolved server-side) and a conflicting ``whatsapp_account`` is
-ignored, so the window checked is always the window of the sending account.
-With no gateway context, every free-form send is treated as proactive.
-``send_template`` (approved templates) is deliberately NOT gated by either
-flag; it is routed through the bridge when available so a WhatsApp Message
-row is written. The tool never uses ``ignore_permissions`` and never
-switches the session user.
+A free-form send is proactive unless ``bridge.window_state(run_gateway, to)`` reports an open
+window. The message is sent from the run gateway's own WhatsApp account (resolved server-side),
+so the window checked is always the window of the sending account. ``send_template`` (approved
+templates) is deliberately NOT gated by the proactive flag (it still requires the run user's
+send authority); it is routed through the bridge when available so a WhatsApp Message row is
+written. The tool never switches the session user.
 """
 
+import contextvars
 import json
+from contextlib import contextmanager
 from typing import Optional, Any
 
 import frappe
 import requests
 
+from huf.ai import whatsapp_send_file as send_file
 from huf.ai.gateway_adapters import whatsapp_bridge as bridge
 from huf.ai.gateway_adapters import whatsapp_messages as wm
 from huf.ai.gateway_adapters import whatsapp_templates as wt
@@ -68,8 +73,12 @@ META_GRAPH_URL = f"https://graph.facebook.com/{bridge.GRAPH_DEFAULT_VERSION}"
 _TRUTHY_STRINGS = {"1", "true", "yes"}
 
 
-def _error(msg: str) -> str:
-	return json.dumps({"success": False, "error": msg}, default=str)
+def _error(msg: str, definite: bool = False) -> str:
+	"""Tool error JSON. ``definite`` marks a failure that happened before anything reached Meta (safe to retry)."""
+	body: dict[str, Any] = {"success": False, "error": msg}
+	if definite:
+		body["definite"] = True
+	return json.dumps(body, default=str)
 
 
 def _success(data: Any) -> str:
@@ -96,89 +105,162 @@ def _is_truthy(value: Any) -> bool:
 	return str(value or "").strip().lower() in _TRUTHY_STRINGS
 
 
-def _server_flag(name: str) -> bool:
-	"""Read a privilege flag from the active WhatsApp Integration Settings.
+_GATEWAY_FLAG_FIELDS = {
+	"allow_proactive": "agent_allow_proactive",
+	"allow_whatsapp_management": "agent_allow_template_management",
+	"auto_submit_templates": "agent_auto_submit_templates",
+}
+# Keys the model must never control: the gateway and account are bound from the run context.
+_BOUND_KWARGS = ("gateway_name", "whatsapp_account")
+_SEND_ACTIONS = {
+	"send_message", "send_media", "send_voice_note", "send_location", "send_contact", "send_reaction",
+	"send_template", "create_template", *_MEDIA_ACTIONS, *_INTERACTIVE_ACTIONS,
+}
+_LIST_DEFAULT_LIMIT = 20
+_LIST_MAX_LIMIT = 50
 
-	Fails closed: any error, or no active settings row, returns False.
+
+_trusted_gateway: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_trusted_gateway", default="")
+_trusted_contact: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_trusted_contact", default="")
+_trusted_run: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_trusted_run", default="")
+
+
+def _effective_run_id() -> Optional[str]:
+	"""The run sends are scoped and capped to: the agent run, else the trusted flow tool-node run."""
+	return getattr(frappe.flags, "huf_current_agent_run_id", None) or _trusted_run.get() or None
+
+
+@contextmanager
+def trusted_gateway(gateway_name: str, run_id: str = "", contact: str = ""):
+	"""Bind the gateway for a TRUSTED, deterministic caller (the Flow engine's tool.call node).
+
+	Only server code can enter this block; tool arguments never can. The gateway comes from the flow
+	run's own gateway event, or from an admin-configured node field, never from the model. The caller
+	still gets recipient scope and send caps, keyed to ``run_id`` (the flow's tool-node run).
+	"""
+	token = _trusted_gateway.set(str(gateway_name or "").strip())
+	run_token = _trusted_run.set(str(run_id or "").strip())
+	contact_token = _trusted_contact.set(str(contact or "").strip())
+	try:
+		yield
+	finally:
+		_trusted_contact.reset(contact_token)
+		_trusted_run.reset(run_token)
+		_trusted_gateway.reset(token)
+
+
+def _run_gateway() -> str:
+	"""The enabled WhatsApp Gateway the current run belongs to, or '' (fail closed).
+
+	A trusted caller's binding wins; otherwise it is derived from Agent Run -> Agent
+	Conversation.channel (``gateway:<name>``). Never from tool args.
 	"""
 	try:
-		settings_list = frappe.get_all(
-			"Integration Settings", filters={"service": "whatsapp", "is_active": 1}, limit=1
-		)
-		if not settings_list:
-			return False
-		doc = frappe.get_doc("Integration Settings", settings_list[0].name)
-		for row in doc.credentials or []:
-			if row.key == name:
-				return _is_truthy(row.get_password("value") or row.value or "")
+		bound = _trusted_gateway.get()
+		if bound:
+			row = frappe.db.get_value("Gateway", bound, ["provider", "is_enabled"], as_dict=True)
+			if row and row.get("provider") == "WhatsApp" and row.get("is_enabled"):
+				return bound
+			return ""
+		run_id = getattr(frappe.flags, "huf_current_agent_run_id", None)
+		if not run_id:
+			return ""
+		conversation = frappe.db.get_value("Agent Run", run_id, "conversation")
+		channel = str(frappe.db.get_value("Agent Conversation", conversation, "channel") or "") if conversation else ""
+		if not channel.startswith("gateway:"):
+			return ""
+		name = channel[len("gateway:"):].strip()
+		row = frappe.db.get_value("Gateway", name, ["provider", "is_enabled"], as_dict=True) if name else None
+		if not row or row.get("provider") != "WhatsApp" or not row.get("is_enabled"):
+			return ""
+		return name
+	except Exception:
+		return ""
+
+
+def _server_flag(gateway_name: str, name: str) -> bool:
+	"""Read a privilege flag from the run's own Gateway. Fails closed: any error or unknown flag is False."""
+	field = _GATEWAY_FLAG_FIELDS.get(name)
+	if not field or not gateway_name:
+		return False
+	try:
+		return _is_truthy(frappe.db.get_value("Gateway", gateway_name, field))
 	except Exception:
 		return False
-	return False
 
 
-def _graph_root() -> str:
-	"""Versioned Graph root; the optional ``graph_api_url`` credential only counts under tests."""
-	override = ""
+def _gateway_integration_values(gateway_name: str) -> dict[str, str]:
+	"""Credential rows of the named Gateway's own Integration Settings ({} when unavailable)."""
 	try:
-		settings_list = frappe.get_all("Integration Settings", filters={"service": "whatsapp", "is_active": 1}, limit=1)
-		if settings_list:
-			doc = frappe.get_doc("Integration Settings", settings_list[0].name)
-			for row in doc.credentials or []:
-				if row.key == "graph_api_url":
-					override = row.get_password("value") or ""
+		settings_name = frappe.db.get_value("Gateway", gateway_name, "integration_settings")
+		if not settings_name:
+			return {}
+		doc = frappe.get_doc("Integration Settings", settings_name)
+		return {row.key: str(row.get_password("value") or "") for row in doc.credentials or [] if row.key}
 	except Exception:
-		override = ""
+		return {}
+
+
+def _graph_root(gateway_name: str = "") -> str:
+	"""Versioned Graph root; the optional ``graph_api_url`` credential of the gateway only counts under tests."""
+	override = _gateway_integration_values(gateway_name).get("graph_api_url", "") if gateway_name else ""
 	return f"{bridge.graph_base_url(override)}/{bridge.GRAPH_DEFAULT_VERSION}"
 
 
 def _gateway_integration_credentials(gateway_name: str) -> tuple[str, str]:
 	"""phone_number_id / access_token of the named Gateway's own Integration Settings."""
-	try:
-		settings_name = frappe.db.get_value("Gateway", gateway_name, "integration_settings")
-		if not settings_name:
-			return "", ""
-		doc = frappe.get_doc("Integration Settings", settings_name)
-		values = {row.key: (row.get_password("value") or "") for row in doc.credentials or [] if row.key}
-		return str(values.get("phone_number_id") or "").strip(), str(values.get("access_token") or "").strip()
-	except Exception:
-		return "", ""
+	values = _gateway_integration_values(gateway_name)
+	return str(values.get("phone_number_id") or "").strip(), str(values.get("access_token") or "").strip()
 
 
 def _get_whatsapp_credentials(kwargs: dict | None = None) -> tuple[str, str]:
-	"""Get phone_number_id and access_token from server-side configuration only.
-
-	A named gateway uses its own integration credentials; other WhatsApp accounts are never
-	consulted for it. Without a gateway the first WhatsApp Account / active integration is used.
-	"""
+	"""phone_number_id / access_token of the run gateway's own integration; no gateway means no credentials."""
 	gateway_name = ((kwargs or {}).get("gateway_name") or "").strip()
-	if gateway_name:
-		return _gateway_integration_credentials(gateway_name)
-	phone_number_id = ""
-	access_token = ""
+	if not gateway_name:
+		return "", ""
+	return _gateway_integration_credentials(gateway_name)
 
-	# Fallback to Integration Settings or WhatsApp Account DocType
-	if frappe.db.exists("DocType", "WhatsApp Account"):
-		accounts = frappe.get_all("WhatsApp Account", fields=["name", "phone_id"], limit=1)
-		if accounts:
-			doc = frappe.get_doc("WhatsApp Account", accounts[0].name)
-			phone_number_id = phone_number_id or doc.phone_id or ""
-			access_token = access_token or doc.get_password("token") or ""
 
-	if not phone_number_id or not access_token:
-		# Check Integration Settings
-		settings_list = frappe.get_all("Integration Settings", filters={"service": "whatsapp", "is_active": 1}, limit=1)
-		if settings_list:
-			doc = frappe.get_doc("Integration Settings", settings_list[0].name)
-			phone_number_id = phone_number_id or doc.get("phone_number_id") or ""
-			for row in doc.credentials or []:
-				if row.key == "access_token":
-					access_token = access_token or row.get_password("value") or ""
+def _authorize(action: str, gateway_name: str) -> Optional[str]:
+	"""Authority of the run over its own gateway.
 
-	return phone_number_id, access_token
+	Sending is authorised for the run's own gateway: ``gateway_name`` is bound server-side from the run
+	(or ``trusted_gateway``), never from the model, and the gateway already admitted the sender, so the
+	gateway's execution user needs no Gateway write. Template management (``create_template``) keeps
+	requiring real write authority; every other action requires read.
+	"""
+	from huf.ai import whatsapp_management as mgmt
+
+	try:
+		if action == "create_template":
+			refused = mgmt._send_authority(gateway_name)
+			return json.dumps(refused, default=str) if refused else None
+		if action in _SEND_ACTIONS:
+			return None
+		if not mgmt._gateway_read_allowed(gateway_name):
+			raise frappe.PermissionError("Not permitted to read this Gateway")
+	except frappe.PermissionError:
+		return _refused("permission_denied", "Not permitted to use WhatsApp through this Gateway")
+	return None
+
+
+def _gateway_phone_id(gateway_name: str) -> str:
+	try:
+		return str(frappe.db.get_value("Gateway", gateway_name, "phone_number_id") or "").strip()
+	except Exception:
+		return ""
+
+
+def _disconnect_refusal(gateway_name: str) -> Optional[str]:
+	"""The normal JSON refusal when the run gateway's number is Disconnected, else None."""
+	from huf.ai import whatsapp_account_events as _ae
+
+	refusal = _ae.send_refusal(_gateway_phone_id(gateway_name))
+	return json.dumps(refusal, default=str) if refusal else None
 
 
 def handle_action(action: str, **kwargs: Any) -> str:
-	"""Handle WhatsApp agent tool invocation."""
+	"""Handle WhatsApp agent tool invocation (bound to the current run's gateway)."""
 	action = (action or "").strip().lower()
 	# Privilege flags are server-side only: discard anything the LLM supplied.
 	for name in _PRIVILEGE_FLAGS:
@@ -186,7 +268,115 @@ def handle_action(action: str, **kwargs: Any) -> str:
 	# Credentials are server-side only (tool args are persisted).
 	for name in _CREDENTIAL_KWARGS:
 		kwargs.pop(name, None)
+	# The gateway / account come from the run context, never from the model.
+	for name in _BOUND_KWARGS:
+		kwargs.pop(name, None)
 
+	gateway_name = _run_gateway()
+	if not gateway_name:
+		return _refused(
+			"gateway_context_required",
+			"WhatsApp can only be used from a run that belongs to an enabled WhatsApp gateway.",
+		)
+	kwargs["gateway_name"] = gateway_name
+	refusal = _authorize(action, gateway_name)
+	if refusal:
+		return refusal
+
+	if action in _SEND_ACTIONS and action != "create_template":
+		refusal = _disconnect_refusal(gateway_name)
+		if refusal:
+			return refusal
+		refusal = _scope_refusal(kwargs, gateway_name)
+		if refusal:
+			return refusal
+		with bridge.run_bound_send():  # the run's own gateway authorised this send
+			raw = _idempotent_send(action, kwargs, gateway_name)
+		_mark_outreach(gateway_name, kwargs, raw)
+		return raw
+	return _dispatch(action, kwargs)
+
+
+def _has_entry(gateway_name: str, recipient: str) -> bool:
+	from types import SimpleNamespace
+
+	from huf.ai import gateway_service
+
+	try:
+		return bool(gateway_service._has_access_entry(SimpleNamespace(name=gateway_name, provider="WhatsApp"), "Sender", recipient))
+	except Exception:
+		return False
+
+
+def _mark_outreach(gateway_name: str, kwargs: dict, raw: str) -> None:
+	"""After a successful send to a recipient with no access entry, remember we messaged them first.
+
+	Their STOP is then honoured (a stranger's STOP stays ignored). Never fails the send.
+	"""
+	try:
+		result = json.loads(raw)
+		recipient = _recipient(kwargs)
+		if not (isinstance(result, dict) and result.get("success") and recipient):
+			return
+		if _has_entry(gateway_name, recipient):
+			return
+		from huf.ai import whatsapp_outbound_policy as policy
+
+		policy.record_template_outreach(gateway_name, recipient)
+	except Exception:
+		frappe.log_error(title="WhatsApp outreach marker not recorded")
+
+
+def _scope_refusal(kwargs: dict, gateway_name: str) -> Optional[str]:
+	"""Recipient scope (WP-10): default recipient is the run's conversation contact; wider scope is gateway config.
+
+	A trusted flow caller is scoped the same way: its args come from agent output / inbound text, so it
+	gets no wider reach than the gateway's configured scope. Fills ``to`` with the current contact when
+	left out.
+	"""
+	from huf.ai import whatsapp_send_scope as send_scope
+
+	run_id = _effective_run_id()
+	if not _recipient(kwargs):
+		contact = send_scope.current_contact(run_id) or send_scope._normalize(_trusted_contact.get())
+		if contact:
+			kwargs["to"] = contact
+	recipient = _recipient(kwargs)
+	if not recipient:
+		return None  # the send itself reports the missing recipient
+	return send_scope.check_recipient(gateway_name, run_id, recipient, contact=_trusted_contact.get())
+
+
+def _idempotent_send(action: str, kwargs: dict, gateway_name: str) -> str:
+	"""Run a send at most once per idempotency key (durable; see ``huf.ai.whatsapp_send_keys``)."""
+	from huf.ai import whatsapp_send_keys as send_keys
+
+	try:
+		explicit = send_keys.explicit_key(kwargs)
+	except send_keys.InvalidKey as e:
+		return _refused("invalid_idempotency_key", str(e))
+	run_id = _effective_run_id()
+	call_id = kwargs.get("call_id")
+	if not run_id and not explicit and not call_id:
+		call_id = f"norun-{frappe.generate_hash(length=16)}"  # nothing to dedupe on, but the send is still claimed and counted
+	key = send_keys.derive_key(gateway_name, run_id, call_id, action, kwargs, explicit)
+	return send_keys.run_once(
+		gateway_name, key, action, lambda: _capped_dispatch(action, kwargs, gateway_name, run_id),
+		run=run_id or "", recipient=_recipient(kwargs),
+	)
+
+
+def _capped_dispatch(action: str, kwargs: dict, gateway_name: str, run_id: Optional[str]) -> str:
+	"""Run the send unless it would exceed the gateway's per-run / per-day cap (checked after the claim)."""
+	from huf.ai import whatsapp_send_scope as send_scope
+
+	refusal = send_scope.check_caps(gateway_name, run_id)
+	if refusal:
+		return refusal
+	return _dispatch(action, kwargs)
+
+
+def _dispatch(action: str, kwargs: dict) -> str:
 	if action == "send_message":
 		return _send_message(kwargs)
 	elif action == "send_media":
@@ -242,34 +432,30 @@ def _gateway_account_name(gateway_name: str) -> Optional[str]:
 
 
 def _resolve_bridge_account(kwargs: dict) -> Optional[dict]:
-	"""Return the resolved WhatsApp Account dict, or None when unavailable.
+	"""Return the run gateway's own WhatsApp Account dict, or None (direct mode / unavailable).
 
-	A named ``gateway_name`` pins the account to that gateway's own account and never
-	falls back to a default or caller-supplied one (an unlinked gateway means direct mode).
-	A ``whatsapp_account`` argument is only honoured without a gateway, where the
-	default account is used when none is given (non-gateway tool use).
+	The account is always the one linked to the run's gateway; there is no default account and no
+	caller-supplied account. An unlinked gateway means direct mode with its own integration.
 	"""
 	if not bridge.is_available():
 		return None
 	gateway_name = (kwargs.get("gateway_name") or "").strip()
-	if gateway_name:
-		gw_account = _gateway_account_name(gateway_name)
-		if not gw_account:
-			return None
-		acct = bridge.resolve_account(gw_account)
-	else:
-		account_name = (kwargs.get("whatsapp_account") or "").strip()
-		acct = bridge.resolve_account(account_name) if account_name else bridge.resolve_default_account()
+	if not gateway_name:
+		return None
+	gw_account = _gateway_account_name(gateway_name)
+	if not gw_account:
+		return None
+	acct = bridge.resolve_account(gw_account)
 	if not acct or acct.get("error"):
 		return None
 	return acct
 
 
 def _is_proactive_send(kwargs: dict, recipient: str) -> bool:
-	"""A free-form send is proactive unless the gateway window is open (A8)."""
+	"""A free-form send is proactive unless the run gateway's window is open (A8)."""
 	gateway_name = (kwargs.get("gateway_name") or "").strip()
-	if not gateway_name or _gateway_account_name(gateway_name) is None:
-		return True  # no (or unknown) gateway: nothing to evaluate a window against
+	if not gateway_name:
+		return True
 	try:
 		state = bridge.window_state(gateway_name, recipient)
 	except Exception:
@@ -283,17 +469,13 @@ def _send_message(kwargs: dict) -> str:
 	message = (kwargs.get("message") or kwargs.get("text") or "").strip()
 
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	if not message:
-		return _error("Message text ('message') is required")
+		return _error("Message text ('message') is required", definite=True)
 
-	if _is_proactive_send(kwargs, recipient) and not (
-		_server_flag("allow_proactive") or _server_flag("allow_whatsapp_management")
-	):
-		return _refused(
-			"proactive_send_not_permitted",
-			"No open 24h window for this number. Enable allow_proactive to send a free-form message.",
-		)
+	refusal = _free_form_refusal(kwargs, recipient, "a free-form message")
+	if refusal:
+		return refusal
 
 	acct = _resolve_bridge_account(kwargs)
 	if acct:
@@ -309,9 +491,9 @@ def _send_message(kwargs: dict) -> str:
 
 	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
+		return _error("WhatsApp credentials not found", definite=True)
 
-	url = f"{_graph_root()}/{phone_number_id}/messages"
+	url = f"{_graph_root(kwargs['gateway_name'])}/{phone_number_id}/messages"
 	headers = {
 		"Authorization": f"Bearer {access_token}",
 		"Content-Type": "application/json",
@@ -328,7 +510,10 @@ def _send_message(kwargs: dict) -> str:
 		res = requests.post(url, json=payload, headers=headers, timeout=15)
 		data = res.json()
 		if res.status_code != 200 or "error" in data:
-			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+			return _error(
+				f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}",
+				definite=400 <= res.status_code < 500,
+			)
 
 		msg_id = data.get("messages", [{}])[0].get("id")
 
@@ -371,13 +556,11 @@ def _recipient(kwargs: dict) -> str:
 
 
 def _is_opted_out(kwargs: dict, recipient: str) -> bool:
-	"""True when the named gateway's contact opted out (STOP). Without a (known) gateway there is nothing to check."""
+	"""True when the run gateway's contact opted out (STOP); fails closed (no gateway or any error = opted out)."""
 	gateway_name = (kwargs.get("gateway_name") or "").strip()
 	if not gateway_name:
-		return False
+		return True
 	try:
-		if not frappe.db.exists("Gateway", gateway_name):
-			return False
 		from huf.ai import gateway_service
 
 		return bool(gateway_service.is_opted_out(gateway_name, recipient))
@@ -390,11 +573,11 @@ def _free_form_refusal(kwargs: dict, recipient: str, what: str) -> Optional[str]
 	if _is_opted_out(kwargs, recipient):
 		return _refused("opted_out", "This contact opted out (STOP); no messages are sent until they opt back in (START).")
 	if _is_proactive_send(kwargs, recipient) and not (
-		_server_flag("allow_proactive") or _server_flag("allow_whatsapp_management")
+		_server_flag(kwargs.get("gateway_name") or "", "allow_proactive")
 	):
 		return _refused(
 			"proactive_send_not_permitted",
-			f"No open 24h window for this number. Enable allow_proactive to send {what}.",
+			f"No open 24h window for this number. Enable proactive agent sends on the gateway to send {what}.",
 		)
 	return None
 
@@ -421,17 +604,20 @@ def _deliver_typed(kwargs: dict, recipient: str, built: tuple, bridge_call: Any,
 
 	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
+		return _error("WhatsApp credentials not found", definite=True)
 	try:
 		res = requests.post(
-			f"{_graph_root()}/{phone_number_id}/messages",
+			f"{_graph_root(kwargs['gateway_name'])}/{phone_number_id}/messages",
 			json=payload,
 			headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
 			timeout=15,
 		)
 		data = res.json()
 		if res.status_code != 200 or "error" in data:
-			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+			return _error(
+				f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}",
+				definite=400 <= res.status_code < 500,
+			)
 		return _success({"message_id": data.get("messages", [{}])[0].get("id"), "recipient": recipient, "status": "sent"})
 	except Exception as e:
 		return _error(f"Failed to send WhatsApp {what}: {str(e)}")
@@ -441,7 +627,9 @@ def _send_media(kwargs: dict) -> str:
 	"""Send an image/video/audio/document/sticker by public link or media id (window / proactive gated like send_message)."""
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
+	if kwargs.get("file_url") or kwargs.get("file_id"):
+		return _send_media_file(kwargs, recipient)
 	media, errors = wt.validate_media_request(
 		kwargs.get("kind") or kwargs.get("media_type"),
 		kwargs.get("link") or kwargs.get("url"),
@@ -464,10 +652,76 @@ def _send_media(kwargs: dict) -> str:
 	)
 
 
+def _file_error(e: "send_file.FileSendError") -> str:
+	return _refused(e.code, e.message)
+
+
+def _upload_for_send(kwargs: dict, prepared: dict) -> str:
+	"""Upload the bytes to Meta (bridge account, else the gateway's own credentials) and return the media id."""
+	mime, content, filename = prepared["mime"], prepared["content"], prepared["filename"]
+	acct = _resolve_bridge_account(kwargs)
+	try:
+		if acct:
+			res = bridge.upload_media(acct["name"], content, mime, filename, kind=prepared["kind"], voice=prepared["voice"])
+			return str(res["media_id"])
+		phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
+		if not phone_number_id or not access_token:
+			raise send_file.FileSendError("credentials_missing", "WhatsApp credentials not found for this gateway.")
+		return bridge.post_media_upload(
+			_graph_root(kwargs["gateway_name"]), phone_number_id, access_token, content, wm.normalize_mime(mime), filename
+		)
+	except bridge.BridgeError as e:
+		raise send_file.FileSendError(str((e.payload or {}).get("error") or "upload_failed"), str((e.payload or {}).get("message") or "Upload to WhatsApp failed.")) from e
+	except frappe.PermissionError as e:
+		raise send_file.FileSendError("permission_denied", "Not permitted to send WhatsApp messages") from e
+
+
+def _send_media_file(kwargs: dict, recipient: str) -> str:
+	"""Send a Huf File: ownership check, limits, gates, upload to Meta, then the normal send by media id."""
+	if kwargs.get("link") or kwargs.get("url") or kwargs.get("media_id"):
+		return json.dumps(wt.validation_error([wm.err("file_url", "one_source", "Provide exactly one of file_url, file_id, link or media_id.")]), default=str)
+	if (kwargs.get("file_url") or "") and (kwargs.get("file_id") or ""):
+		return json.dumps(wt.validation_error([wm.err("file_url", "one_source", "Provide exactly one of file_url or file_id.")]), default=str)
+	refusal = _free_form_refusal(kwargs, recipient, "media")
+	if refusal:
+		return refusal
+	voice = _is_truthy(kwargs.get("voice"))
+	try:
+		resolved = send_file.resolve_file(kwargs.get("file_url"), kwargs.get("file_id"), _effective_run_id())
+		prepared = send_file.prepare_upload(resolved, kwargs.get("kind") or kwargs.get("media_type"), voice)
+		first, rest = send_file.split_caption(str(kwargs.get("caption") or ""))
+		filename = (kwargs.get("filename") or "").strip() or prepared["filename"]
+		_, errors = wm.validate_media_message(prepared["kind"], "", "pending", first, filename, prepared["voice"])
+		if errors:
+			return json.dumps(wt.validation_error(errors), default=str)
+		media_id = _upload_for_send(kwargs, prepared)
+	except send_file.FileSendError as e:
+		return _file_error(e)
+	except Exception as e:
+		return _error(f"Failed to prepare WhatsApp media: {str(e)}", definite=True)
+	send_kwargs = {k: v for k, v in kwargs.items() if k not in ("file_url", "file_id", "link", "url")}
+	raw = _send_media({
+		**send_kwargs, "kind": prepared["kind"], "media_id": media_id, "caption": first,
+		"filename": filename, "voice": prepared["voice"],
+	})
+	if rest:
+		try:
+			ok = json.loads(raw).get("success")
+		except ValueError:
+			ok = False
+		if ok:
+			follow = json.loads(_send_message({**send_kwargs, "message": rest}))
+			if not follow.get("success"):
+				body = json.loads(raw)
+				body.setdefault("data", {})["caption_overflow_sent"] = False
+				return json.dumps(body, default=str)
+	return raw
+
+
 def _send_voice_note(kwargs: dict) -> str:
 	"""Send audio as a voice note (``audio.voice: true``); only Ogg/Opus is accepted."""
 	link = kwargs.get("link") or kwargs.get("url")
-	if link and not kwargs.get("media_id"):
+	if link and not kwargs.get("media_id") and not (kwargs.get("file_url") or kwargs.get("file_id")):
 		errors = wm.validate_voice_link(link)
 		if errors:
 			return json.dumps(wt.validation_error(errors), default=str)
@@ -477,7 +731,7 @@ def _send_voice_note(kwargs: dict) -> str:
 def _send_location(kwargs: dict) -> str:
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	args = (kwargs.get("latitude"), kwargs.get("longitude"), kwargs.get("name"), kwargs.get("address"))
 	reply_to = (kwargs.get("reply_to") or "").strip() or None
 	return _deliver_typed(
@@ -490,7 +744,7 @@ def _send_location(kwargs: dict) -> str:
 def _send_contact(kwargs: dict) -> str:
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	contacts = kwargs.get("contacts")
 	if isinstance(contacts, str) and contacts.strip():
 		try:
@@ -514,7 +768,7 @@ def _send_contact(kwargs: dict) -> str:
 def _send_reaction(kwargs: dict) -> str:
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	remove = _is_truthy(kwargs.get("remove"))
 	emoji = "" if remove else str(kwargs.get("emoji") or "")
 	message_id = kwargs.get("message_id")
@@ -529,7 +783,7 @@ def _send_interactive(kwargs: dict, kind: str) -> str:
 	"""send_buttons / send_list / send_cta_url (``body``, ``header``, ``footer`` plus the kind's own fields)."""
 	recipient = _recipient(kwargs)
 	if not recipient:
-		return _error("Recipient phone number ('to') is required")
+		return _error("Recipient phone number ('to') is required", definite=True)
 	buttons = _json_list(kwargs.get("buttons"))
 	sections = _json_list(kwargs.get("sections"))
 	if buttons is None or sections is None:
@@ -588,10 +842,15 @@ def _send_template(kwargs: dict) -> str:
 	if header_params is None or button_params is None:
 		return _error("'header_params' and 'button_params' must be lists (or JSON lists)")
 
+	if _is_opted_out(kwargs, recipient):
+		return _refused("opted_out", "This contact opted out (STOP); no messages are sent until they opt back in (START).")
+	if bridge.is_bsuid(recipient):
+		return _refused("bsuid_recipient", "A BSUID cannot be used as a recipient; send to the contact's phone number.")
+
 	acct = _resolve_bridge_account(kwargs)
 	if acct:
 		try:
-			extra: dict[str, Any] = {}
+			extra: dict[str, Any] = {"gateway_name": kwargs.get("gateway_name")}
 			if header_params:
 				extra["header_params"] = header_params
 			if button_params:
@@ -609,9 +868,9 @@ def _send_template(kwargs: dict) -> str:
 
 	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
+		return _error("WhatsApp credentials not found", definite=True)
 
-	url = f"{_graph_root()}/{phone_number_id}/messages"
+	url = f"{_graph_root(kwargs['gateway_name'])}/{phone_number_id}/messages"
 	headers = {
 		"Authorization": f"Bearer {access_token}",
 		"Content-Type": "application/json",
@@ -637,50 +896,76 @@ def _send_template(kwargs: dict) -> str:
 		res = requests.post(url, json=payload, headers=headers, timeout=15)
 		data = res.json()
 		if res.status_code != 200 or "error" in data:
-			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+			return _error(
+				f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}",
+				definite=400 <= res.status_code < 500,
+			)
 
 		return _success(data)
 	except Exception as e:
 		return _error(f"Failed to send WhatsApp template: {str(e)}")
 
 
-def _list_messages(kwargs: dict) -> str:
-	if not frappe.db.exists("DocType", "WhatsApp Message"):
-		return _error("frappe_whatsapp app is not installed or enabled")
+def _clamp_limit(value: Any) -> int:
+	try:
+		number = int(value)
+	except (TypeError, ValueError):
+		number = _LIST_DEFAULT_LIMIT
+	return max(1, min(number, _LIST_MAX_LIMIT))
 
-	limit = int(kwargs.get("limit") or 20)
-	filters = {}
-	if kwargs.get("to"):
-		filters["to"] = kwargs["to"]
-	if kwargs.get("from"):
-		filters["from"] = kwargs["from"]
+
+def _list_messages(kwargs: dict) -> str:
+	"""Messages exchanged with ONE contact through the run's own gateway (newest first, cursor paged).
+
+	Built on ``list_message_log`` so it is gateway scoped and permission checked for the run user;
+	each item carries the wamid in ``message_id``.
+	"""
+	contact = bridge.normalize_phone(kwargs.get("to") or kwargs.get("recipient") or kwargs.get("phone_number") or "")
+	if not contact:
+		return _refused("contact_required", "Name the contact ('to') whose messages should be listed.")
+	from huf.ai import whatsapp_management as mgmt
 
 	try:
-		messages = frappe.get_all(
-			"WhatsApp Message",
-			filters=filters,
-			fields=["name", "type", "from", "to", "message", "status", "creation"],
-			order_by="creation desc",
-			limit=limit,
+		result = mgmt.list_message_log(
+			gateway_name=kwargs["gateway_name"],
+			phone=contact,
+			cursor=(kwargs.get("cursor") or "").strip() or None,
+			limit=_clamp_limit(kwargs.get("limit")),
 		)
-		return _success(messages)
+	except frappe.PermissionError:
+		return _refused("permission_denied", "Not permitted to read WhatsApp messages")
 	except Exception as e:
 		return _error(f"Failed to fetch WhatsApp messages: {str(e)}")
+	if not result.get("success"):
+		return json.dumps(result, default=str)
+	return _success(
+		{"items": result.get("items") or [], "next_cursor": result.get("next_cursor"), "has_more": bool(result.get("has_more"))}
+	)
 
 
 def _get_account_info(kwargs: dict) -> str:
-	phone_number_id, access_token = _get_whatsapp_credentials()
+	"""Phone number info of the run gateway's own number."""
+	gateway_name = kwargs["gateway_name"]
+	phone_number_id, access_token = _get_whatsapp_credentials(kwargs)
 	if not phone_number_id or not access_token:
-		return _error("WhatsApp credentials not found")
+		acct = _resolve_bridge_account(kwargs)
+		if acct:
+			phone_number_id = phone_number_id or str(acct.get("phone_id") or "")
+			access_token = access_token or str(acct.get("token") or "")
+	if not phone_number_id or not access_token:
+		return _error("WhatsApp credentials not found", definite=True)
 
-	url = f"{_graph_root()}/{phone_number_id}"
+	url = f"{_graph_root(gateway_name)}/{phone_number_id}"
 	headers = {"Authorization": f"Bearer {access_token}"}
 
 	try:
 		res = requests.get(url, headers=headers, timeout=10)
 		data = res.json()
 		if res.status_code != 200 or "error" in data:
-			return _error(f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}")
+			return _error(
+				f"WhatsApp API Error: {data.get('error', {}).get('message', res.text)}",
+				definite=400 <= res.status_code < 500,
+			)
 		return _success(data)
 	except Exception as e:
 		return _error(f"Failed to fetch WhatsApp account info: {str(e)}")
@@ -692,7 +977,7 @@ def _list_templates(kwargs: dict) -> str:
 		return _error("bridge_unavailable")
 	acct = _resolve_bridge_account(kwargs)
 	if not acct:
-		return _refused("gateway_required", "Name a gateway (or a WhatsApp account); templates are never listed across accounts.")
+		return _refused("no_account", "This gateway is not linked to a WhatsApp Account.")
 	status = (kwargs.get("status") or "").strip() or None
 	try:
 		rows = bridge.list_templates(acct["name"], status)
@@ -703,8 +988,20 @@ def _list_templates(kwargs: dict) -> str:
 	return _success(rows)
 
 
-def _create_template_draft(acct: dict, payload: dict) -> str:
-	"""Save the template as a draft awaiting human approval; Meta is never contacted."""
+def _create_template_draft(acct: dict, payload: dict, gateway_name: str) -> str:
+	"""Save the template as a draft awaiting human approval; Meta is never contacted.
+
+	``trusted=True`` skips the Template Draft doctype permission, so the run user's write authority
+	on the run gateway is re-checked here, right at the bypass.
+	"""
+	try:
+		from huf.ai import whatsapp_management as mgmt
+
+		refused = mgmt._send_authority(gateway_name)
+		if refused:
+			return json.dumps(refused, default=str)
+	except frappe.PermissionError:
+		return _refused("permission_denied", "Not permitted to create WhatsApp templates through this Gateway")
 	try:
 		result = bridge.create_draft(
 			payload,
@@ -712,7 +1009,7 @@ def _create_template_draft(acct: dict, payload: dict) -> str:
 			via="Agent run",
 			agent_run=getattr(frappe.flags, "huf_current_agent_run_id", None) or "",
 			account=acct["name"],
-			trusted=True,  # gated by the server-side allow_whatsapp_management flag
+			trusted=True,  # gated by the gateway flag and _send_authority above
 		)
 	except Exception as e:
 		return _error(f"Failed to save WhatsApp template draft: {str(e)}")
@@ -747,17 +1044,17 @@ def _get_template_status(kwargs: dict) -> str:
 def _create_template(kwargs: dict) -> str:
 	"""Create a WhatsApp template via the bridge (management; A8 gated).
 
-	Requires ``allow_whatsapp_management`` enabled in
-	the server-side Integration Settings. By default this only saves a draft for human
-	approval; with the server-side ``auto_submit_templates`` credential it submits directly. Accepted fields: ``template_name``,
+	Requires the run gateway's ``agent_allow_template_management`` flag and the run user's write
+	authority on that gateway. By default this only saves a draft for human approval; with the
+	gateway's ``agent_auto_submit_templates`` flag it submits directly. Accepted fields: ``template_name``,
 	``category`` (MARKETING/UTILITY), ``language_code``, ``body`` (+ ``sample_values``),
 	optional ``header_type``/``header``/``sample``, ``footer`` and ``buttons``
 	(QUICK_REPLY, URL, PHONE_NUMBER). Validation errors are returned structured.
 	"""
-	if not _server_flag("allow_whatsapp_management"):
+	if not _server_flag(kwargs["gateway_name"], "allow_whatsapp_management"):
 		return _refused(
 			"management_not_permitted",
-			"Template creation is disabled. Enable allow_whatsapp_management in the tool config.",
+			"Template creation is disabled. Enable agent template management on the gateway.",
 		)
 	if not bridge.is_available():
 		return _error("bridge_unavailable")
@@ -778,8 +1075,8 @@ def _create_template(kwargs: dict) -> str:
 			payload["buttons"] = json.loads(payload["buttons"])
 		except ValueError:
 			return _error("'buttons' must be a list (or JSON list)")
-	if not _server_flag("auto_submit_templates"):
-		return _create_template_draft(acct, payload)
+	if not _server_flag(kwargs["gateway_name"], "auto_submit_templates"):
+		return _create_template_draft(acct, payload, kwargs["gateway_name"])
 	try:
 		result = bridge.create_template(acct["name"], payload)
 	except bridge.BridgeError as e:

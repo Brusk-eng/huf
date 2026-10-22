@@ -473,6 +473,107 @@ def _get_default_tts_model(provider_name: str) -> str:
     return defaults.get(provider_name.lower())
 
 
+def _lookup_ai_model(model_ref: str):
+    """Return the AI Model doc for ``model_ref`` (doc name, or model_name), else None."""
+    if not model_ref:
+        return None
+    try:
+        return frappe.get_doc("AI Model", model_ref)
+    except frappe.DoesNotExistError:
+        pass
+    except KeyError:
+        return None
+    name = frappe.db.get_value("AI Model", {"model_name": model_ref}, "name")
+    return frappe.get_doc("AI Model", name) if name else None
+
+
+def _resolve_model_provider(model_ref: str, fallback_provider: str, kind: str):
+    """
+    Resolve ``(provider_link, provider_doc, api_key, model_name)`` for a model.
+
+    The AI Model's own provider supplies the API key and LiteLLM normalisation;
+    ``fallback_provider`` (the agent's) is used only when the model is not a
+    known AI Model.
+
+    Raises:
+        ValueError: the chosen provider has no API key (error names that provider).
+    """
+    model_doc = _lookup_ai_model(model_ref)
+    if model_doc is not None:
+        if not model_doc.provider:
+            raise ValueError(
+                f"{kind} model '{model_ref}' has no provider linked. "
+                "Please set a provider on the AI Model document."
+            )
+        provider_link = model_doc.provider
+        model_name = model_doc.model_name
+    else:
+        provider_link = fallback_provider
+        model_name = model_ref
+    provider_doc = frappe.get_doc("AI Provider", provider_link)
+    api_key = provider_doc.get_password("api_key")
+    if not api_key:
+        raise ValueError(
+            f"API key is not configured for {kind} provider "
+            f"'{provider_doc.provider_name}'. Please add it to the AI Provider document."
+        )
+    return provider_link, provider_doc, api_key, model_name
+
+
+def _pcm16_to_wav(pcm: bytes, sample_rate: int = 24000, channels: int = 1) -> bytes:
+    """Wrap raw PCM16 (Gemini TTS output) in a WAV container."""
+    import struct
+
+    if pcm[:4] == b"RIFF":
+        return pcm
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + len(pcm), b"WAVE", b"fmt ", 16, 1, channels,
+        sample_rate, sample_rate * channels * 2, channels * 2, 16, b"data", len(pcm),
+    )
+    return header + pcm
+
+
+_GEMINI_VOICES = {
+    "zephyr", "puck", "charon", "kore", "fenrir", "leda", "orus", "aoede",
+    "callirrhoe", "autonoe", "enceladus", "iapetus", "umbriel", "algieba",
+    "despina", "erinome", "algenib", "rasalgethi", "laomedeia", "achernar",
+    "alnilam", "schedar", "gacrux", "pulcherrima", "achird", "zubenelgenubi",
+    "vindemiatrix", "sadachbia", "sadaltager", "sulafat",
+}
+
+
+def _gemini_voice(voice: str | None) -> str:
+    """Valid Gemini prebuilt voice; OpenAI-style names (alloy...) map to Kore."""
+    if voice and voice.lower() in _GEMINI_VOICES:
+        return voice.capitalize()
+    return "Kore"
+
+
+def _gemini_tts_completion(model: str, text: str, voice: str, api_key: str) -> bytes:
+    """
+    Gemini TTS via LiteLLM completion(modalities=["audio"], format pcm16 — the only
+    format LiteLLM accepts for Gemini TTS).
+
+    litellm.speech() routes gemini/* through a bridge that drops ``api_key``
+    (falling back to process env), so the key is passed explicitly here. The
+    response audio is base64 raw PCM16 @ 24kHz, returned as WAV bytes.
+    """
+    import litellm
+
+    response = litellm.completion(
+        model=model,
+        messages=[{"role": "user", "content": text}],
+        modalities=["audio"],
+        audio={"voice": _gemini_voice(voice), "format": "pcm16"},
+        api_key=api_key,
+    )
+    audio = response.choices[0].message.audio
+    if audio is None or not getattr(audio, "data", None):
+        raise ValueError("Gemini TTS response contained no audio data")
+    return _pcm16_to_wav(base64.b64decode(audio.data))
+
+
 def _resolve_tts_config(
     agent_doc,
     tool_model: str | None = None,
@@ -514,18 +615,14 @@ def _resolve_tts_config(
     from huf.ai.providers.litellm import _normalize_model_name
 
     if tool_model:
-        provider_doc = frappe.get_doc("AI Provider", agent_doc.provider)
-        api_key = provider_doc.get_password("api_key")
-        if not api_key:
-            raise ValueError(
-                f"API key is not configured for provider "
-                f"'{provider_doc.provider_name}'. Please add it to the AI Provider document."
-            )
+        provider_link, provider_doc, api_key, model_name = _resolve_model_provider(
+            tool_model, agent_doc.provider, "TTS"
+        )
         provider_name = provider_doc.provider_name.lower()
         voice = tool_voice or _get_default_voice(provider_name)
         if voice and provider_name == "openai":
             voice = voice.lower()
-        normalized = _normalize_model_name(tool_model, agent_doc.provider)
+        normalized = _normalize_model_name(model_name, provider_link)
         return {
             "tts_model":     normalized,
             "voice":         voice,
@@ -715,28 +812,28 @@ async def handle_generate_audio(
 
         import litellm
 
-        speech_params: dict = {
-            "model": normalized_model,
-            "input": input,
-            "voice": voice,
-        }
+        if normalized_model.startswith("gemini/"):
+            # Gemini TTS returns PCM16; deliver as WAV regardless of the
+            # requested response_format (mp3 etc. is not produced).
+            response_format = "wav"
+            audio_bytes = await asyncio.to_thread(
+                _gemini_tts_completion, normalized_model, input, voice, api_key
+            )
+        else:
+            speech_params: dict = {
+                "model": normalized_model,
+                "input": input,
+                "voice": voice,
+                "api_key": api_key,
+            }
+            if speed != 1.0:
+                speech_params["speed"] = speed
+            if response_format != "mp3":
+                speech_params["response_format"] = response_format
 
-        speech_params["api_key"] = api_key
-
-        if speed != 1.0:
-            speech_params["speed"] = speed
-        if response_format != "mp3":
-            speech_params["response_format"] = response_format
-
-        # Call LiteLLM speech (returns HttpxBinaryResponseContent)
-        response = await asyncio.to_thread(
-            litellm.speech,
-            **speech_params
-        )
-
-        # Get audio content from response
-        # LiteLLM speech() returns HttpxBinaryResponseContent
-        audio_bytes = response.content
+            # LiteLLM speech returns HttpxBinaryResponseContent
+            response = await asyncio.to_thread(litellm.speech, **speech_params)
+            audio_bytes = response.content
 
         # Get conversation_index for message ordering
         conversation_index = None
@@ -1045,30 +1142,24 @@ async def handle_generate_video(
             return {"success": False, "error": "Agent name not found in context"}
 
         agent_doc = frappe.get_doc("Agent", agent_name)
-        provider_doc = frappe.get_doc("AI Provider", agent_doc.provider)
-        api_key = provider_doc.get_password("api_key")
-
-        if not api_key:
-            return {"success": False, "error": "API key not configured for provider"}
-
-        # Determine video generation model.
-        #
-        # NOTE: Agent DocType does not (yet) have a dedicated
-        # video-generation-model field analogous to `image_generation_model`
-        # / `tts_model`. Until that field exists, we can only resolve a
-        # video model if the caller explicitly passes `model=` in kwargs and
-        # that AI Model has "Video" in its modalities; there is no
-        # auto-detection fallback the way `handle_generate_image` has for
-        # image models, because no per-provider default video model mapping
-        # has been established here.
+        # Determine video generation model (see note below: no dedicated
+        # Agent field yet, so the caller must pass model=<AI Model>).
         video_model = None
         explicit_model = kwargs.get("model")
+        provider_doc = frappe.get_doc("AI Provider", agent_doc.provider)
 
         if explicit_model:
             model_doc = frappe.get_doc("AI Model", explicit_model)
             modalities = (model_doc.get("modalities") or "").split("\n")
             if "Video" in modalities:
                 video_model = model_doc.model_name
+                # The video model's own provider owns the API key.
+                try:
+                    _link, provider_doc, _key, _name = _resolve_model_provider(
+                        explicit_model, agent_doc.provider, "video"
+                    )
+                except ValueError as exc:
+                    return {"success": False, "error": str(exc)}
 
         if not video_model:
             return {

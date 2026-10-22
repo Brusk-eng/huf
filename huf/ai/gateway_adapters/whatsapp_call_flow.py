@@ -165,6 +165,125 @@ class FakeMediaSession(MediaSession):
 		self.closed = True
 
 
+# --------------------------------------------------------------------- ICE configuration
+DEFAULT_STUN_URLS = ("stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478")
+_ENV_PREFIX = "HUF_WA_CALL_"
+_TRUE = {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class IceConfig:
+	"""ICE server settings for the media session. The TURN credential never leaves this object.
+
+	Default = direct UDP with public STUN only. ``relay_only`` forces every candidate through TURN
+	(the NAT fallback: use ``turns:`` or ``?transport=tcp`` when no UDP can get in or out).
+	"""
+
+	stun_urls: tuple[str, ...] = DEFAULT_STUN_URLS
+	turn_urls: tuple[str, ...] = ()
+	turn_username: str = field(default="", repr=False)
+	turn_credential: str = field(default="", repr=False)
+	relay_only: bool = False
+
+	def __repr__(self) -> str:  # never include the secret
+		return (
+			f"IceConfig(stun={list(self.stun_urls)}, turn={list(self.turn_urls)}, "
+			f"turn_credential={'<set>' if self.turn_credential else '<unset>'}, relay_only={self.relay_only})"
+		)
+
+	__str__ = __repr__
+
+	def safe_summary(self) -> dict[str, Any]:
+		"""Loggable view (no username, no credential)."""
+		return {
+			"stun": list(self.stun_urls),
+			"turn": list(self.turn_urls),
+			"turn_auth": bool(self.turn_credential),
+			"relay_only": self.relay_only,
+		}
+
+	def validate(self) -> None:
+		if self.relay_only and not (self.turn_urls and self.turn_credential):
+			raise ValueError("relay_only needs a TURN url and credential")
+		for url in self.turn_urls:
+			if not url.startswith(("turn:", "turns:")):
+				raise ValueError("TURN url must start with turn: or turns:")
+		for url in self.stun_urls:
+			if not url.startswith("stun:"):
+				raise ValueError("STUN url must start with stun:")
+
+
+def _as_list(value: Any) -> list[str]:
+	if not value:
+		return []
+	if isinstance(value, str):
+		value = value.replace(";", ",").split(",")
+	return [str(v).strip() for v in value if str(v).strip()]
+
+
+def build_ice_config(site_conf: dict[str, Any] | None = None, env: dict[str, str] | None = None) -> IceConfig:
+	"""Build the ICE config. Env ``HUF_WA_CALL_<KEY>`` overrides site config ``huf_wa_call_<key>``.
+
+	Keys: ``stun_urls`` (comma list), ``turn_urls`` (comma list), ``turn_username``, ``turn_credential``,
+	``relay_only``. The credential is read from site config / env only, never from a DocType field.
+	"""
+	import os
+
+	site_conf = site_conf or {}
+	env = os.environ if env is None else env
+
+	def get(key: str) -> Any:
+		return env.get(_ENV_PREFIX + key.upper()) or site_conf.get("huf_wa_call_" + key)
+
+	stun = _as_list(get("stun_urls"))
+	cfg = IceConfig(
+		stun_urls=tuple(stun) if stun else DEFAULT_STUN_URLS,
+		turn_urls=tuple(_as_list(get("turn_urls"))),
+		turn_username=str(get("turn_username") or ""),
+		turn_credential=str(get("turn_credential") or ""),
+		relay_only=str(get("relay_only") or "").strip().lower() in _TRUE,
+	)
+	cfg.validate()
+	return cfg
+
+
+def site_ice_config() -> IceConfig:
+	import frappe
+
+	return build_ice_config(dict(frappe.conf or {}))
+
+
+def to_rtc_configuration(cfg: IceConfig) -> Any:
+	"""aiortc RTCConfiguration. aiortc uses ONE STUN and ONE TURN server (the first of each)."""
+	from aiortc import RTCConfiguration, RTCIceServer
+
+	servers = []
+	if cfg.stun_urls:
+		servers.append(RTCIceServer(urls=cfg.stun_urls[0]))
+	if cfg.turn_urls:
+		servers.append(
+			RTCIceServer(urls=cfg.turn_urls[0], username=cfg.turn_username, credential=cfg.turn_credential)
+		)
+	return RTCConfiguration(iceServers=servers)
+
+
+def _force_relay_policy(pc: Any) -> None:
+	"""aiortc has no iceTransportPolicy option; set aioice's RELAY policy on every gatherer.
+
+	Uses private attributes, so it fails closed: if it cannot be applied we raise instead of
+	silently leaking host/srflx candidates.
+	"""
+	from aioice import TransportPolicy
+
+	n = 0
+	for tr in pc.getTransceivers():
+		gatherer = tr.sender.transport.transport.iceGatherer
+		gatherer._connection._transport_policy = TransportPolicy.RELAY
+		n += 1
+	if not n:
+		raise RuntimeError("could not apply relay-only ICE policy")
+
+
 def aiortc_available() -> bool:
 	try:
 		import aiortc  # noqa: F401
@@ -174,18 +293,20 @@ def aiortc_available() -> bool:
 
 
 class AiortcMediaSession(MediaSession):
-	"""aiortc peer connection (STUB: written from tools/wa_call_spike.py, not exercised against Meta).
+	"""aiortc peer connection (loopback-tested; not yet exercised against Meta). ICE servers come from :class:`IceConfig`.
 
 	Imported lazily: constructing it without aiortc raises ``RuntimeError("aiortc not installed")``.
 	Inbound caller audio is drained and discarded (never stored) - ``listen`` returns ``None``.
 	"""
 
-	def __init__(self) -> None:
+	def __init__(self, ice: IceConfig | None = None) -> None:
 		if not aiortc_available():
 			raise RuntimeError("aiortc not installed")
 		from aiortc import RTCPeerConnection
 
-		self._pc = RTCPeerConnection()
+		self._ice = ice or IceConfig()
+		self._ice.validate()
+		self._pc = RTCPeerConnection(to_rtc_configuration(self._ice))
 		self._connected = asyncio.Event()
 		self._gate = asyncio.Event()
 		self._players: list[Any] = []
@@ -212,6 +333,8 @@ class AiortcMediaSession(MediaSession):
 		await self._pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
 		self._track = _build_gated_track(self._gate)
 		self._pc.addTrack(self._track)
+		if self._ice.relay_only:
+			_force_relay_policy(self._pc)
 		await self._pc.setLocalDescription(await self._pc.createAnswer())
 		return self._pc.localDescription.sdp
 
@@ -485,7 +608,7 @@ def answer_inbound_call_job(gateway_name: str, call_id: str, caller: str, sdp_ke
 		return {"call_id": call_id, "outcome": "no_greeting"}
 	trace = asyncio.run(
 		run_call(
-			call_id, sdp_offer, graph=graph, media=AiortcMediaSession(), source=FilePlayback(clips),
+			call_id, sdp_offer, graph=graph, media=AiortcMediaSession(site_ice_config()), source=FilePlayback(clips),
 			sink=InMemoryAudioSink(), max_seconds=int(getattr(gateway, "call_max_seconds", 0) or DEFAULT_MAX_SECONDS),
 		)
 	)

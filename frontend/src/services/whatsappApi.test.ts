@@ -129,6 +129,13 @@ describe('whatsappApi helpers', () => {
     });
   });
 
+  it('maps media link preflight errors to plain text', () => {
+    for (const error of ['media_link_unreachable', 'media_link_wrong_type', 'media_link_too_large']) {
+      expect(errorText({ success: false, error })).toMatch(/upload|Upload/);
+    }
+    expect(errorText({ success: false, error: 'media_link_unreachable', message: 'Custom.' })).toBe('Custom.');
+  });
+
   it('validates outbound media sends', () => {
     expect(validateMediaSend({ kind: 'image' })).toMatch(/file or paste/);
     expect(validateMediaSend({ kind: 'image', link: 'http://x.example/a.png' })).toMatch(/https/);

@@ -938,3 +938,132 @@ class TestSampleRedirects(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+class LinkResp:
+	def __init__(self, status=200, ctype="audio/mpeg", content=b"ID3data", location=None, length=None):
+		self.status_code, self.content = status, content
+		self.headers = {"Content-Type": ctype}
+		if location:
+			self.headers["Location"] = location
+		if length is not None:
+			self.headers["Content-Length"] = str(length)
+		self.closed = False
+
+	def iter_content(self, chunk_size=1):
+		yield self.content
+
+	def close(self):
+		self.closed = True
+
+
+class TestMediaLinkPreflight(unittest.TestCase):
+	"""Meta fetches links asynchronously, so an unfetchable link must be refused before any Graph call."""
+
+	def _run(self, routes, kind="audio", start="https://a.example/horse.mp3"):
+		calls = []
+
+		def get(url, **kw):
+			calls.append((url, kw.get("allow_redirects")))
+			return routes[url]
+
+		with patch.object(wb, "_is_private_host", side_effect=lambda h: h.startswith(("10.", "127.", "internal"))):
+			try:
+				wb.preflight_media_link(kind, start, get)
+				return None, calls
+			except wb.BridgeError as exc:
+				return exc.payload, calls
+
+	def test_good_link_passes_and_closes_response(self):
+		resp = LinkResp()
+		out, calls = self._run({"https://a.example/horse.mp3": resp})
+		self.assertIsNone(out)
+		self.assertEqual(calls, [("https://a.example/horse.mp3", False)])
+		self.assertTrue(resp.closed)
+
+	def test_octet_stream_with_matching_extension_passes(self):
+		out, _ = self._run({"https://a.example/horse.mp3": LinkResp(ctype="application/octet-stream")})
+		self.assertIsNone(out)
+		out, _ = self._run({"https://a.example/horse": LinkResp(ctype="application/octet-stream")}, start="https://a.example/horse")
+		self.assertEqual(out["error"], "media_link_wrong_type")
+
+	def test_document_pdf_passes(self):
+		out, _ = self._run({"https://a.example/a.pdf": LinkResp(ctype="application/pdf", content=b"%PDF")}, "document", "https://a.example/a.pdf")
+		self.assertIsNone(out)
+
+	def test_403_is_unreachable_without_http_internals(self):
+		out, _ = self._run({"https://a.example/horse.mp3": LinkResp(status=403, ctype="text/html", content=b"<html>no</html>")})
+		self.assertEqual((out["success"], out["error"]), (False, "media_link_unreachable"))
+		self.assertNotIn("403", out["message"])
+		self.assertIn("file_url", out["hint"])
+
+	def test_html_body_with_audio_content_type_is_wrong_type(self):
+		out, _ = self._run({"https://a.example/horse.mp3": LinkResp(content=b"  <!DOCTYPE html><html>")})
+		self.assertEqual(out["error"], "media_link_wrong_type")
+
+	def test_html_content_type_is_wrong_type(self):
+		out, _ = self._run({"https://a.example/horse.mp3": LinkResp(ctype="text/html; charset=utf-8", content=b"hi")})
+		self.assertEqual(out["error"], "media_link_wrong_type")
+
+	def test_wrong_media_family_is_wrong_type(self):
+		out, _ = self._run({"https://a.example/p.png": LinkResp(ctype="image/png", content=b"\x89PNG")}, "audio", "https://a.example/p.png")
+		self.assertEqual(out["error"], "media_link_wrong_type")
+
+	def test_oversize_by_content_length(self):
+		out, _ = self._run({"https://a.example/horse.mp3": LinkResp(length=17 * 1024 * 1024)})
+		self.assertEqual(out["error"], "media_link_too_large")
+		self.assertIn("16 MB", out["message"])
+
+	def test_oversize_image_without_length_header(self):
+		resp = LinkResp(ctype="image/png", content=b"x" * (5 * 1024 * 1024 + 1))
+		out, _ = self._run({"https://a.example/p.png": resp}, "image", "https://a.example/p.png")
+		self.assertEqual(out["error"], "media_link_too_large")
+
+	def test_sticker_static_limit(self):
+		resp = LinkResp(ctype="image/webp", content=b"RIFF" + b"\0" * 10, length=101 * 1024)
+		out, _ = self._run({"https://a.example/s.webp": resp}, "sticker", "https://a.example/s.webp")
+		self.assertEqual(out["error"], "media_link_too_large")
+
+	def test_redirect_to_private_ip_is_refused_before_fetching_it(self):
+		routes = {"https://a.example/horse.mp3": LinkResp(302, location="https://10.0.0.1/x"), "https://10.0.0.1/x": LinkResp()}
+		out, calls = self._run(routes)
+		self.assertEqual(out["error"], "media_link_unreachable")
+		self.assertEqual(len(calls), 1)
+
+	def test_redirect_is_followed_to_a_good_file(self):
+		routes = {"https://a.example/horse.mp3": LinkResp(302, location="https://b.example/h.mp3"), "https://b.example/h.mp3": LinkResp()}
+		out, calls = self._run(routes)
+		self.assertIsNone(out)
+		self.assertEqual(len(calls), 2)
+
+	def test_plain_http_link_is_refused(self):
+		out, calls = self._run({}, start="http://a.example/horse.mp3")
+		self.assertEqual((out["error"], calls), ("media_link_unreachable", []))
+
+	def test_network_error_is_unreachable(self):
+		def boom(url, **kw):
+			raise OSError("connection reset https://a.example/horse.mp3?access_token=SECRET")
+
+		with patch.object(wb, "_is_private_host", return_value=False):
+			with self.assertRaises(wb.BridgeError) as ctx:
+				wb.preflight_media_link("audio", "https://a.example/horse.mp3", boom)
+		self.assertEqual(ctx.exception.payload["error"], "media_link_unreachable")
+		self.assertNotIn("SECRET", json.dumps(ctx.exception.payload))
+
+	def test_send_media_refuses_before_any_graph_call(self):
+		post = MagicMock()
+		get = lambda url, **kw: LinkResp(status=403, ctype="text/html", content=b"<html>")  # noqa: E731
+		with patch.object(wb, "_account_or_error", return_value=ACCT), patch.object(wb, "_is_private_host", return_value=False):
+			with self.assertRaises(wb.BridgeError) as ctx:
+				wb.send_media("ACC", "15551234567", "audio", link="https://a.example/horse.mp3", http_post=post, http_get=get)
+		self.assertEqual(ctx.exception.payload["error"], "media_link_unreachable")
+		post.assert_not_called()
+
+	def test_send_sticker_refuses_before_any_graph_call(self):
+		post = MagicMock()
+		get = lambda url, **kw: LinkResp(ctype="text/html", content=b"<html>")  # noqa: E731
+		with patch.object(wb, "_account_or_error", return_value=ACCT), patch.object(wb, "_is_private_host", return_value=False):
+			with self.assertRaises(wb.BridgeError) as ctx:
+				wb.send_sticker("ACC", "15551234567", link="https://a.example/s.webp", http_post=post, http_get=get)
+		self.assertEqual(ctx.exception.payload["error"], "media_link_wrong_type")
+		post.assert_not_called()

@@ -824,13 +824,17 @@ class TestWhatsAppMultiGateway(IntegrationTestCase):
 		self.gateway_a.whatsapp_account = "No Such Account"
 		with self.assertRaises(frappe.ValidationError) as cm:
 			self.gateway_a.save()
-		self.assertIn("does not exist", str(cm.exception))
+		# the field is a Link since WP-1, so Frappe's link validation rejects a missing account first
+		self.assertTrue(
+			"does not exist" in str(cm.exception) or "Could not find" in str(cm.exception),
+			str(cm.exception),
+		)
 		self.gateway_a.reload()
 		self.gateway_a.whatsapp_account = self.account_b.name  # B's account carries B's phone id
 		with self.assertRaises(frappe.ValidationError) as cm:
 			self.gateway_a.save()
-		self.assertIn(self.PHONE_B, str(cm.exception))
-		self.assertIn(self.PHONE_A, str(cm.exception))
+		# B's account is already linked to the enabled gateway B, which is refused before the phone-id check
+		self.assertIn("already linked to the enabled gateway", str(cm.exception))
 		self.gateway_a.reload()
 		self.gateway_a.whatsapp_account = self.account_a.name
 		self.gateway_a.save()

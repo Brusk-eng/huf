@@ -31,6 +31,24 @@ CONTENT_TYPES = {
 }
 
 
+# Conversational types the agent may see. Anything else is record-only (see ``message_kind``).
+CONVERSATIONAL_TYPES = frozenset(
+	{"text", "interactive", "button", "location", "contacts", "order", *MEDIA_TYPES}
+)
+# kinds that are logged on a Gateway Event but never reach an agent or LLM
+RECORD_ONLY_KINDS = frozenset({"edit", "revoke", "system", "unknown"})
+
+
+def message_kind(msg_type: Any) -> str:
+	"""Gateway kind for an inbound ``type``: message | reaction | unsupported | edit | revoke | system | unknown."""
+	mtype = str(msg_type or "text")
+	if mtype in CONVERSATIONAL_TYPES:
+		return "message"
+	if mtype in ("reaction", "unsupported", "edit", "revoke", "system"):
+		return mtype
+	return "unknown"
+
+
 def cap(value: Any, limit: int) -> str:
 	text = " ".join(str(value if value is not None else "").split())
 	return text if len(text) <= limit else text[: max(limit - 1, 0)] + "…"

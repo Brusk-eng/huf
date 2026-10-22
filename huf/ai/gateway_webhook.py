@@ -8,6 +8,7 @@ adapter package or required credentials are unavailable.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import frappe
@@ -180,7 +181,27 @@ def _gateway_credentials(gateway) -> dict[str, str]:
 	return credentials
 
 
-def get_gateway_adapter(gateway):
+def _fallback_params(gateway, contact_name: str):
+	"""The Gateway's ``fallback_template_params`` (a JSON list or map; ``{{contact_name}}`` is substituted)."""
+	raw = str(gateway.get("fallback_template_params") or "").strip()
+	if not raw:
+		return None
+	try:
+		value = json.loads(raw)
+	except ValueError:
+		return None
+
+	def fill(item):
+		return str(item).replace("{{contact_name}}", contact_name or "there")
+
+	if isinstance(value, dict):
+		return {str(k): fill(v) for k, v in value.items()}
+	if isinstance(value, list):
+		return [fill(v) for v in value]
+	return None
+
+
+def get_gateway_adapter(gateway, contact_name: str = ""):
 	"""Instantiate the configured adapter without exposing stored credentials."""
 	adapter_class = _adapter_class_for_provider(gateway.provider)
 	credentials = _gateway_credentials(gateway)
@@ -192,6 +213,8 @@ def get_gateway_adapter(gateway):
 				"whatsapp_account": (gateway.get("whatsapp_account") or "").strip(),
 				"fallback_template": (gateway.get("fallback_template") or "").strip(),
 				"fallback_template_language": (gateway.get("fallback_template_language") or "").strip(),
+				"fallback_template_params": _fallback_params(gateway, contact_name),
+				"contact_name": contact_name,
 				"preview_url": (gateway.get("preview_url") or "").strip(),
 			},
 		)
@@ -213,7 +236,19 @@ def _inbound_request():
 
 
 def _event_context(event) -> dict[str, Any]:
+	raw = getattr(event, "raw_payload", None)
+	raw = raw if isinstance(raw, dict) else {}
+	message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
+	codes = [
+		e.get("code")
+		for e in (message.get("errors") if isinstance(message.get("errors"), list) else [])
+		if isinstance(e, dict) and e.get("code") is not None
+	]
+	kind = getattr(event, "kind", "message")
 	return {
+		"kind": kind if isinstance(kind, str) and kind else "message",
+		"original_message_id": str(raw.get("original_message_id") or ""),
+		"provider_error_codes": codes,
 		"sender_id": event.sender_id,
 		"conversation_id": event.conversation_id,
 		"thread_id": event.thread_id,
@@ -246,7 +281,16 @@ def _ingest_rate_gate() -> None:
 _ingest_rate_limited = rate_limit(key="gateway_name", limit=100, seconds=60)(_ingest_rate_gate)
 _RATE_LIMIT_WINDOW_SECONDS = 60
 MAX_BODY_BYTES = 3 * 1024 * 1024  # Meta's webhook payload cap
-MAX_MESSAGES_PER_PAYLOAD = 100
+MAX_MESSAGES_PER_PAYLOAD = 100  # calls handled per delivery
+# Policy for large deliveries (no silent drops): every message is ingested inline, up to this cap on
+# total work per request. Past it the first MAX_INGEST_PER_REQUEST are ingested and the webhook answers
+# HTTP 503 + Retry-After so Meta redelivers the whole payload; ingest is idempotent per message id, so
+# the redelivery skips what is stored and continues with the rest. Meta caps a delivery at ~3 MB.
+MAX_INGEST_PER_REQUEST = 500
+_DEFERRED_RETRY_AFTER_SECONDS = 30
+# A payload that still has unprocessed messages after this many 503 passes is acked; the rest are dead-lettered.
+MAX_DEFERRALS_PER_PAYLOAD = 5
+_DEFERRAL_TTL_SECONDS = 3600
 
 
 def _ingest_rate_gate() -> None:
@@ -329,6 +373,8 @@ def _record_failed_status(gateway_name: str, status: dict) -> None:
 	try:
 		errors = status.get("errors") if isinstance(status.get("errors"), list) else []
 		first = errors[0] if errors and isinstance(errors[0], dict) else {}
+		if str(first.get("code")) in ("131060", "2593109"):
+			return  # informational (WP-11): no alert, no Failed marking
 		code = first.get("code") or "unknown"
 		title = first.get("title") or first.get("message") or "no detail"
 		recipient = str(status.get("recipient_id") or "")
@@ -543,6 +589,63 @@ def _handle_calls(gateway, calls) -> list[dict]:
 	return results
 
 
+def _savepoint(name: str) -> None:
+	try:
+		frappe.db.savepoint(name)
+	except Exception:
+		pass
+
+
+def _rollback_to_savepoint(name: str) -> None:
+	try:
+		frappe.db.rollback(save_point=name)
+	except Exception:
+		pass
+
+
+def _dead_letter(gateway_name: str, event, exc: BaseException) -> int:
+	"""Keep a deterministically failing message as a replayable Failed Gateway Event. Never raises."""
+	from huf.ai.gateway_service import store_ingest_dead_letter
+
+	_rollback_to_savepoint("gw_ingest")  # drop whatever the failed ingest left half-written
+	try:
+		store_ingest_dead_letter(
+			gateway_name, event.provider_event_id, _event_context(event), dict(event.raw_payload or {}), exc
+		)
+		return 1
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "WhatsApp gateway dead letter failed")
+		return 0
+
+def _apply_account_events(events, gateway_name: str) -> int:
+	"""account_update / user_preferences: applied to the receiving gateway only, no Gateway Event row (WP-11)."""
+	if not events:
+		return 0
+	from huf.ai import whatsapp_account_events
+
+	return whatsapp_account_events.apply_account_events(events, gateway_name)
+
+
+def _deferral_key(gateway_name: str, request) -> str:
+	import hashlib
+
+	return f"huf:wa_deferrals:{gateway_name}:{hashlib.sha256(getattr(request, 'body', b'') or b'').hexdigest()[:32]}"
+
+
+def _deferral_count(key: str) -> int:
+	try:
+		return int(frappe.cache.get_value(key) or 0)
+	except Exception:
+		return 0
+
+
+def _bump_deferral(key: str, count: int) -> None:
+	try:
+		frappe.cache.set_value(key, count + 1, expires_in_sec=_DEFERRAL_TTL_SECONDS)
+	except Exception:
+		pass
+
+
 def _supports_batch_parse(adapter) -> bool:
 	# Class-level lookup so duck-typed/mock adapters do not accidentally qualify.
 	return callable(getattr(type(adapter), "parse_payload", None))
@@ -560,22 +663,22 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		return {"success": False, "error": "Invalid payload"}
 
 	messages = list(parsed.messages)
-	over_cap = max(len(messages) - MAX_MESSAGES_PER_PAYLOAD, 0)
-	if over_cap:
-		messages = messages[:MAX_MESSAGES_PER_PAYLOAD]
-		_warn(
-			f"WhatsApp gateway {gateway.name}: payload carried {len(parsed.messages)} messages; "
-			f"processed the first {MAX_MESSAGES_PER_PAYLOAD}, ignored {over_cap}"
-		)
 	if messages or getattr(parsed, "calls", ()):
 		_ingest_rate_gate()
 
 	ingested = duplicates = 0
 	results: list[dict] = []
 	first_transient = None
-	failed = 0
+	failed = dead_lettered = 0
 	account_name = None
-	for event in messages:
+	cap_hit_at = None
+	for index, event in enumerate(messages):
+		# Only NEW ingests count toward the cap, so a redelivery walks past already-stored
+		# duplicates and makes progress instead of re-deferring the same tail forever.
+		if ingested >= MAX_INGEST_PER_REQUEST:
+			cap_hit_at = index
+			break
+		_savepoint("gw_ingest")
 		try:
 			result = ingest_gateway_event(
 				gateway.name,
@@ -590,7 +693,8 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			if isinstance(exc, _TRANSIENT_ERRORS):
 				first_transient = first_transient or exc  # re-raised below so Meta retries (deduped)
 			else:
-				failed += 1  # deterministic: a retry cannot succeed, so still ack 200
+				failed += 1  # deterministic: a retry cannot succeed, so still ack 200 ...
+				dead_lettered += _dead_letter(gateway.name, event, exc)  # ... but never lose the message
 			continue
 		results.append(result)
 		if result.get("duplicate"):
@@ -598,8 +702,8 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 			continue
 		ingested += 1
 		touch_last_event(gateway)
-		if result.get("status") == "Rejected":
-			continue
+		if result.get("status") in ("Rejected", "Recorded"):
+			continue  # rejected or record-only (reaction/edit/revoke/system/unknown/unsupported): not mirrored
 		try:  # best-effort mirror into frappe_whatsapp (A4)
 			if account_name is None:
 				# the Gateway's own account only: never a default or first-Active guess
@@ -620,44 +724,80 @@ def _handle_batched_payload(gateway, adapter, request) -> dict:
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "WhatsApp record_incoming failed")
 
-	_record_unknown_phone_ids(gateway.name, getattr(parsed, "unknown_phone_ids", ()) or ())
-	for status in parsed.statuses:
-		_update_reply_status(gateway.name, status)
-		if str(status.get("status") or "").lower() == "failed":
-			_record_failed_status(gateway.name, status)
-	routed_updates = [update for update in parsed.template_updates if _record_template_update(update, gateway.name)]
-	call_results = _handle_calls(gateway, getattr(parsed, "calls", ()) or ())
+	remaining = messages[cap_hit_at:] if cap_hit_at is not None else []
+	deferred = len(remaining)
+	deferral_key = _deferral_key(gateway.name, request)
+	if deferred:
+		seen = _deferral_count(deferral_key)
+		if seen >= MAX_DEFERRALS_PER_PAYLOAD:
+			# bounded: stop asking Meta to redeliver; keep the tail as replayable dead letters and ack
+			_warn(f"WhatsApp gateway {gateway.name}: {deferred} messages still deferred after {seen} passes; dead-lettering")
+			for event in remaining:
+				dead_lettered += _dead_letter(gateway.name, event, RuntimeError("deferral limit exceeded"))
+			failed += deferred
+			deferred = 0
+		else:
+			_bump_deferral(deferral_key, seen)
+			_warn(
+				f"WhatsApp gateway {gateway.name}: ingested {MAX_INGEST_PER_REQUEST} new messages, answering 503 "
+				f"so the provider redelivers the other {deferred}"
+			)
 
-	forwarded = 0
-	changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
-	changes += [
-		{
-			"field": _TEMPLATE_KIND_FIELDS.get(update.get("kind"), "message_template_status_update"),
-			"value": {k: v for k, v in update.items() if k not in ("kind", "waba_id")},
-		}
-		for update in routed_updates
-	]
-	for change in changes:
-		try:
-			if bridge.forward_status(change):
-				forwarded += 1
-		except Exception:
-			pass  # best effort, never fail the ack
+	_record_unknown_phone_ids(gateway.name, getattr(parsed, "unknown_phone_ids", ()) or ())
+	# A deferred pass only ingests messages: statuses/templates/calls/account events run once, on the
+	# final pass, so Meta's redeliveries of a big payload never re-apply them.
+	routed_updates: list = []
+	call_results: list = []
+	account_applied = forwarded = 0
+	if not deferred:
+		for status in parsed.statuses:
+			_update_reply_status(gateway.name, status)
+			if str(status.get("status") or "").lower() == "failed":
+				_record_failed_status(gateway.name, status)
+		routed_updates = [update for update in parsed.template_updates if _record_template_update(update, gateway.name)]
+		call_results = _handle_calls(gateway, getattr(parsed, "calls", ()) or ())
+		account_applied = _apply_account_events(getattr(parsed, "account_events", ()) or (), gateway.name)
+
+		changes = [{"field": "messages", "value": {"statuses": [status]}} for status in parsed.statuses]
+		changes += [
+			{
+				"field": _TEMPLATE_KIND_FIELDS.get(update.get("kind"), "message_template_status_update"),
+				"value": {k: v for k, v in update.items() if k not in ("kind", "waba_id")},
+			}
+			for update in routed_updates
+		]
+		for change in changes:
+			try:
+				if bridge.forward_status(change):
+					forwarded += 1
+			except Exception:
+				pass  # best effort, never fail the ack
 
 	if first_transient is not None:
 		raise first_transient
+	if deferred:
+		frappe.local.response.http_status_code = 503
+		try:
+			frappe.local.response_headers["Retry-After"] = str(_DEFERRED_RETRY_AFTER_SECONDS)
+		except Exception:
+			pass
 	return {
-		"success": True,
-		"messages": len(messages),
+		"success": not deferred,
+		"messages": len(messages) - deferred,
 		"ingested": ingested,
 		"duplicates": duplicates,
 		"statuses": len(parsed.statuses),
 		"template_updates": len(parsed.template_updates),
 		"calls": len(call_results),
+		"account_events": account_applied,
 		"forwarded": forwarded,
-		"ignored": parsed.ignored + over_cap,
-		"note": (f"Only the first {MAX_MESSAGES_PER_PAYLOAD} messages were processed" if over_cap else ""),
+		"ignored": parsed.ignored,
+		"deferred": deferred,
+		"note": (
+			f"{deferred} messages not processed yet; retry the delivery (503)" if deferred else ""
+		),
 		"failed": failed,
+		"dead_lettered": dead_lettered,
 		"results": results,
 	}
 
@@ -691,10 +831,6 @@ def handle_gateway_webhook() -> dict | None:
 	except frappe.DoesNotExistError:
 		frappe.local.response.http_status_code = 404
 		return {"success": False, "error": "Unknown gateway"}
-	if not gateway.is_enabled:
-		frappe.local.response.http_status_code = 403
-		return {"success": False, "error": "Gateway is disabled"}
-
 	declared = getattr(frappe.request, "content_length", None) if frappe.request is not None else None
 	if declared is not None and declared > MAX_BODY_BYTES:
 		frappe.local.response.http_status_code = 413
@@ -718,6 +854,11 @@ def handle_gateway_webhook() -> dict | None:
 			_record_webhook_signal(gateway, "last_verify_ok_at")
 		_text_response(challenge)
 		return None
+	# Only ingest is gated on is_enabled: Meta's callback verification (GET) runs when the
+	# callback is saved, normally before the gateway is enabled.
+	if not gateway.is_enabled:
+		frappe.local.response.http_status_code = 403
+		return {"success": False, "error": "Gateway is disabled"}
 	batched = _supports_batch_parse(adapter)
 	if not batched:
 		_ingest_rate_gate()
@@ -744,11 +885,22 @@ def handle_gateway_webhook() -> dict | None:
 	return {"success": True, **result}
 
 
+def event_contact_name(event) -> str:
+	"""The sender's profile name recorded on the inbound event (empty when unknown)."""
+	raw = getattr(event, "raw_payload", None)
+	if isinstance(raw, str):
+		try:
+			raw = json.loads(raw)
+		except ValueError:
+			raw = None
+	return str(raw.get("contact_name") or "").strip() if isinstance(raw, dict) else ""
+
+
 def send_gateway_reply(gateway, event, text: str):
 	"""Deliver one completed Agent response through the same verified gateway."""
 	from huf.ai.gateway_adapters.types import GatewayReply
 
-	adapter = get_gateway_adapter(gateway)
+	adapter = get_gateway_adapter(gateway, event_contact_name(event))
 	if gateway.provider == "WhatsApp":
 		# A2: WhatsApp never fragments conversations by thread; the reply quotes
 		# the inbound wamid, which is the event's provider_event_id.
@@ -776,7 +928,7 @@ def send_gateway_parts(gateway, event, parts: list[str], *, quote: bool = True):
 	``quote`` puts the reply-to context on the first part only; pass False when an earlier part was
 	already delivered. Raises ``WhatsAppPartsError`` carrying what was sent and what remains.
 	"""
-	adapter = get_gateway_adapter(gateway)
+	adapter = get_gateway_adapter(gateway, event_contact_name(event))
 	return adapter.send_text_parts(
 		event.conversation_id, list(parts), (event.provider_event_id or None) if quote else None
 	)

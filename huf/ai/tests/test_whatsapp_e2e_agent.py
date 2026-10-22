@@ -26,7 +26,7 @@ import frappe
 from frappe.tests import IntegrationTestCase
 from frappe.utils import now_datetime
 
-from huf.ai import gateway_webhook
+from huf.ai import gateway_service, gateway_webhook
 from huf.ai.gateway_adapters import GatewayInboundRequest, whatsapp_bridge as bridge
 
 APP_SECRET = "e2e-agent-secret"
@@ -307,7 +307,15 @@ class _E2EMixin:
 		self.assertTrue(self._post(_text_msg(wamid))["success"])
 		return self._process(self._event_name(wamid)), self._event(self._event_name(wamid))
 
-	def test_h_provider_failure_marks_event_failed_and_sends_nothing(self):
+	def _assert_only_default_fallback(self):
+		sends = self.meta.sends()
+		self.assertEqual(len(sends), 1)
+		body = sends[0]["body"]["text"]["body"]
+		self.assertIn("Sorry", body)
+		self.assertNotIn("429", body)
+		self.assertNotIn("model", body.lower())
+
+	def test_h_provider_failure_marks_event_failed_and_sends_default_fallback(self):
 		self._fail_run(error="The selected model is no longer available.", error_kind="model_not_found")
 		out, event = self._post_and_process("wamid.H1")
 		self.assertEqual(out["status"], "Failed")
@@ -315,39 +323,37 @@ class _E2EMixin:
 		self.assertEqual(event.status, "Failed")
 		self.assertTrue(event.error_message.startswith("provider_model_not_found:"), event.error_message)
 		self.assertTrue(event.delivery_error)
-		self.assertEqual(self.meta.sends(), [])
+		self._assert_only_default_fallback()
 
 	def test_h_error_without_kind_is_agent_run_failed_and_raw_text_not_sent(self):
 		self._fail_run(error="Gemini API Error: 429 Too Many Requests. {raw}")
 		out, event = self._post_and_process("wamid.H2")
 		self.assertEqual(out["error_code"], "agent_run_failed")
-		self.assertEqual(self.meta.sends(), [])
+		self._assert_only_default_fallback()
 
 	def test_h_empty_response_fails_without_send(self):
 		self.run_mock.side_effect = lambda **kw: {"response": "  ", "agent_run_id": "x"}
 		out, event = self._post_and_process("wamid.H3")
 		self.assertEqual(event.status, "Failed")
-		self.assertEqual(self.meta.sends(), [])
+		self._assert_only_default_fallback()
 
 	def _set_fallback_text(self, text):
 		self.integration.reload()
 		self.integration.append("credentials", {"key": "fallback_reply_text", "value": text})
 		self.integration.save(ignore_permissions=True)
 
-	def test_h_fallback_text_sent_once_per_sender_per_window(self):
+	def test_h_configured_fallback_text_sent_once_per_event(self):
 		self._set_fallback_text("Sorry, we cannot answer right now.")
 		self._fail_run(error="x", error_kind="rate_limited")
-		frappe.cache().delete_value(f"huf_gw_fallback_reply:{self.gateway.name}:{SENDER}")
 		out1, event1 = self._post_and_process("wamid.H4")
 		self.assertEqual(event1.status, "Failed")
 		self.assertTrue(out1["fallback_sent"])
 		sends = self.meta.sends()
 		self.assertEqual(len(sends), 1)
 		self.assertEqual(sends[0]["body"]["text"]["body"], "Sorry, we cannot answer right now.")
-		out2, event2 = self._post_and_process("wamid.H5")
-		self.assertFalse(out2["fallback_sent"])
+		# re-processing the same event never sends a second fallback
+		self.assertFalse(gateway_service._send_fallback_once(event1, self.gateway, "error"))
 		self.assertEqual(len(self.meta.sends()), 1)
-		self.addCleanup(frappe.cache().delete_value, f"huf_gw_fallback_reply:{self.gateway.name}:{SENDER}")
 
 	def test_c_second_and_quoting_inbound_reuse_external_id(self):
 		for wamid, quoted in (("wamid.C1", None), ("wamid.C2", None), ("wamid.C3", "wamid.C1")):
@@ -458,10 +464,10 @@ class TestWhatsAppE2EAgentUnapproved(_E2EMixin, IntegrationTestCase):
 	test_e_window_closed_without_fallback_fails_cleanly_with_no_post = None
 	test_e_window_closed_with_fallback_template_sends_one_template = None
 	test_g_duplicate_wamid_one_event_and_one_agent_run = None
-	test_h_provider_failure_marks_event_failed_and_sends_nothing = None
+	test_h_provider_failure_marks_event_failed_and_sends_default_fallback = None
 	test_h_error_without_kind_is_agent_run_failed_and_raw_text_not_sent = None
 	test_h_empty_response_fails_without_send = None
-	test_h_fallback_text_sent_once_per_sender_per_window = None
+	test_h_configured_fallback_text_sent_once_per_event = None
 
 	def test_f_unapproved_sender_never_runs_or_sends(self):
 		self._post(_text_msg("wamid.U1"))

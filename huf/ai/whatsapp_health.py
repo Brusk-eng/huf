@@ -123,6 +123,8 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 	mismatch = bool(facts.get("account_phone_mismatch"))
 	# Meta said the stored token is expired or revoked (last cached live check); None = never checked.
 	token_invalid = token and facts.get("token_valid") is False
+	conn_state = str(facts.get("connection_state") or "Connected")
+	conn_reason = str(facts.get("connection_reason") or "").strip()
 	last_event_at = facts.get("last_event_at")
 	last_error = str(facts.get("last_error") or "").strip()
 	events_ever = int(facts.get("events_ever") or 0)
@@ -221,6 +223,11 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 			)
 		)
 
+	if conn_state == "Disconnected":
+		reasons.append(_reason("gateway_disconnected", "error", conn_reason or "This WhatsApp account is disconnected. Sends are refused until it is reconnected."))
+	elif conn_state == "Degraded":
+		reasons.append(_reason("gateway_degraded", "warning", conn_reason or "Meta restricted this WhatsApp account. Sends are allowed but may fail."))
+
 	configured_nothing = not (facts.get("has_integration") or token or phone or verify or secret)
 	errors = [r for r in reasons if r["severity"] == "error"]
 	warnings = [r for r in reasons if r["severity"] == "warning" and r["code"] != "no_events_yet"]
@@ -282,9 +289,10 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 
 
 def _is_failed(row: dict[str, Any]) -> bool:
-	return str(row.get("status") or "") == "Failed" or str(row.get("reply_status") or "").lower() == "failed" or bool(
-		(row.get("delivery_error") or "").strip()
-	)
+	err = (row.get("delivery_error") or "").strip()
+	if err and re.search(r"\b(131060|2593109)\b", err):
+		return False  # informational codes never count as failures
+	return str(row.get("status") or "") == "Failed" or str(row.get("reply_status") or "").lower() == "failed" or bool(err)
 
 
 _AGENT_ERROR_RE = re.compile(r"^(?:provider_([a-z_]+)|agent_run_failed):")
@@ -468,6 +476,12 @@ def build_health(
 	last_error = redact(gateway.get("last_error") or "")
 	phone_present = bool(presence.get("phone_number_id") or own_phone)
 	token_check = _cached_token_check(name)
+	if "connection_state" not in gateway:  # not in every caller's field list
+		try:
+			stored = frappe.db.get_value("Gateway", name, ["connection_state", "connection_reason"], as_dict=True) or {}
+		except Exception:
+			stored = {}
+		gateway = {**gateway, **stored}
 	facts = {
 		"token_valid": token_check["valid"] if token_check else None,
 		"enabled": gateway.get("is_enabled"),
@@ -482,6 +496,8 @@ def build_health(
 		"signature_failure_at": sig_at,
 		"verify_ok_at": verify_ok_at,
 		"last_error": last_error,
+		"connection_state": gateway.get("connection_state") or "Connected",
+		"connection_reason": gateway.get("connection_reason") or "",
 		"events_ever": events["events_ever"],
 		"replied_ever": events["replied_ever"],
 		"events_24h": events["events_24h"],

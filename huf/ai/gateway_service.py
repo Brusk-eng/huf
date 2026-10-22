@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import threading
@@ -21,6 +22,7 @@ from frappe import _
 from frappe.rate_limiter import rate_limit
 from frappe.utils import add_to_date, now_datetime
 
+from huf.ai import whatsapp_outbound_policy as policy
 from huf.ai.gateway_adapters.provider_ids import provider_to_service_id
 
 
@@ -105,29 +107,102 @@ def _gateway_fallback_reply_text(gateway) -> str:
     return ""
 
 
-def _maybe_send_failure_fallback(event, gateway) -> bool:
-    """Send the configured fallback text at most once per sender per 10 minutes. Never raises."""
+_FALLBACK_TEXTS = {
+    "en": {
+        "error": "Sorry, something went wrong on our side and I could not answer. Please try again in a moment.",
+        "attachment": "Sorry, I could not open the file you sent. Please send it again or describe it in a message.",
+    },
+    "es": {
+        "error": "Lo sentimos, algo salio mal y no pude responder. Por favor intentalo de nuevo en un momento.",
+        "attachment": "Lo sentimos, no pude abrir el archivo que enviaste. Envialo de nuevo o descríbelo en un mensaje.",
+    },
+    "fr": {
+        "error": "Désolé, un problème est survenu et je n'ai pas pu répondre. Veuillez réessayer dans un instant.",
+        "attachment": "Désolé, je n'ai pas pu ouvrir le fichier envoyé. Renvoyez-le ou décrivez-le dans un message.",
+    },
+    "pt": {
+        "error": "Desculpe, algo deu errado e nao consegui responder. Tente novamente em instantes.",
+        "attachment": "Desculpe, nao consegui abrir o arquivo enviado. Envie novamente ou descreva em uma mensagem.",
+    },
+    "de": {
+        "error": "Entschuldigung, es ist ein Fehler aufgetreten und ich konnte nicht antworten. Bitte versuchen Sie es gleich noch einmal.",
+        "attachment": "Entschuldigung, ich konnte die gesendete Datei nicht öffnen. Bitte senden Sie sie erneut oder beschreiben Sie sie kurz.",
+    },
+    "ar": {
+        "error": "عذرا، حدث خطأ ولم أتمكن من الرد. يرجى المحاولة مرة أخرى بعد قليل.",
+        "attachment": "عذرا، لم أتمكن من فتح الملف الذي أرسلته. يرجى إرساله مرة أخرى أو وصفه في رسالة.",
+    },
+}
+ATTACHMENT_UNAVAILABLE_NOTE = "[Attachment unavailable: the file the user sent could not be downloaded]"
+
+
+def _lang_code(value: Any) -> str:
+    return str(value or "").strip().replace("-", "_").split("_")[0].lower()
+
+
+def _contact_language(event) -> str:
+    raw = getattr(event, "raw_payload", None)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if isinstance(raw, dict):
+        return _lang_code(raw.get("language") or raw.get("locale"))
+    return ""
+
+
+def _default_fallback_text(gateway, event, kind: str) -> str:
+    """Plain, localized text: contact language > gateway default language > English."""
+    if kind == "error":
+        custom = _gateway_fallback_reply_text(gateway)
+        if custom:
+            return custom
+    for code in (_contact_language(event), _lang_code(getattr(gateway, "fallback_template_language", ""))):
+        if code in _FALLBACK_TEXTS:
+            return _FALLBACK_TEXTS[code][kind]
+    return _FALLBACK_TEXTS["en"][kind]
+
+
+def _send_fallback_once(event, gateway, kind: str = "error") -> bool:
+    """Send the default fallback reply at most once per event and kind, through the normal reply
+    pipeline (opt-out and window rules apply). Never raises."""
     try:
-        text = _gateway_fallback_reply_text(gateway)
-        if not text:
-            return False
         if event.sender_id and is_opted_out(gateway, event.sender_id):
             return False
-        key = f"huf_gw_fallback_reply:{gateway.name}:{event.sender_id or event.conversation_id}"
-        if not frappe.cache().set(key, 1, ex=_FALLBACK_REPLY_WINDOW_SECONDS, nx=True):
+        key = f"huf_gw_fallback_reply:{event.name}:{kind}"
+        if not frappe.cache().set(key, 1, ex=86400, nx=True):
             return False
         from huf.ai.gateway_webhook import send_gateway_reply
 
-        delivery = send_gateway_reply(gateway, event, text)
-        _record_reply_sent(event, getattr(delivery, "provider_message_id", None))
+        delivery = send_gateway_reply(gateway, event, _default_fallback_text(gateway, event, kind))
+        if kind == "error":
+            _record_reply_sent(event, getattr(delivery, "provider_message_id", None))
         return True
     except Exception:
         frappe.logger("huf").warning("Gateway fallback reply failed to send")
         return False
 
 
-def _fail_event_for_agent_run(event, gateway, result, error_code: str, reason: str) -> dict:
-    """Mark the event Failed for a failed agent run and send nothing (bar the optional fallback)."""
+def _inbound_media_type(event) -> str | None:
+    """Media message type of the inbound WhatsApp message, when it carries a downloadable id."""
+    raw = getattr(event, "raw_payload", None)
+    try:
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        message = raw.get("message") if isinstance(raw, dict) else None
+        msg_type = message.get("type") if isinstance(message, dict) else None
+        if msg_type in ("image", "document", "audio", "video", "sticker") and (message.get(msg_type) or {}).get("id"):
+            return msg_type
+    except Exception:
+        pass
+    return None
+
+
+def _fail_event_for_agent_run(
+    event, gateway, result, error_code: str, reason: str, fallback_kind: str = "error"
+) -> dict:
+    """Mark the event Failed for a failed agent run and send nothing (bar the default fallback reply)."""
     agent_run_id = result.get("agent_run_id") if isinstance(result, dict) else None
     message = f"{error_code}: {reason}"[:500]
     values = {"status": "Failed", "error_message": message, "delivery_error": message[:140]}
@@ -135,7 +210,7 @@ def _fail_event_for_agent_run(event, gateway, result, error_code: str, reason: s
         values["agent_run"] = agent_run_id
     event.db_set(values)
     frappe.log_error(message, "Gateway agent run failed")
-    fallback_sent = _maybe_send_failure_fallback(event, gateway)
+    fallback_sent = _send_fallback_once(event, gateway, fallback_kind)
     return {
         "event_name": event.name,
         "status": "Failed",
@@ -319,6 +394,50 @@ def _normalize_sender_for_provider(provider: str | None, entry_type: str, extern
 _MEDIA_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 
 
+_MIME_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "audio/ogg": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "audio/aac": "aac",
+    "audio/amr": "amr",
+    "video/mp4": "mp4",
+    "video/3gpp": "3gp",
+    "application/pdf": "pdf",
+    "text/plain": "txt",
+    "text/csv": "csv",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+}
+
+
+def _media_file_name(msg_type: str, media: dict, media_id: str, downloaded: dict) -> str:
+    """A readable file name: the sender's own filename for documents, else ``<type>-<id>.<ext>``."""
+    mime = str(downloaded.get("mime_type") or (media or {}).get("mime_type") or "").split(";")[0].strip().lower()
+    ext = _MIME_EXTENSIONS.get(mime) or (mime.split("/")[-1] if "/" in mime and mime.split("/")[-1].isalnum() else "")
+    original = os.path.basename(str((media or {}).get("filename") or ""))
+    if not original:
+        # Meta's media metadata sometimes names the file; the bridge falls back to the raw id.
+        provided = os.path.basename(str(downloaded.get("filename") or ""))
+        if provided and _MEDIA_SAFE_NAME.sub("_", media_id) not in (provided, provided.rsplit(".", 1)[0]):
+            original = provided
+    if original:
+        name = original
+    else:
+        name = f"{msg_type}-{media_id}"
+    name = _MEDIA_SAFE_NAME.sub("_", name).lstrip(".")[:100] or f"{msg_type}-{media_id}"
+    if ext and "." not in os.path.basename(name):
+        name = f"{name}.{ext}"[:100]
+    return name
+
+
 def _save_whatsapp_media(event, gateway) -> list[str]:
     """Best-effort download of inbound WhatsApp media into private Files (A9).
 
@@ -348,9 +467,10 @@ def _save_whatsapp_media(event, gateway) -> list[str]:
 
             creds = _gateway_credentials(gateway)
             direct = {"token": creds.get("access_token"), "url": bridge.graph_base_url(creds.get("graph_api_url"))}
-        downloaded = bridge.download_media(account, media_id, credentials=direct, kind=msg_type)
-        name = os.path.basename(str(downloaded.get("filename") or media_id))
-        name = _MEDIA_SAFE_NAME.sub("_", name).lstrip(".")[:100] or "media"
+        downloaded = bridge.download_media(
+            account, media_id, credentials=direct, kind=msg_type, filename=(media or {}).get("filename")
+        )
+        name = _media_file_name(msg_type, media, media_id, downloaded)
         file_doc = frappe.get_doc(
             {
                 "doctype": "File",
@@ -460,6 +580,9 @@ PAIRING_PREFIX = "PAIR-"
 PAIRING_RESEND_COOLDOWN_MINUTES = 10
 PAIRING_APPROVAL_MAX_FAILURES_PER_MINUTE = 5
 PENDING_ENTRY_RETENTION_DAYS = 7
+PAIRING_DEFAULT_PENDING_LIMIT = 50
+PAIRING_DEFAULT_REPLY_DAILY_LIMIT = 20
+PAIRING_MAX_REQUESTS_PER_SENDER_PER_DAY = 3
 
 # Access entry states that stop a sender from being admitted or re-paired.
 ENTRY_STATE_BLOCKED = "Blocked"
@@ -512,13 +635,13 @@ def _read_counter(key: str) -> int:
 
 
 def _is_gateway_admin() -> bool:
-    """Admin role, or the Huf ``system.integrations.manage`` capability."""
+    """Single authority for list/approve/revoke: System Manager, Huf Admin, or ``system.integrations.manage``."""
     if set(frappe.get_roles() or []).intersection(_GATEWAY_ADMIN_ROLES):
         return True
     try:
-        from huf.permissions import has_capability
+        from huf.permissions import is_gateway_admin
 
-        return bool(has_capability(frappe.session.user, "system.integrations.manage"))
+        return bool(is_gateway_admin(frappe.session.user))
     except Exception:
         return False
 
@@ -572,6 +695,15 @@ def _new_unique_pairing_code(gateway_name: str) -> str:
 # -- access entries -------------------------------------------------------------
 
 
+def _save_entry(entry, updates: dict[str, Any]):
+    """Apply ``updates`` through ``save()`` so Frappe's version log (track_changes) records who changed what."""
+    if isinstance(entry, str):
+        entry = frappe.get_doc("Gateway Access Entry", entry)
+    entry.update(updates)
+    entry.save(ignore_permissions=True, ignore_version=False)
+    return entry
+
+
 def _has_access_entry(gateway, entry_type: str, external_id: str) -> bool:
     if not external_id:
         return False
@@ -605,7 +737,7 @@ def _sender_negative_state(gateway, sender_id: str) -> str | None:
                 "gateway": gateway.name,
                 "entry_type": "Sender",
                 "provider": gateway.provider,
-                "external_id": external_id,
+                "external_id": ["in", _linked_sender_ids(gateway.name, gateway.provider, sender_id)],
                 "state": ["in", [ENTRY_STATE_OPTED_OUT, ENTRY_STATE_BLOCKED, ENTRY_STATE_REVOKED]],
             },
             pluck="state",
@@ -620,6 +752,44 @@ def _sender_negative_state(gateway, sender_id: str) -> str | None:
     if ENTRY_STATE_REVOKED in states and not _has_access_entry(gateway, "Sender", sender_id):
         return ENTRY_STATE_REVOKED
     return None
+
+
+def _raw_bsuid(raw: Any) -> str:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return ""
+    return str(raw.get("bsuid") or "") if isinstance(raw, dict) else ""
+
+
+def _linked_sender_ids(gateway_name: str, provider: str | None, sender: str) -> list[str]:
+    """The normalised sender id plus the other WhatsApp id (phone <-> BSUID) seen with it on an event."""
+    primary = _normalize_sender_for_provider(provider, "Sender", sender)
+    ids = [primary]
+    if provider != "WhatsApp" or not primary:
+        return ids
+    from huf.ai.gateway_adapters import whatsapp_bridge as bridge
+
+    if bridge.is_bsuid(primary):
+        filters = {"gateway": gateway_name, "raw_payload": ["like", f"%{primary}%"]}
+    else:
+        filters = {"gateway": gateway_name, "sender_id": primary, "raw_payload": ["like", "%bsuid%"]}
+    rows = frappe.get_all(
+        "Gateway Event", filters=filters, fields=["sender_id", "raw_payload"],
+        order_by="creation desc", limit_page_length=20,
+    )  # fmt: skip
+    for row in rows or []:
+        if bridge.is_bsuid(primary):
+            if _raw_bsuid(row.get("raw_payload")) == primary and row.get("sender_id"):
+                other = _normalize_sender_for_provider(provider, "Sender", row["sender_id"])
+            else:
+                continue
+        else:
+            other = _raw_bsuid(row.get("raw_payload"))
+        if other and other not in ids:
+            ids.append(other)
+    return ids
 
 
 def is_opted_out(gateway, sender: str) -> bool:
@@ -647,7 +817,7 @@ def is_opted_out(gateway, sender: str) -> bool:
             filters={
                 "gateway": gateway_name,
                 "entry_type": "Sender",
-                "external_id": external_id,
+                "external_id": ["in", _linked_sender_ids(gateway_name, provider, sender)],
                 "state": ENTRY_STATE_OPTED_OUT,
             },
             pluck="name",
@@ -746,11 +916,7 @@ def _record_opt_out(gateway, sender_id: str, display_name: str | None = None) ->
     external_id = _normalize_sender_for_provider(gateway.provider, "Sender", sender_id)
     row = _live_sender_entry(gateway, sender_id)
     if row:
-        frappe.db.set_value(
-            "Gateway Access Entry",
-            row["name"],
-            {"state": ENTRY_STATE_OPTED_OUT, "previous_state": row["state"]},
-        )
+        _save_entry(row["name"], {"state": ENTRY_STATE_OPTED_OUT, "previous_state": row["state"]})
         return
     frappe.get_doc(
         {
@@ -766,15 +932,27 @@ def _record_opt_out(gateway, sender_id: str, display_name: str | None = None) ->
     ).insert(ignore_permissions=True)
 
 
+def _record_opt_out_linked(gateway, event, sender_id: str, display_name: str | None = None) -> None:
+    """Record the opt-out under the sender id and, when the event carries both, the BSUID too."""
+    _record_opt_out(gateway, sender_id, display_name)
+    other = _raw_bsuid(getattr(event, "raw_payload", None))
+    if other and other != sender_id:
+        _record_opt_out(gateway, other, display_name)
+
+
+def _record_opt_in_linked(gateway, sender_id: str) -> None:
+    """START clears the opt-out under every id linked to the sender (phone and BSUID), like STOP set it."""
+    for linked in _linked_sender_ids(gateway.name, gateway.provider, sender_id):
+        _record_opt_in(gateway, linked)
+
+
 def _record_opt_in(gateway, sender_id: str) -> None:
     row = _live_sender_entry(gateway, sender_id)
     if not row or row["state"] != ENTRY_STATE_OPTED_OUT:
         return
     previous = row.get("previous_state")
     restored = previous if previous in _RESTORABLE_STATES else ENTRY_STATE_EXPIRED
-    frappe.db.set_value(
-        "Gateway Access Entry", row["name"], {"state": restored, "previous_state": ""}
-    )
+    _save_entry(row["name"], {"state": restored, "previous_state": ""})
 
 
 def _reject_event(event, reason: str) -> dict:
@@ -782,12 +960,52 @@ def _reject_event(event, reason: str) -> dict:
     return {"event_name": event.name, "status": "Rejected"}
 
 
+def access_rate_gate(gateway, context: dict[str, Any]) -> str:
+    """Per-sender inbound rate gate for ingest to call BEFORE any consent/admission side effect.
+
+    Returns ``""`` when the event may proceed, else the rejection reason.
+    """
+    return _sender_rate_limit_reason(gateway, context)
+
+
+def _sender_is_known(gateway, sender_id: str) -> bool:
+    """True if the sender is approved or already has any live access entry (no side effects)."""
+    if _has_access_entry(gateway, "Sender", sender_id):
+        return True
+    return _live_sender_entry(gateway, sender_id) is not None
+
+
+def record_consent_event(event, gateway, context: dict[str, Any]) -> dict | None:
+    """STOP/START handling for ingest. Returns a result dict when handled.
+
+    Call after :func:`access_rate_gate`. A sender that is not admitted and has
+    no access entry gets neither a row nor a reply (a stranger's STOP must not
+    allocate state or trigger outbound traffic).
+    """
+    return _handle_consent_event(event, gateway, context)
+
+
 def _handle_consent_event(event, gateway, context: dict[str, Any]) -> dict | None:
-    """STOP/START handling, before admission. Returns a result dict when handled."""
+    """STOP/START handling. Returns a result dict when handled."""
     if gateway.provider not in CONSENT_PROVIDERS or context.get("is_room"):
         return None
     sender_id = str(context.get("sender_id") or "")
     if not sender_id:
+        return None
+    if not _sender_is_known(gateway, sender_id):
+        text = context.get("message_text")
+        if _text_matches_keywords(
+            gateway, text, "opt_out_keywords", DEFAULT_OPT_OUT_KEYWORDS
+        ) and policy.has_received_template(gateway.name, sender_id):
+            # We messaged this contact first (proactive template): their STOP must be honoured.
+            _record_opt_out_linked(gateway, event, sender_id, str(context.get("display_name") or "") or None)
+            reply = getattr(gateway, "opt_out_reply_text", None) or DEFAULT_OPT_OUT_REPLY
+            _send_plain_reply(gateway, sender_id, str(context.get("conversation_id") or "") or sender_id, reply)
+            return _reject_event(event, "Sender opted out (STOP) after a proactive template; no agent run")
+        if _text_matches_keywords(gateway, text, "opt_out_keywords", DEFAULT_OPT_OUT_KEYWORDS) or _text_matches_keywords(
+            gateway, text, "opt_in_keywords", DEFAULT_OPT_IN_KEYWORDS
+        ):
+            return _reject_event(event, "Sender is not admitted; consent keyword ignored")
         return None
     text = context.get("message_text")
     state = _sender_negative_state(gateway, sender_id)
@@ -795,7 +1013,7 @@ def _handle_consent_event(event, gateway, context: dict[str, Any]) -> dict | Non
 
     if state == ENTRY_STATE_OPTED_OUT:
         if _text_matches_keywords(gateway, text, "opt_in_keywords", DEFAULT_OPT_IN_KEYWORDS):
-            _record_opt_in(gateway, sender_id)
+            _record_opt_in_linked(gateway, sender_id)
             _send_plain_reply(gateway, sender_id, conversation_id, DEFAULT_OPT_IN_REPLY)
             return _reject_event(event, "Sender opted back in (START); no agent run")
         return _reject_event(event, "Sender has opted out")
@@ -804,7 +1022,7 @@ def _handle_consent_event(event, gateway, context: dict[str, Any]) -> dict | Non
         return None  # admission rejects these silently
 
     if _text_matches_keywords(gateway, text, "opt_out_keywords", DEFAULT_OPT_OUT_KEYWORDS):
-        _record_opt_out(gateway, sender_id, str(context.get("display_name") or "") or None)
+        _record_opt_out_linked(gateway, event, sender_id, str(context.get("display_name") or "") or None)
         reply = getattr(gateway, "opt_out_reply_text", None) or DEFAULT_OPT_OUT_REPLY
         _send_plain_reply(gateway, sender_id, conversation_id, reply)
         return _reject_event(event, "Sender opted out (STOP); no agent run")
@@ -842,6 +1060,56 @@ def _process_time_block_reason(gateway, event) -> str:
 # -- pairing --------------------------------------------------------------------
 
 
+def _int_setting(gateway, fieldname: str, default: int) -> int:
+    value = getattr(gateway, fieldname, None)
+    try:
+        return default if value in (None, "") else int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _pairing_cap_reason(gateway, sender_id: str) -> str:
+    """Return why a NEW pairing request may not be created (``""`` when allowed).
+
+    Caps: Pending requests per gateway, and pairing requests per sender per 24h
+    (expired and revoked rows count, so a sender cannot churn new rows).
+    """
+    limit = _int_setting(gateway, "pairing_pending_limit", PAIRING_DEFAULT_PENDING_LIMIT)
+    if limit > 0:
+        pending = frappe.get_all(
+            "Gateway Access Entry",
+            filters={"gateway": gateway.name, "state": "Pending"},
+            pluck="name",
+            limit_page_length=limit,
+        )
+        if len(pending or []) >= limit:
+            return "Pairing capacity reached for this gateway"
+    external_id = _normalize_sender_for_provider(gateway.provider, "Sender", sender_id)
+    recent = frappe.get_all(
+        "Gateway Access Entry",
+        filters={
+            "gateway": gateway.name,
+            "entry_type": "Sender",
+            "external_id": external_id,
+            "creation": [">", add_to_date(now_datetime(), hours=-24)],
+        },
+        pluck="name",
+        limit_page_length=PAIRING_MAX_REQUESTS_PER_SENDER_PER_DAY,
+    )
+    if len(recent or []) >= PAIRING_MAX_REQUESTS_PER_SENDER_PER_DAY:
+        return "Too many pairing requests from this sender"
+    return ""
+
+
+def _pairing_reply_budget_left(gateway) -> bool:
+    """Count one pairing reply against the gateway's daily budget; False once it is spent."""
+    limit = _int_setting(gateway, "pairing_reply_daily_limit", PAIRING_DEFAULT_REPLY_DAILY_LIMIT)
+    if limit <= 0:
+        return False
+    day = int(time.time() // 86400)
+    return _bump_counter(_counter_key("pairing_reply", gateway.name, day), 90000) <= limit
+
+
 def _create_pairing_request(
     gateway, sender_id: str, conversation_id: str | None = None, display_name: str | None = None
 ) -> str:
@@ -868,7 +1136,7 @@ def _create_pairing_request(
     )
     for row in existing or []:
         if row.get("expires_at") and row.get("expires_at") < now:
-            frappe.db.set_value("Gateway Access Entry", row["name"], "state", ENTRY_STATE_EXPIRED)
+            _save_entry(row["name"], {"state": ENTRY_STATE_EXPIRED})
             continue
         return row.get("pairing_code") or ""
 
@@ -889,11 +1157,12 @@ def _create_pairing_request(
     if recent:
         return ""  # cooldown: at most one pairing message per sender per window
 
+    if _pairing_cap_reason(gateway, sender_id):
+        return ""
+
     pairing_code = _new_unique_pairing_code(gateway.name)
-    # pairing_reply_enabled defaults to 1 (on) but doesn't exist on Gateway
-    # docs created before this field was added; getattr keeps those enabled
-    # rather than silently going quiet.
-    reply_enabled = bool(getattr(gateway, "pairing_reply_enabled", 1))
+    # Replies to unknown numbers are opt-in (default OFF) and capped per day.
+    reply_enabled = bool(getattr(gateway, "pairing_reply_enabled", 0)) and _pairing_reply_budget_left(gateway)
     ttl_minutes = int(gateway.pairing_ttl_minutes or 60)
     doc = frappe.get_doc(
         {
@@ -985,6 +1254,9 @@ def _admission(gateway, context: dict[str, Any]) -> tuple[bool, str]:
                 gateway, sender_id, conversation_id=conversation_id, display_name=display_name
             )
             if not code:
+                capped = _pairing_cap_reason(gateway, sender_id)
+                if capped:
+                    return False, f"Sender pairing approval is required ({capped})"
                 return False, "Sender pairing approval is required (pairing code was sent recently)"
             return False, f"Sender pairing approval is required. Pairing code: {_mask_code(code)}"
         return (policy == "Allow list" and _has_access_entry(gateway, "Sender", sender_id), "Sender is not approved for this gateway")
@@ -1086,7 +1358,7 @@ def _approve_gateway_pairing(code_or_entry_name: str, notes: str | None = None, 
     }
     if notes:
         updates["notes"] = notes
-    entry.db_set(updates)
+    _save_entry(entry, updates)
 
     notification_status = "Not attempted"
     try:
@@ -1152,25 +1424,32 @@ def approve_gateway_access_entry(entry_name: str) -> dict:
 
 @frappe.whitelist(methods=["GET"])
 def list_gateway_access_entries(gateway: str | None = None, state: str = "Pending") -> list[dict]:
-    """List Gateway Access Entries, defaulting to the pending-approval queue."""
-    if not frappe.has_permission("Gateway Access Entry", "read"):
-        frappe.throw(_("Not permitted"), frappe.PermissionError)
+    """List Gateway Access Entries, defaulting to the pending-approval queue.
+
+    Admin-only. Pairing codes are masked: approve by entry name from this list,
+    or by the full code the sender received.
+    """
+    _require_gateway_admin()
     filters: dict[str, Any] = {}
     if state:
         filters["state"] = state
     if gateway:
         filters["gateway"] = gateway
-    return frappe.get_all(
+    rows = frappe.get_all(
         "Gateway Access Entry",
         filters=filters,
         fields=[
             "name", "gateway", "provider", "entry_type", "external_id", "pairing_code",
             "state", "expires_at", "display_label", "approved_by", "approved_at",
-            "revoked_at", "notes", "creation",
+            "revoked_at", "revoked_by", "notes", "creation",
         ],
         order_by="creation desc",
         limit_page_length=0,
     )
+    for row in rows:
+        if row.get("pairing_code"):
+            row["pairing_code"] = _mask_code(row["pairing_code"])
+    return rows
 
 
 @frappe.whitelist(methods=["POST"])
@@ -1178,12 +1457,19 @@ def revoke_gateway_access_entry(entry_name: str) -> dict:
     """Revoke an entry, pending or previously approved, denying it going forward.
 
     A revoked sender is blocked: it never gets a new pairing request or run.
+    Revoke never weakens a negative consent state: ``Opted out`` and ``Blocked``
+    entries keep their state (only ``revoked_at``/``revoked_by`` are recorded,
+    and an opted-out sender who later sends START lands on ``Revoked``).
     """
-    if not frappe.has_permission("Gateway Access Entry", "write"):
-        frappe.throw(_("Not permitted"), frappe.PermissionError)
+    _require_gateway_admin()
     entry = frappe.get_doc("Gateway Access Entry", entry_name)
-    entry.db_set({"state": "Revoked", "revoked_at": now_datetime()})
-    return {"name": entry.name, "state": "Revoked"}
+    updates: dict[str, Any] = {"revoked_at": now_datetime(), "revoked_by": frappe.session.user}
+    if entry.state == ENTRY_STATE_OPTED_OUT:
+        updates["previous_state"] = ENTRY_STATE_REVOKED
+    elif entry.state != ENTRY_STATE_BLOCKED:
+        updates["state"] = ENTRY_STATE_REVOKED
+    _save_entry(entry, updates)
+    return {"name": entry.name, "state": entry.state}
 
 
 def cleanup_stale_access_entries() -> dict:
@@ -1196,7 +1482,7 @@ def cleanup_stale_access_entries() -> dict:
         limit_page_length=0,
     )
     for name in expired:
-        frappe.db.set_value("Gateway Access Entry", name, "state", ENTRY_STATE_EXPIRED)
+        _save_entry(name, {"state": ENTRY_STATE_EXPIRED})
     stale = frappe.get_all(
         "Gateway Access Entry",
         filters={
@@ -1258,12 +1544,86 @@ def _conversation_race_errors() -> tuple[type, ...]:
     return (frappe.QueryDeadlockError, frappe.TimestampMismatchError)
 
 
+BUSY_CONVERSATION_MARKER = "currently executing another run"
+_BUSY_ATTEMPTS = 6
+_BUSY_BASE_DELAY = 2.0
+_BUSY_MAX_DELAY = 20.0
+_CONVERSATION_LOCK_WAIT = 90
+_CONVERSATION_LOCK_TTL = 330
+_REQUEUE_MAX = 25
+_PROCESS_JOB_TIMEOUT = 300
+_REQUEUE_TTL = 7200
+
+
+class ConversationBusy(Exception):
+    """The sender's conversation stayed busy for the whole retry budget; the event is re-queued."""
+
+
+def _is_busy_conversation_error(exc: BaseException) -> bool:
+    return isinstance(exc, frappe.ValidationError) and BUSY_CONVERSATION_MARKER in str(exc)
+
+
+def _busy_delay(attempt: int) -> float:
+    return min(_BUSY_BASE_DELAY * (2 ** (attempt - 1)), _BUSY_MAX_DELAY) * random.uniform(0.75, 1.25)
+
+
+def _run_agent_serialised(run_fn, *, lock_key: str, **kwargs):
+    """Run one event's agent turn while holding a per-conversation lock, so messages from the same
+    sender are processed one after another. Waiting too long raises :class:`ConversationBusy`."""
+    try:
+        lock = frappe.cache.lock(lock_key, timeout=_CONVERSATION_LOCK_TTL, blocking_timeout=_CONVERSATION_LOCK_WAIT)
+        acquired = lock.acquire()
+    except Exception:
+        # No lock backend: fall back to the busy-conversation retry alone.
+        return _run_agent_with_retry(run_fn, **kwargs)
+    if not acquired:
+        raise ConversationBusy(f"Conversation {lock_key} is busy")
+    try:
+        return _run_agent_with_retry(run_fn, **kwargs)
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+
+def _requeue_busy_event(event, error: str) -> dict:
+    """Leave the event Queued for another worker pass; fail it only after a bounded number of requeues."""
+    key = f"huf_gw_requeue:{event.name}"
+    count = int(frappe.cache.get_value(key) or 0) + 1
+    frappe.db.rollback()
+    if count > _REQUEUE_MAX:
+        event.db_set({"status": "Failed", "error_message": f"Conversation stayed busy: {error}"[-500:]})
+        _commit_unless_testing()
+        try:
+            _send_fallback_once(event, frappe.get_doc("Gateway", event.gateway), "error")
+            _commit_unless_testing()
+        except Exception:
+            frappe.logger("huf").warning("Busy fallback reply skipped")
+        return {"event_name": event.name, "status": "Failed", "error": "conversation_busy"}
+    frappe.cache.set_value(key, count, expires_in_sec=_REQUEUE_TTL)
+    event.db_set({"status": "Queued", "error_message": f"Conversation busy; retry {count}/{_REQUEUE_MAX}"})
+    _commit_unless_testing()
+    frappe.enqueue(
+        "huf.ai.gateway_service.process_gateway_event",
+        queue="default",
+        timeout=_PROCESS_JOB_TIMEOUT,
+        event_name=event.name,
+        enqueue_after_commit=True,
+    )
+    return {"event_name": event.name, "status": "Queued", "requeued": count}
+
+
 def _run_agent_with_retry(run_fn, **kwargs):
     """Run the agent, retrying with backoff when concurrent same-sender events collide on the
-    conversation row (deadlock / timestamp mismatch) instead of terminally failing the event."""
+    conversation row (deadlock / timestamp mismatch) or the conversation is busy with another run,
+    instead of terminally failing the event. The idempotency key keeps a retry from duplicating a run."""
     import time
 
-    for attempt in range(1, _CONVERSATION_RACE_ATTEMPTS + 1):
+    busy_attempts = 0
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             result = run_fn(**kwargs)
             if attempt > 1 and isinstance(result, dict) and (
@@ -1280,6 +1640,70 @@ def _run_agent_with_retry(run_fn, **kwargs):
                 raise
             frappe.db.rollback()
             time.sleep(_CONVERSATION_RACE_BACKOFF * attempt)
+        except frappe.ValidationError as exc:
+            if not _is_busy_conversation_error(exc):
+                raise
+            busy_attempts += 1
+            if busy_attempts >= _BUSY_ATTEMPTS:
+                raise ConversationBusy(str(exc)) from exc
+            frappe.db.rollback()
+            time.sleep(_busy_delay(busy_attempts))
+
+
+UNSUPPORTED_REPLY = (
+    "Sorry, I can't read this type of message. Please send text, a photo, a document, audio or a location."
+)
+_SILENT_UNSUPPORTED_CODES = (131060,)
+_RECORD_ONLY_KINDS = ("edit", "revoke", "system", "unknown")
+
+
+def _record_event(event, reason: str, **extra) -> dict:
+    """Mark an event Recorded (kept for audit, never routed or run) and log why."""
+    event.db_set({"status": "Recorded", "error_message": reason})
+    frappe.logger("huf").info(f"Gateway event {event.name} recorded: {reason}")
+    return {"event_name": event.name, "status": "Recorded", **extra}
+
+
+def _mark_original_event(gateway_name: str, context: dict[str, Any], kind: str, new_event_id: str) -> None:
+    """edit -> original superseded; revoke -> original revoked (a not-yet-run Queued run is neutralised).
+
+    Only the original's own sender can touch it; anything else is ignored.
+    """
+    original_id = str(context.get("original_message_id") or "")
+    if not original_id:
+        return
+    row = frappe.db.get_value(
+        "Gateway Event",
+        {"idempotency_key": _idempotency_key(gateway_name, original_id)},
+        ["name", "status", "sender_id", "raw_payload"],
+        as_dict=True,
+    )
+    if not row or str(row.get("sender_id") or "") != str(context.get("sender_id") or ""):
+        return
+    raw = row.get("raw_payload")
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = {}
+    raw = dict(raw) if isinstance(raw, dict) else {}
+    values: dict[str, Any] = {}
+    if kind == "revoke":
+        raw["revoked"] = True
+        values["message_text"] = "[deleted by sender]"
+        if row.get("status") in ("Received", "Queued"):
+            values["status"] = "Rejected"
+            values["error_message"] = "revoked_by_sender: deleted before it was processed; no run"
+    else:
+        raw["superseded_by"] = new_event_id
+    values["raw_payload"] = json.dumps(raw)
+    frappe.db.set_value("Gateway Event", row["name"], values)
+
+
+def _handle_record_only(event, gateway_name: str, context: dict[str, Any], kind: str, provider_event_id: str) -> dict:
+    if kind in ("edit", "revoke"):
+        _mark_original_event(gateway_name, context, kind, provider_event_id)
+    return _record_event(event, f"{kind}_recorded: no run")
 
 
 def ingest_gateway_event(
@@ -1327,14 +1751,37 @@ def ingest_gateway_event(
         existing = frappe.db.get_value("Gateway Event", {"idempotency_key": key}, "name")
         return {"duplicate": True, "event_name": existing}
 
+    return _continue_ingest(event, gateway_name, provider_event_id, context, verified_sender)
+
+
+def _continue_ingest(
+    event, gateway_name: str, provider_event_id: str, context: dict[str, Any], verified_sender: bool
+) -> dict:
+    """Everything after the event row exists: reject, record-only, admission, routing, enqueue.
+
+    Split out so the reaper and the dead-letter replay can resume an event that was inserted but
+    never routed, with exactly the same rules as a fresh delivery.
+    """
     if not verified_sender:
         event.db_set({"status": "Rejected", "error_message": "Provider did not verify sender"})
         return {"event_name": event.name, "status": "Rejected"}
+
+    kind = str(context.get("kind") or "message")
+    if kind == "reaction":
+        # Short-circuit: no consent, pairing, admission, rate bucket or run for a reaction.
+        return _record_event(event, REACTION_RECORDED_NOTE, reaction=True)
+    if kind in _RECORD_ONLY_KINDS:
+        # edit/revoke/system/unknown never reach an agent or LLM; edit/revoke only mark the original.
+        return _handle_record_only(event, gateway_name, context, kind, provider_event_id)
 
     gateway = frappe.get_doc("Gateway", gateway_name)
     if not gateway.is_enabled:
         event.db_set({"status": "Rejected", "error_message": "Gateway is disabled"})
         return {"event_name": event.name, "status": "Rejected"}
+    # Rate limit first so a STOP/START or pairing flood cannot bypass the per-sender bucket.
+    limited = _sender_rate_limit_reason(gateway, context)
+    if limited:
+        return _reject_event(event, limited)
     consent = _handle_consent_event(event, gateway, context)
     if consent is not None:
         return consent
@@ -1342,9 +1789,17 @@ def ingest_gateway_event(
     if not admitted:
         event.db_set({"status": "Rejected", "error_message": reason})
         return {"event_name": event.name, "status": "Rejected"}
-    limited = _sender_rate_limit_reason(gateway, context)
-    if limited:
-        return _reject_event(event, limited)
+    if kind == "unsupported":
+        # Fixed reply (or silence for the expected 131060), never an LLM turn.
+        codes = {str(c) for c in (context.get("provider_error_codes") or [])}
+        if not codes & {str(c) for c in _SILENT_UNSUPPORTED_CODES}:
+            _send_plain_reply(
+                gateway,
+                str(context.get("sender_id") or ""),
+                str(context.get("conversation_id") or "") or None,
+                UNSUPPORTED_REPLY,
+            )
+        return _record_event(event, "unsupported_recorded: fixed reply, no run")
 
     route = resolve_gateway_route(gateway_name, context)
     if route["status"] != "Queued":
@@ -1379,38 +1834,326 @@ def _commit_unless_testing() -> None:
 STUCK_RUNNING_MINUTES = 15
 _TERMINAL_STATES = ("Succeeded", "Failed")
 
+# Reaper v2 (WP-5). Every recovery attempt is persisted on the event (``recovery_attempts``) with a
+# ``retry_deadline`` set at the first attempt, so the budget survives cache flushes and restarts.
+QUEUED_STUCK_MINUTES = 10  # Queued, enqueue lost (worker killed / job dropped)
+RECEIVED_STUCK_MINUTES = 5  # inserted but never routed (crash between insert and route)
+RETRYING_STUCK_MINUTES = 10  # reply_status 'retrying' whose retry job is gone
+RECOVERY_MAX_ATTEMPTS = 3
+RECOVERY_DEADLINE_MINUTES = 60
+DEAD_LETTER_PREFIX = "dead_letter:"
+# Callables ``hook(event_name, reason)`` run (best effort) when an event ends Failed because
+# recovery gave up or a worker died. The failure/fallback path (WP-4b) registers the sender notice here.
+REAP_FAILURE_HOOKS: list = []
+
+
+def fail_event_after_budget(event_name: str, reason: str) -> dict:
+    """End an event Failed with ``reason`` and flag it for a sender notice (hooks never raise)."""
+    frappe.db.set_value("Gateway Event", event_name, {"status": "Failed", "error_message": reason[:500]})
+    for hook in list(REAP_FAILURE_HOOKS):
+        try:
+            hook(event_name, reason)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Gateway reaper failure hook failed")
+    return {"event_name": event_name, "status": "Failed", "notify_sender": True, "reason": reason}
+
+
+RECOVERY_RACED = "raced"  # another worker already recovered this event; do nothing
+
+
+def _spend_recovery_attempt(row: dict, now) -> str | None:
+    """Persist one more recovery attempt under a row lock.
+
+    Returns a failure reason when the budget is spent, ``RECOVERY_RACED`` when another worker already
+    handled the event since ``row`` was listed, else None.
+    """
+    fresh = frappe.db.get_value(
+        "Gateway Event",
+        row["name"],
+        ["status", "modified", "recovery_attempts", "retry_deadline"],
+        as_dict=True,
+        for_update=True,
+    )
+    if not fresh or fresh.get("status") != row.get("status") or fresh.get("modified") != row.get("modified"):
+        return RECOVERY_RACED
+    attempts = int(fresh.get("recovery_attempts") or 0)
+    deadline = fresh.get("retry_deadline")
+    if attempts >= RECOVERY_MAX_ATTEMPTS:
+        return f"Recovery gave up after {attempts} attempts; the event was never completed."
+    if deadline and now > deadline:
+        return "Recovery deadline passed before the event completed."
+    values = {"recovery_attempts": attempts + 1}
+    if not deadline:
+        values["retry_deadline"] = add_to_date(now, minutes=RECOVERY_DEADLINE_MINUTES)
+    frappe.db.set_value("Gateway Event", row["name"], values)
+    return None
+
+
+_RECOVERY_FIELDS = [
+    "name", "status", "modified", "received_at", "reply_status", "reply_message_id",
+    "agent_run", "recovery_attempts", "retry_deadline", "gateway",
+]  # fmt: skip
+
+
+def _reply_parts_for_run(agent_run: str) -> list[str]:
+    """Rebuild the reply parts from the finished Agent Run (empty when it cannot be recovered)."""
+    if not agent_run:
+        return []
+    from huf.ai.gateway_adapters import whatsapp_format as wf
+
+    response = frappe.db.get_value("Agent Run", agent_run, "response")
+    if not response:
+        return []
+    return wf.split_body(wf.to_whatsapp(response)) or [response]
+
+
+def _recover_orphaned_events(limit: int = 50) -> int:
+    """Recover Queued / Received orphans and 'retrying' replies whose job is gone (bounded)."""
+    now = now_datetime()
+    recovered = 0
+
+    def fetch(filters):
+        return frappe.get_all(
+            "Gateway Event", filters=filters, fields=_RECOVERY_FIELDS, limit_page_length=limit
+        )
+
+    queued = fetch({"status": "Queued", "modified": ["<", add_to_date(now, minutes=-QUEUED_STUCK_MINUTES)]})
+    received = fetch(
+        {"status": "Received", "modified": ["<", add_to_date(now, minutes=-RECEIVED_STUCK_MINUTES)]}
+    )
+    retrying = fetch(
+        {
+            "status": "Running",
+            "reply_status": "retrying",
+            "modified": ["<", add_to_date(now, minutes=-RETRYING_STUCK_MINUTES)],
+        }
+    )
+    for row in queued + received + retrying:
+        try:
+            reason = _spend_recovery_attempt(row, now)
+            if reason == RECOVERY_RACED:
+                continue
+            if reason:
+                fail_event_after_budget(row["name"], f"{row['status']} orphan: {reason}")
+            elif row["status"] == "Queued":
+                frappe.enqueue(
+                    "huf.ai.gateway_service.process_gateway_event",
+                    queue="default",
+                    timeout=300,
+                    event_name=row["name"],
+                    enqueue_after_commit=True,
+                )
+            elif row["status"] == "Received":
+                try:
+                    _replay_event_ingest(row["name"])
+                except Exception as exc:
+                    _mark_dead_letter(row["name"], exc)
+            else:
+                _recover_retrying_reply(row)
+            recovered += 1
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Gateway orphan recovery failed")
+    return recovered
+
+
+def _recover_retrying_reply(row: dict) -> None:
+    attempts = int(row.get("recovery_attempts") or 0) + 1  # already spent above
+    parts = [] if row.get("reply_message_id") else _reply_parts_for_run(row.get("agent_run") or "")
+    if not parts:
+        fail_event_after_budget(
+            row["name"],
+            "Reply retry lost: the retry job is gone and the unsent part of the reply cannot be rebuilt.",
+        )
+        return
+    frappe.enqueue(
+        "huf.ai.gateway_service.retry_gateway_reply",
+        queue="default",
+        timeout=300,
+        enqueue_after_commit=True,
+        event_name=row["name"],
+        parts_remaining=parts,
+        attempt=1 + attempts,
+        not_before=0,
+    )
+
+
+_FLOW_RUN_TERMINAL = ("Success", "Failed")
+REAPED_PREFIX = "Stuck in Running for over"
+
+
+def _flow_run_is_active(event_name: str) -> bool:
+    """A Flow-routed event whose run is not finished (running, queued or parked on a human) is not stuck."""
+    run = frappe.db.get_value("Gateway Event", event_name, "flow_run")
+    if not run:
+        return False
+    status = frappe.db.get_value("Flow Run", run, "status")
+    return bool(status) and status not in _FLOW_RUN_TERMINAL
+
+
+def _reap_one_stuck(name: str, cutoff, minutes: int) -> bool:
+    """Fail one stuck event under its row lock, unless it moved on since it was listed."""
+    fresh = frappe.db.get_value(
+        "Gateway Event", name, ["status", "modified", "reply_status"], as_dict=True, for_update=True
+    )
+    if (
+        not fresh
+        or fresh.get("status") not in _REAPABLE_STATUSES
+        or fresh.get("reply_status") == "retrying"
+        or not fresh.get("modified")
+        or fresh["modified"] >= cutoff
+        or _flow_run_is_active(name)
+    ):
+        return False
+    fail_event_after_budget(
+        name,
+        f"{REAPED_PREFIX} {minutes} minutes; the worker finished or died without recording a result.",
+    )
+    return True
+
+
+_REAPABLE_STATUSES = ("Running", "Replying")
+
 
 def reap_stuck_gateway_events(minutes: int = STUCK_RUNNING_MINUTES, limit: int = 50) -> int:
-    """Mark events stuck in Running (a lost terminal write / killed worker) as Failed with a reason."""
+    """Recover or fail events a worker lost: stuck Running, orphaned Queued/Received, dead 'retrying' replies."""
     try:
         cutoff = add_to_date(now_datetime(), minutes=-minutes)
         stuck = frappe.get_all(
             "Gateway Event",
             filters={
-                "status": "Running",
+                "status": ["in", list(_REAPABLE_STATUSES)],
                 "modified": ["<", cutoff],
-                # a pending send-only reply retry is legitimately Running; never drop it
+                # a pending send-only reply retry is handled by the retrying recovery below
                 "reply_status": ["!=", "retrying"],
             },
             pluck="name",
             limit_page_length=limit,
         )
-        for name in stuck:
-            frappe.db.set_value(
-                "Gateway Event",
-                name,
-                {
-                    "status": "Failed",
-                    "error_message": f"Stuck in Running for over {minutes} minutes; the worker "
-                    "finished or died without recording a result.",
-                },
-            )
-        if stuck:
+        count = sum(1 for name in stuck if _reap_one_stuck(name, cutoff, minutes))
+        count += _recover_orphaned_events(limit)
+        if count:
             _commit_unless_testing()
-        return len(stuck)
+        return count
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Gateway stuck-event reaper failed")
         return 0
+
+
+# -- ingest dead letters --------------------------------------------------------
+
+
+def _mark_dead_letter(event_name: str, error: BaseException | str) -> None:
+    text = _redact_error_text(str(error))[:400]
+    frappe.db.set_value(
+        "Gateway Event",
+        event_name,
+        {"status": "Failed", "error_message": f"{DEAD_LETTER_PREFIX} ingest failed: {text}"},
+    )
+
+
+def store_ingest_dead_letter(
+    gateway_name: str,
+    provider_event_id: str,
+    context: dict[str, Any],
+    raw_payload: dict[str, Any] | None,
+    error: BaseException | str,
+) -> str:
+    """Keep a deterministically failing delivery as a Failed Gateway Event (dead letter).
+
+    The row carries the redacted raw payload plus the ingest context so ``retry_gateway_event`` can
+    replay it, and uses the normal idempotency key so a provider redelivery or a replay can never
+    create a second event.
+    """
+    key = _idempotency_key(gateway_name, provider_event_id)
+    reason = f"{DEAD_LETTER_PREFIX} ingest failed: {_redact_error_text(str(error))[:400]}"
+    existing = frappe.db.get_value("Gateway Event", {"idempotency_key": key}, ["name", "status"], as_dict=True)
+    if existing:
+        if existing.get("status") in ("Received", "Failed"):
+            frappe.db.set_value("Gateway Event", existing["name"], {"status": "Failed", "error_message": reason})
+        return existing["name"]
+    payload = _redact_payload(raw_payload or {})
+    payload = dict(payload) if isinstance(payload, dict) else {"payload": payload}
+    payload["_replay_context"] = _redact_payload(dict(context or {}))
+    doc = frappe.get_doc(
+        {
+            "doctype": "Gateway Event",
+            "gateway": gateway_name,
+            "idempotency_key": key,
+            "provider_event_id": provider_event_id,
+            "status": "Failed",
+            "received_at": now_datetime(),
+            "verified_sender": 1,
+            "sender_id": str((context or {}).get("sender_id") or ""),
+            "conversation_id": str((context or {}).get("conversation_id") or ""),
+            "thread_id": str((context or {}).get("thread_id") or ""),
+            "message_text": _cap_message_text((context or {}).get("message_text")),
+            "raw_payload": payload,
+            "error_message": reason,
+        }
+    )
+    doc.insert(ignore_permissions=True)
+    return doc.name
+
+
+def _replay_context(event) -> dict[str, Any]:
+    raw = event.raw_payload
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = {}
+    saved = raw.get("_replay_context") if isinstance(raw, dict) else None
+    if isinstance(saved, dict):
+        return saved
+    return {
+        "kind": "message",
+        "sender_id": event.sender_id or "",
+        "conversation_id": event.conversation_id or "",
+        "thread_id": event.thread_id or "",
+        "message_text": event.message_text or "",
+    }
+
+
+def _replay_event_ingest(event_name: str) -> dict:
+    """Resume ingest for an existing event row (same idempotency key, same rules as a fresh delivery)."""
+    event = frappe.get_doc("Gateway Event", event_name)
+    return _continue_ingest(
+        event,
+        event.gateway,
+        event.provider_event_id or "",
+        _replay_context(event),
+        bool(event.verified_sender),
+    )
+
+
+@frappe.whitelist(methods=["POST"])
+def retry_gateway_event(name: str) -> dict:
+    """Admin action: replay an ingest dead letter. Idempotent; only dead letters, only once they are Failed."""
+    _require_gateway_admin()
+    row = frappe.db.get_value(
+        "Gateway Event", name, ["name", "status", "error_message"], as_dict=True, for_update=True
+    )
+    if not row:
+        raise frappe.DoesNotExistError(_("Gateway Event {0} not found").format(name))
+    is_dead = row.get("status") == "Failed" and str(row.get("error_message") or "").startswith(
+        DEAD_LETTER_PREFIX
+    )
+    if not is_dead:
+        if row.get("status") == "Failed":
+            frappe.throw(_("Only ingest dead letters can be replayed."))
+        return {"event_name": name, "replayed": False, "status": row.get("status")}
+    previous_error = row["error_message"]
+    frappe.db.savepoint("gw_replay")
+    frappe.db.set_value("Gateway Event", name, {"status": "Received", "error_message": ""})
+    try:
+        result = _replay_event_ingest(name)
+    except Exception as exc:
+        frappe.db.rollback(save_point="gw_replay")
+        frappe.db.set_value("Gateway Event", name, {"status": "Failed", "error_message": previous_error})
+        frappe.log_error(frappe.get_traceback(), "Gateway dead-letter replay failed")
+        return {"event_name": name, "replayed": False, "status": "Failed", "error": _redact_error_text(str(exc))[:300]}
+    _commit_unless_testing()
+    return {"event_name": name, "replayed": True, "status": result.get("status")}
 
 
 def _persist_terminal_state(event_name: str, result: Any) -> None:
@@ -1430,6 +2173,110 @@ def _persist_terminal_state(event_name: str, result: Any) -> None:
     )
     frappe.db.set_value("Gateway Event", event_name, expected)
     _commit_unless_testing()
+
+
+def _flow_trigger_payload(event, gateway, attachments: list[str]) -> dict:
+    """What a Flow gets for a gateway message: who, where, what, media and reply context."""
+    try:
+        raw = event.raw_payload
+        raw = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        raw = None
+    message = raw.get("message") if isinstance(raw, dict) and isinstance(raw.get("message"), dict) else {}
+    msg_type = str(message.get("type") or "text")
+    context = message.get("context") if isinstance(message.get("context"), dict) else {}
+    interactive = message.get("interactive") if isinstance(message.get("interactive"), dict) else {}
+    reply = interactive.get("button_reply") or interactive.get("list_reply") or {}
+    sender = str(event.sender_id or "")
+    return {
+        "gateway_event": event.name,
+        "gateway": gateway.name,
+        "provider": gateway.provider,
+        "sender_id": sender,
+        "wa_id": sender if gateway.provider == "WhatsApp" else "",
+        "conversation_id": event.conversation_id,
+        "thread_id": event.thread_id,
+        "message_id": event.provider_event_id,
+        "message": event.message_text,
+        "text": event.message_text,
+        "message_type": msg_type,
+        "attachments": list(attachments),
+        "reply_to_message_id": str(context.get("id") or "") or None,
+        "interactive_reply": {"id": reply.get("id"), "title": reply.get("title")} if reply else None,
+    }
+
+
+def _start_flow_for_event(event, gateway) -> dict:
+    """Start the routed Flow once per event; a re-queued or redelivered event never starts a second run."""
+    from huf.ai.flow_engine import create_flow_run
+
+    existing = frappe.db.get_value("Gateway Event", event.name, "flow_run", for_update=True)
+    if existing:
+        event.db_set("status", "Running")
+        return {"event_name": event.name, "status": "Running", "flow_run_id": existing}
+    attachments = _save_whatsapp_media(event, gateway) if gateway.provider == "WhatsApp" else []
+    # Route authorisation already happened (enabled gateway, flow bound by an admin), so the run is
+    # created on the gateway's behalf: the execution user needs no Huf User role.
+    flow_run = create_flow_run(
+        flow_id=event.target_flow,
+        payload=_flow_trigger_payload(event, gateway, attachments),
+        trigger_type="Gateway",
+        ignore_permissions=True,
+    )
+    event.db_set({"flow_run": flow_run.name, "status": "Running"})
+    frappe.enqueue(
+        "huf.ai.flow_engine.run_flow",
+        queue="default",
+        timeout=300,
+        flow_run_name=flow_run.name,
+        enqueue_after_commit=True,
+    )
+    return {"event_name": event.name, "status": "Running", "flow_run_id": flow_run.name}
+
+
+def finish_flow_event(flow_run_name: str, status: str, reply_text: str | None = None, error: str = "") -> None:
+    """Flow Run -> Gateway Event: deliver the Flow's reply through the normal pipeline and sync the status.
+
+    Idempotent: a terminal event is left alone, so a replayed completion never sends twice. Never raises.
+    """
+    try:
+        event_name = frappe.db.get_value("Gateway Event", {"flow_run": flow_run_name}, "name")
+        if not event_name:
+            return
+        locked = frappe.db.get_value(
+            "Gateway Event", event_name, ["status", "error_message"], as_dict=True, for_update=True
+        )
+        current = (locked or {}).get("status")
+        reaped = current == "Failed" and str((locked or {}).get("error_message") or "").startswith(REAPED_PREFIX)
+        if not locked or current in ("Succeeded", "Rejected", "Replying") or (current == "Failed" and not reaped):
+            return
+        event = frappe.get_doc("Gateway Event", event_name)
+        if status != "Success":
+            event.db_set({"status": "Failed", "error_message": _redact_error_text(error or "Flow failed")[-500:]})
+            return
+        # Compare-and-set (row is locked): exactly one completion claims the reply, then sends.
+        event.db_set({"status": "Replying", "error_message": ""})
+        _commit_unless_testing()
+        gateway = frappe.get_doc("Gateway", event.gateway)
+        text = (reply_text or "").strip()
+        if not text or _is_no_reply(text):
+            event.db_set({"status": "Succeeded", **({"reply_status": "suppressed"} if text else {})})
+            return
+        if gateway.provider == "WhatsApp":
+            _send_whatsapp_reply(event, gateway, None, text)
+            return
+        from huf.ai.gateway_webhook import send_gateway_reply
+
+        delivery = send_gateway_reply(gateway, event, text)
+        _record_reply_sent(event, delivery.provider_message_id)
+        event.db_set("status", "Succeeded")
+    except Exception:
+        message = _redact_error_text(frappe.get_traceback())
+        frappe.log_error(message, "Gateway flow completion failed")
+        try:
+            frappe.db.set_value("Gateway Event", {"flow_run": flow_run_name}, {"status": "Failed", "error_message": message[-500:]})
+        except Exception:
+            pass
 
 
 def process_gateway_event(event_name: str) -> dict:
@@ -1509,6 +2356,7 @@ def _process_gateway_event(event_name: str) -> dict:
             from huf.ai.gateway_webhook import send_gateway_reply
 
             attachment_note = _describe_attachments(event.raw_payload)
+            saved_files: list[str] = []
             if gateway.provider == "WhatsApp":
                 saved_files = _save_whatsapp_media(event, gateway)
                 if saved_files:
@@ -1516,24 +2364,48 @@ def _process_gateway_event(event_name: str) -> dict:
                         [attachment_note] * bool(attachment_note)
                         + [f"[Attachment saved: {file_url}]" for file_url in saved_files]
                     )
-            prompt = f"{attachment_note}\n{event.message_text}" if attachment_note else event.message_text
+            media_type = _inbound_media_type(event) if gateway.provider == "WhatsApp" else None
+            # The agent is the only responder for an unsaved attachment; the standalone note is sent
+            # only if the run fails or yields no reply.
+            attachment_unavailable = bool(media_type and not saved_files)
+            fallback_kind = "attachment" if attachment_unavailable else "error"
+            if attachment_unavailable:
+                attachment_note = "\n".join([attachment_note] * bool(attachment_note) + [ATTACHMENT_UNAVAILABLE_NOTE])
+            media_files: list = []
+            media_prep_result = None
+            if saved_files:
+                from huf.ai import media_prep
+
+                media_prep_result = media_prep.prepare_media_for_agent(
+                    media_prep.resolve_event_files(event.name, saved_files), event.target_agent
+                )
+                media_files = media_prep_result.files
+            if media_prep_result:
+                prompt = media_prep.build_prompt(attachment_note, event.message_text, media_prep_result)
+            else:
+                prompt = f"{attachment_note}\n{event.message_text}" if attachment_note else event.message_text
 
             fallback_note = ""
             _maybe_mark_read_typing(event, gateway)
             _commit_unless_testing()  # keep Running status and saved media across a retry rollback
-            result = _run_agent_with_retry(
+            result = _run_agent_serialised(
                 run_agent_sync,
+                lock_key=f"huf_gw_conv:{gateway.name}:{event.thread_id or event.conversation_id or event.sender_id}",
                 agent_name=event.target_agent,
                 prompt=prompt,
                 channel_id=f"gateway:{gateway.name}",
                 external_id=event.thread_id or event.conversation_id or event.sender_id,
                 now=True,
                 client_idempotency_key=f"gateway-event:{event.name}",
+                files=media_files or None,
             )
             failure = _agent_run_failure(result)
             if failure:
-                return _fail_event_for_agent_run(event, gateway, result, *failure)
+                return _fail_event_for_agent_run(event, gateway, result, *failure, fallback_kind=fallback_kind)
             response = result.get("response")
+            if attachment_unavailable and (_is_no_reply(response) or not str(response or "").strip()):
+                _send_fallback_once(event, gateway, "attachment")
+                return _suppress_reply(event, result.get("agent_run_id"), NO_REPLY_NOTE)
             if _is_no_reply(response):
                 return _suppress_reply(event, result.get("agent_run_id"), NO_REPLY_NOTE)
             if gateway.provider == "WhatsApp":
@@ -1581,6 +2453,7 @@ def _process_gateway_event(event_name: str) -> dict:
             }
 
         if event.target_type == "Flow":
+<<<<<<< HEAD
             from huf.ai.flow_engine import create_flow_run
 
             # TODO(#473-followup): Gateway trigger_type is temporarily removed from
@@ -1606,8 +2479,13 @@ def _process_gateway_event(event_name: str) -> dict:
                 enqueue_after_commit=True,
             )
             return {"event_name": event.name, "status": "Queued", "flow_run_id": flow_run.name}
+=======
+            return _start_flow_for_event(event, gateway)
+>>>>>>> origin/pre-develop
 
         raise frappe.ValidationError(_("Gateway event has no valid target."))
+    except ConversationBusy as busy:
+        return _requeue_busy_event(event, str(busy))
     except Exception:
         message = _redact_error_text(frappe.get_traceback())
         # GW-06: a failure here (e.g. send_gateway_reply raising after a
@@ -1621,6 +2499,12 @@ def _process_gateway_event(event_name: str) -> dict:
         event.db_set({"status": "Failed", "error_message": message[-500:]})
         frappe.db.commit()
         frappe.log_error(message, "Gateway event failed")
+        if not getattr(event, "reply_message_id", ""):
+            try:
+                if _send_fallback_once(event, frappe.get_doc("Gateway", event.gateway), "error"):
+                    frappe.db.commit()
+            except Exception:
+                pass
         raise
 
 
@@ -1698,8 +2582,41 @@ def _send_whatsapp_reply(event, gateway, agent_run_id, response: str) -> dict:
         event.db_set("agent_run", agent_run_id)
     if event.sender_id and is_opted_out(gateway, event.sender_id):
         return _suppress_reply(event, agent_run_id, "Recipient opted out: reply not sent")
+    from huf.ai import whatsapp_voice_reply as voice
+
+    mode = voice.reply_mode(event, gateway, response)
+    if mode == voice.VOICE_ONLY:
+        if event.reply_message_id or _send_voice_only(event, gateway, response):
+            return _finish_voice_only(event, gateway)
     parts = wf.split_body(wf.to_whatsapp(response)) or [response]
-    return _attempt_reply_parts(event, gateway, parts, 1)
+    result = _attempt_reply_parts(event, gateway, parts, 1)
+    if mode == voice.TEXT_AND_VOICE and result.get("status") == "Succeeded":
+        voice.send_voice_reply(event, gateway, response, quote=False, once=True)
+    return result
+
+
+def _send_voice_only(event, gateway, response: str) -> bool:
+    from huf.ai import whatsapp_voice_reply as voice
+
+    _throttle_outbound_send(gateway.name, _outbound_rate_cap(gateway.provider))
+    wamid = voice.send_voice_reply(event, gateway, response)
+    _record_reply_sent(event, wamid)
+    return bool(wamid)
+
+
+def _finish_voice_only(event, gateway) -> dict:
+    from huf.ai.gateway_webhook import touch_last_event
+
+    event.db_set({"status": "Succeeded", "delivery_error": ""})
+    touch_last_event(gateway)
+    return {
+        "event_name": event.name,
+        "status": "Succeeded",
+        "agent_run_id": event.agent_run,
+        "provider_message_id": event.reply_message_id,
+        "attempts": 1,
+        "voice": True,
+    }
 
 
 def _attempt_reply_parts(event, gateway, parts: list[str], attempt: int) -> dict:
@@ -1818,6 +2735,8 @@ def retry_gateway_reply(event_name: str, parts_remaining: list[str], attempt: in
     if wait > 0:
         # Not due yet: hop back onto the queue instead of holding a worker for the whole backoff.
         _sleep(min(wait, _RETRY_POLL_SECONDS))
+        # Keep the event looking alive to the reaper while it waits out the backoff.
+        frappe.db.set_value("Gateway Event", event_name, "modified", now_datetime(), update_modified=False)
         frappe.enqueue(
             "huf.ai.gateway_service.retry_gateway_reply",
             queue="default",
@@ -1829,7 +2748,8 @@ def retry_gateway_reply(event_name: str, parts_remaining: list[str], attempt: in
             not_before=not_before,
         )
         return {"event_name": event_name, "deferred": True}
-    if not frappe.cache().set(f"huf_gw_reply_retry:{event_name}:{attempt}", 1, ex=_RETRY_CLAIM_SECONDS, nx=True):
+    claim_key = f"huf_gw_reply_retry:{event_name}"  # one in-flight retry per event, whatever the attempt
+    if not frappe.cache().set(claim_key, 1, ex=_RETRY_CLAIM_SECONDS, nx=True):
         return {"event_name": event_name, "skipped": True}
 
     gateway = frappe.get_doc("Gateway", event.gateway)
@@ -1844,6 +2764,8 @@ def retry_gateway_reply(event_name: str, parts_remaining: list[str], attempt: in
         event.db_set({"status": "Failed", "reply_status": "failed", "error_message": message[-500:]})
         frappe.log_error(message, "Gateway reply retry failed")
         return {"event_name": event_name, "status": "Failed"}
+    finally:
+        frappe.cache().delete(claim_key)
 
 
 @frappe.whitelist(methods=["POST"])

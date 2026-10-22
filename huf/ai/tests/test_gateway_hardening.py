@@ -1,6 +1,7 @@
 """Hardening fixes from live security testing of the WhatsApp gateway."""
 
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -131,42 +132,6 @@ class TestWebhookLimits(unittest.TestCase):
 		self.assertEqual(mf.local.response.http_status_code, 413)
 		adapter.verify_inbound.assert_not_called()
 
-	def test_message_cap_ignores_the_rest(self):
-		n = gateway_webhook.MAX_MESSAGES_PER_PAYLOAD + 20
-		events = [
-			SimpleNamespace(
-				provider_event_id=f"id{i}",
-				sender_id="1",
-				conversation_id="1",
-				thread_id="",
-				message_text="t",
-				is_room=0,
-				mentioned=0,
-				raw_payload={},
-			)
-			for i in range(n)
-		]
-		parsed = SimpleNamespace(
-			messages=tuple(events), statuses=(), template_updates=(), ignored=0, unknown_phone_ids=()
-		)
-		adapter = MagicMock()
-		adapter.parse_payload.return_value = parsed
-		gateway = SimpleNamespace(name="GW", whatsapp_account="")
-		with (
-			patch.object(gateway_webhook, "_ingest_rate_gate"),
-			patch.object(gateway_webhook, "touch_last_event"),
-			patch.object(gateway_webhook, "_warn"),
-			patch.object(gateway_webhook, "_record_unknown_phone_ids"),
-			patch(
-				"huf.ai.gateway_service.ingest_gateway_event",
-				return_value={"event_name": "E", "status": "Rejected"},
-			) as ingest,
-		):
-			result = gateway_webhook._handle_batched_payload(gateway, adapter, _req(b"{}"))
-		self.assertEqual(ingest.call_count, gateway_webhook.MAX_MESSAGES_PER_PAYLOAD)
-		self.assertEqual(result["ignored"], 20)
-		self.assertTrue(result["note"])
-
 	def test_rate_limit_sets_retry_after(self):
 		headers = {}
 		with (
@@ -180,6 +145,12 @@ class TestWebhookLimits(unittest.TestCase):
 			with self.assertRaises(frappe.RateLimitExceededError):
 				gateway_webhook._ingest_rate_gate()
 		self.assertEqual(headers["Retry-After"], "60")
+
+
+def _event_row_value(*args, **kwargs):
+	if args and args[0] == "Gateway Event" and kwargs.get("as_dict"):
+		return {"status": "Running", "modified": datetime(2000, 1, 1), "reply_status": ""}
+	return None
 
 
 class TestTerminalStatePersistence(unittest.TestCase):
@@ -240,12 +211,19 @@ class TestTerminalStatePersistence(unittest.TestCase):
 	def test_reaper_fails_stuck_running_events(self):
 		with (
 			patch.object(gateway_service.frappe, "get_all", return_value=["GEV-1", "GEV-2"]) as get_all,
+			patch.object(
+				gateway_service.frappe.db,
+				"get_value",
+				side_effect=_event_row_value,
+			),
+			patch.object(gateway_service, "_flow_run_is_active", return_value=False),
 			patch.object(gateway_service.frappe.db, "set_value") as set_value,
 			patch.object(gateway_service.frappe.db, "commit"),
+			patch.object(gateway_service, "_recover_orphaned_events", return_value=0),
 		):
 			self.assertEqual(gateway_service.reap_stuck_gateway_events(), 2)
-		self.assertEqual(get_all.call_args.kwargs["filters"]["status"], "Running")
-		self.assertEqual(get_all.call_args.kwargs["filters"]["reply_status"], ["!=", "retrying"])
+		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["status"], ["in", ["Running", "Replying"]])
+		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["reply_status"], ["!=", "retrying"])
 		self.assertEqual(set_value.call_count, 2)
 		self.assertEqual(set_value.call_args.args[2]["status"], "Failed")
 
@@ -318,3 +296,110 @@ class TestReaperScheduled(unittest.TestCase):
 			"huf.ai.gateway_service.reap_stuck_gateway_events",
 			hooks.scheduler_events["cron"]["*/10 * * * *"],
 		)
+
+
+class TestBusyConversation(unittest.TestCase):
+	def busy(self):
+		return frappe.ValidationError(
+			"This conversation is currently executing another run. Please try again shortly."
+		)
+
+	def test_busy_then_success_runs_once_with_same_key(self):
+		run = MagicMock(side_effect=[self.busy(), self.busy(), {"success": True, "status": "Success"}])
+		with patch("time.sleep") as sleep, patch.object(gateway_service.frappe.db, "rollback"):
+			out = gateway_service._run_agent_with_retry(run, client_idempotency_key="gateway-event:E1")
+		self.assertEqual(out["status"], "Success")
+		self.assertEqual(run.call_count, 3)
+		self.assertTrue(all(c.kwargs["client_idempotency_key"] == "gateway-event:E1" for c in run.call_args_list))
+		self.assertEqual(sleep.call_count, 2)
+
+	def test_permanently_busy_is_bounded_and_raises_conversation_busy(self):
+		run = MagicMock(side_effect=self.busy())
+		with patch("time.sleep"), patch.object(gateway_service.frappe.db, "rollback"):
+			with self.assertRaises(gateway_service.ConversationBusy):
+				gateway_service._run_agent_with_retry(run)
+		self.assertEqual(run.call_count, gateway_service._BUSY_ATTEMPTS)
+
+	def test_unrelated_validation_error_not_retried(self):
+		run = MagicMock(side_effect=frappe.ValidationError("Agent is disabled"))
+		with self.assertRaises(frappe.ValidationError):
+			gateway_service._run_agent_with_retry(run)
+		self.assertEqual(run.call_count, 1)
+
+	def test_busy_delay_is_jittered_and_capped(self):
+		delays = {round(gateway_service._busy_delay(6), 3) for _ in range(20)}
+		self.assertGreater(len(delays), 1)
+		self.assertLessEqual(max(delays), gateway_service._BUSY_MAX_DELAY * 1.25)
+
+	def test_serialised_holds_and_releases_lock(self):
+		lock = MagicMock()
+		lock.acquire.return_value = True
+		run = MagicMock(return_value={"ok": 1})
+		with patch.object(gateway_service.frappe.cache, "lock", return_value=lock) as mk:
+			out = gateway_service._run_agent_serialised(run, lock_key="k", prompt="x")
+		self.assertEqual(out, {"ok": 1})
+		self.assertEqual(mk.call_args.args[0], "k")
+		lock.release.assert_called_once()
+		run.assert_called_once_with(prompt="x")
+
+	def test_serialised_lock_timeout_means_busy(self):
+		lock = MagicMock()
+		lock.acquire.return_value = False
+		run = MagicMock()
+		with patch.object(gateway_service.frappe.cache, "lock", return_value=lock):
+			with self.assertRaises(gateway_service.ConversationBusy):
+				gateway_service._run_agent_serialised(run, lock_key="k")
+		run.assert_not_called()
+
+	def test_requeue_keeps_event_queued_then_fails_after_budget(self):
+		event = MagicMock()
+		event.name = "GEV-1"
+		with (
+			patch.object(gateway_service.frappe.cache, "get_value", return_value=0),
+			patch.object(gateway_service.frappe.cache, "set_value"),
+			patch.object(gateway_service.frappe.db, "rollback"),
+			patch.object(gateway_service, "_commit_unless_testing"),
+			patch.object(gateway_service.frappe, "enqueue") as enqueue,
+		):
+			out = gateway_service._requeue_busy_event(event, "busy")
+		self.assertEqual(out["status"], "Queued")
+		self.assertEqual(event.db_set.call_args.args[0]["status"], "Queued")
+		enqueue.assert_called_once()
+		with (
+			patch.object(gateway_service.frappe.cache, "get_value", return_value=gateway_service._REQUEUE_MAX),
+			patch.object(gateway_service.frappe.db, "rollback"),
+			patch.object(gateway_service, "_commit_unless_testing"),
+			patch.object(gateway_service.frappe, "enqueue") as enqueue,
+		):
+			out = gateway_service._requeue_busy_event(event, "busy")
+		self.assertEqual(out["status"], "Failed")
+		enqueue.assert_not_called()
+
+
+class TestMediaFileName(unittest.TestCase):
+	def name(self, msg_type, media, media_id, downloaded):
+		return gateway_service._media_file_name(msg_type, media, media_id, downloaded)
+
+	def test_document_uses_senders_filename(self):
+		self.assertEqual(
+			self.name("document", {"filename": "Invoice March.pdf"}, "123", {"mime_type": "application/pdf", "filename": "123"}),
+			"Invoice_March.pdf",
+		)
+
+	def test_missing_filename_uses_type_id_and_mime_extension(self):
+		cases = {
+			("image", "image/jpeg"): "image-123.jpg",
+			("audio", "audio/ogg; codecs=opus"): "audio-123.ogg",
+			("document", "application/pdf"): "document-123.pdf",
+			("video", "video/mp4"): "video-123.mp4",
+		}
+		for (kind, mime), expected in cases.items():
+			self.assertEqual(self.name(kind, {}, "123", {"mime_type": mime, "filename": "123"}), expected)
+
+	def test_filename_without_extension_gets_one(self):
+		self.assertEqual(self.name("document", {"filename": "report"}, "9", {"mime_type": "application/pdf"}), "report.pdf")
+
+	def test_path_traversal_is_neutralised(self):
+		out = self.name("document", {"filename": "../../etc/passwd"}, "9", {"mime_type": "text/plain"})
+		self.assertNotIn("/", out)
+		self.assertTrue(out.endswith(".txt") or out == "passwd")

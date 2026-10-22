@@ -1,3 +1,5 @@
+import json
+
 import frappe
 from frappe import _
 from frappe.model.document import Document
@@ -46,6 +48,7 @@ class Gateway(Document):
         self._validate_fallback_template()
         self._validate_consent_settings()
         self._validate_reply_settings()
+        self._validate_send_scope()
 
         # ST-04.4: Validate required credentials are set
         if self.is_enabled and self.provider:
@@ -103,8 +106,33 @@ class Gateway(Document):
             return  # frappe_whatsapp absent: the link is inert, nothing to validate against
         if not frappe.db.exists("WhatsApp Account", account):
             frappe.throw(_("WhatsApp Account {0} does not exist.").format(account))
+
+        # One account (and so one token) per enabled gateway: gateway B must not send with A's token.
+        shared = frappe.db.get_value(
+            "Gateway",
+            {
+                "provider": "WhatsApp",
+                "is_enabled": 1,
+                "whatsapp_account": account,
+                "name": ["!=", self.name or ""],
+            },
+            "name",
+        )
+        if shared:
+            frappe.throw(
+                _("WhatsApp Account {0} is already linked to the enabled gateway {1}. Each enabled gateway needs its own account.").format(
+                    account, shared
+                )
+            )
+
         account_phone = str(frappe.db.get_value("WhatsApp Account", account, "phone_id") or "").strip()
-        if self.phone_number_id and account_phone != self.phone_number_id:
+        if not self.phone_number_id:
+            frappe.throw(
+                _("Add the phone_number_id credential to this gateway's integration before linking WhatsApp Account {0}.").format(
+                    account
+                )
+            )
+        if account_phone != self.phone_number_id:
             frappe.throw(
                 _(
                     "WhatsApp Account {0} uses phone number ID {1}, but this gateway's integration uses {2}. "
@@ -113,10 +141,12 @@ class Gateway(Document):
             )
 
     def _validate_fallback_template(self):
-        """The fallback template is sent with no parameters, so it must have no variables.
+        """The fallback template may have body variables but no media/location header.
 
-        Checked only when frappe_whatsapp is installed, an account is linked and the template row
-        is already known; otherwise it cannot be verified here (health warns about it instead).
+        Body variables are filled from ``fallback_template_params`` (or the contact name by default); when
+        params are configured their count must match the template's variables. Checked only when
+        frappe_whatsapp is installed, an account is linked and the template row is already known;
+        otherwise it cannot be verified here (health warns about it instead).
         """
         if self.provider != "WhatsApp":
             return
@@ -137,22 +167,36 @@ class Gateway(Document):
             return  # not found yet / ambiguous language: nothing to verify
         if not row or row.get("whatsapp_account") != account:
             return
-        texts = [row.get("template"), row.get("header")] + [
-            b.get("website_url") for b in row.get("buttons") or []
-        ]
         media_header = str(row.get("header_format") or row.get("header_type") or "").upper() in {
             "IMAGE",
             "VIDEO",
             "DOCUMENT",
             "LOCATION",
         }
-        if media_header or any(variables(t or "") for t in texts):
+        header_vars = variables(row.get("header") or "")
+        url_vars = any(variables(b.get("website_url") or "") for b in row.get("buttons") or [])
+        if media_header or header_vars or url_vars:
             frappe.throw(
                 _(
-                    "The fallback template can't have variables (it is sent without values). "
-                    "Pick a template with plain text."
+                    "The fallback template can't have a media, location or variable header, or a button URL "
+                    "variable (only body variables are filled). Pick a template with a plain header."
                 )
             )
+        params = (self.get("fallback_template_params") or "").strip()
+        if params:
+            try:
+                parsed = json.loads(params)
+            except ValueError:
+                parsed = None
+            if not isinstance(parsed, (list, dict)):
+                frappe.throw(_("Fallback template params must be a JSON list or a {name: value} map."))
+            expected = len(variables(row.get("template") or ""))
+            if len(parsed) != expected:
+                frappe.throw(
+                    _("The fallback template has {0} body variable(s) but {1} param(s) are configured.").format(
+                        expected, len(parsed)
+                    )
+                )
 
     def _validate_required_credentials(self):
         """Verify that required credentials per the adapter schema are configured.
@@ -274,8 +318,33 @@ class Gateway(Document):
         text = (self.get("error_reply_text") or "").strip()
         if len(text) > 1000:
             frappe.throw(_("Error reply text must be 1000 characters or fewer."))
+        if self.get("voice_reply_mode") not in (None, "", "Off", "Voice only", "Text and voice"):
+            frappe.throw(_("Voice note replies must be Off, Voice only or Text and voice."))
+        if self.get("voice_reply_mode") in ("Voice only", "Text and voice") and self.provider != "WhatsApp":
+            frappe.throw(_("Voice note replies are only available for WhatsApp gateways."))
         if self.get("preview_url") not in (None, "", "Default (off)", "On", "Off"):
             frappe.throw(_("Link previews must be Default (off), On or Off."))
+
+    def _validate_send_scope(self):
+        """Agent send scope (WhatsApp): a known scope, a real allow-list when chosen, non-negative caps."""
+        if self.provider != "WhatsApp":
+            return
+        from huf.ai import whatsapp_send_scope as send_scope
+
+        scope = self.get("agent_recipient_scope") or send_scope.DEFAULT_SCOPE
+        if scope not in send_scope.SCOPES:
+            frappe.throw(_("Agent recipient scope must be one of: {0}.").format(", ".join(send_scope.SCOPES)))
+        raw = self.get("agent_recipient_allowlist") or ""
+        if str(raw).strip():
+            bad = send_scope.invalid_allowlist_entries(raw)
+            if bad:
+                frappe.throw(_("Not a phone number in the allowed recipients: {0}").format(", ".join(bad)))
+        if scope == "Allow-list" and not send_scope.parse_allowlist(raw):
+            frappe.throw(_("Add at least one number to the allowed recipients, or choose another recipient scope."))
+        for field, label in (("agent_send_cap_per_run", _("Agent sends per run")), ("agent_send_cap_per_day", _("Agent sends per day"))):
+            value = self.get(field)
+            if value is not None and int(value) < 0:
+                frappe.throw(_("{0} must be 0 (no limit) or more.").format(label))
 
     def _validate_consent_settings(self):
         limit = self.get("inbound_sender_limit")

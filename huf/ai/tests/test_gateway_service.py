@@ -434,28 +434,17 @@ class TestPairingReplyEnabled(unittest.TestCase):
 
     @patch("huf.ai.gateway_webhook._adapter_class_for_provider")
     @patch("huf.ai.gateway_service.frappe")
-    def test_reply_defaults_to_enabled_on_gateways_without_the_field(self, mock_frappe, mock_adapter_cls):
-        """Gateway docs created before pairing_reply_enabled existed have no
-        such attribute at all; getattr's default must keep them behaving as
-        "on" rather than silently going quiet."""
+    def test_reply_defaults_to_disabled_on_gateways_without_the_field(self, mock_frappe, mock_adapter_cls):
+        """Replies to unknown numbers are opt-in: no field means no reply (the entry is still created)."""
         mock_frappe.get_all.return_value = []
         mock_frappe.get_doc.side_effect = self._get_doc_side_effect
-        adapter = MagicMock()
-        # Two-level wiring: _adapter_class_for_provider returns a class,
-        # the code instantiates it, so the returned instance must be adapter.
-        mock_adapter_cls.return_value.return_value = adapter
 
         gw = gateway(direct_policy="Pairing", integration_settings="INT-001")
         assert not hasattr(gw, "pairing_reply_enabled")
         code = gateway_service._create_pairing_request(gw, "42")
 
-        mock_adapter_cls.assert_called_once_with("Telegram")
-        adapter.send_reply.assert_called_once()
-        call_args = adapter.send_reply.call_args
-        reply = call_args[0][0]
-        assert isinstance(reply, GatewayReply)
-        assert reply.conversation_id == "42"
-        assert code in reply.text
+        assert code
+        mock_adapter_cls.assert_not_called()
 
 
 class TestApproveGatewayPairing(unittest.TestCase):
@@ -487,7 +476,7 @@ class TestApproveGatewayPairing(unittest.TestCase):
 
         assert result["state"] == "Approved"
         assert result["name"] == entry.name
-        entry.db_set.assert_called_once_with(
+        entry.update.assert_called_once_with(
             {
                 "state": "Approved",
                 "approved_by": "admin@example.com",
@@ -495,6 +484,7 @@ class TestApproveGatewayPairing(unittest.TestCase):
                 "expires_at": None,
             }
         )
+        entry.save.assert_called_once()
 
     @patch("huf.ai.gateway_service.frappe")
     def test_approve_falls_back_to_legacy_entry_name(self, mock_frappe):
@@ -539,7 +529,7 @@ class TestApproveGatewayPairing(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             gateway_service.approve_gateway_pairing("PAIR-7A9KXM4Q", gateway="GW")
-        entry.db_set.assert_not_called()
+        entry.save.assert_not_called()
 
     @patch("huf.ai.gateway_service.frappe")
     def test_already_approved_entry_is_rejected(self, mock_frappe):
@@ -555,7 +545,7 @@ class TestApproveGatewayPairing(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             gateway_service.approve_gateway_pairing("PAIR-7A9KXM4Q", gateway="GW")
-        entry.db_set.assert_not_called()
+        entry.save.assert_not_called()
 
     @patch("huf.ai.gateway_service.frappe")
     def test_approval_denied_without_write_permission(self, mock_frappe):
@@ -587,7 +577,7 @@ class TestApproveGatewayAccessEntryAlias(unittest.TestCase):
         result = gateway_service.approve_gateway_access_entry("ACCESS-001")
 
         assert result == {"name": "ACCESS-001", "state": "Approved"}
-        entry.db_set.assert_called_once_with(
+        entry.update.assert_called_once_with(
             {
                 "state": "Approved",
                 "approved_by": "admin@example.com",
@@ -595,9 +585,15 @@ class TestApproveGatewayAccessEntryAlias(unittest.TestCase):
                 "expires_at": None,
             }
         )
+        entry.save.assert_called_once()
 
 
 class TestListGatewayAccessEntries(unittest.TestCase):
+    def setUp(self):
+        self._admin = patch("huf.ai.gateway_service._is_gateway_admin", return_value=True)
+        self._admin.start()
+        self.addCleanup(self._admin.stop)
+
     @patch("huf.ai.gateway_service.frappe")
     def test_defaults_to_pending_state(self, mock_frappe):
         mock_frappe.has_permission.return_value = True
@@ -621,7 +617,10 @@ class TestListGatewayAccessEntries(unittest.TestCase):
 
     @patch("huf.ai.gateway_service.frappe")
     def test_denied_without_read_permission(self, mock_frappe):
-        mock_frappe.has_permission.return_value = False
+        self._admin.stop()
+        self.addCleanup(self._admin.start)
+        patch("huf.ai.gateway_service._is_gateway_admin", return_value=False).start()
+        self.addCleanup(patch.stopall)
         mock_frappe.PermissionError = PermissionError
         mock_frappe.throw.side_effect = PermissionError("Not permitted")
 
@@ -630,6 +629,11 @@ class TestListGatewayAccessEntries(unittest.TestCase):
 
 
 class TestRevokeGatewayAccessEntry(unittest.TestCase):
+    def setUp(self):
+        self._admin = patch("huf.ai.gateway_service._is_gateway_admin", return_value=True)
+        self._admin.start()
+        self.addCleanup(self._admin.stop)
+
     @patch("huf.ai.gateway_service.now_datetime", return_value=datetime(2026, 7, 26, 0, 0, 0))
     @patch("huf.ai.gateway_service.frappe")
     def test_revoke_sets_state_and_timestamp(self, mock_frappe, mock_now):
@@ -639,12 +643,16 @@ class TestRevokeGatewayAccessEntry(unittest.TestCase):
 
         result = gateway_service.revoke_gateway_access_entry(entry.name)
 
-        assert result == {"name": entry.name, "state": "Revoked"}
-        entry.db_set.assert_called_once_with({"state": "Revoked", "revoked_at": mock_now.return_value})
+        assert result == {"name": entry.name, "state": entry.state}
+        entry.save.assert_called_once()
+        updates = entry.update.call_args.args[0]
+        assert updates["state"] == "Revoked" and updates["revoked_at"] == mock_now.return_value
 
     @patch("huf.ai.gateway_service.frappe")
     def test_revoke_denied_without_write_permission(self, mock_frappe):
-        mock_frappe.has_permission.return_value = False
+        self._admin.stop()
+        patch("huf.ai.gateway_service._is_gateway_admin", return_value=False).start()
+        self.addCleanup(patch.stopall)
         mock_frappe.PermissionError = PermissionError
         mock_frappe.throw.side_effect = PermissionError("Not permitted")
 
@@ -1065,8 +1073,8 @@ class TestApproveGatewayPairingIntegration(IntegrationTestCase):
         pending = gateway_service.list_gateway_access_entries(gateway=gw, state="Pending")
         approved = gateway_service.list_gateway_access_entries(gateway=gw, state="Approved")
 
-        assert any(row["pairing_code"] == "PAIR-LIST" for row in pending)
-        assert not any(row["pairing_code"] == "PAIR-LIST" for row in approved)
+        assert any(row["pairing_code"] == "*********ST" or row["pairing_code"].endswith("ST") and "*" in row["pairing_code"] for row in pending)
+        assert not any(row["pairing_code"] == "PAIR-LIST" for row in approved + pending)
 
 
 class TestWhatsAppGatewayService(unittest.TestCase):
