@@ -6,6 +6,7 @@ Behaviour is taken from code; file references name the source of truth. Setup gu
 ## 1. Access token expiry and rotation
 
 - Meta error 190 means the token is invalid or expired (`huf/ai/gateway_adapters/whatsapp_errors.py`).
+- Rotate the token in BOTH places: the gateway's integration credential `access_token` (used for agent replies) and the linked WhatsApp Account `token` (used by the bridge: confirmations, templates, management). If only one is refreshed, some sends work and others fail with 131005/190.
 - Token check: `check_token(gateway_name, force)` in `huf/ai/whatsapp_management.py` (POST, whitelisted).
   It calls Meta `debug_token` and `subscribed_apps` (`huf/ai/whatsapp_token_check.py`). The result
   is cached for 600 s and live checks are limited to one per 10 s. `force` bypasses the cache.
