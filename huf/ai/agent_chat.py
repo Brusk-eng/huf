@@ -11,6 +11,7 @@ logger = frappe.logger("huf")
 
 from huf.ai import audio_service
 from huf.ai import conversation_fork
+from huf.ai import media_prep
 from huf.ai import sdk_tools
 from huf.ai.agent_access import assert_agent_access
 from huf.ai.agent_integration import _is_truthy, _resolve_effective_model, _run_async_safely, run_agent_sync
@@ -1013,9 +1014,9 @@ def prepare_message_with_file_web(
     if not resolved_file_url:
         resolved_file_url = frappe.db.get_value("File", resolved_file_id, "file_url")
 
-    mime_type, _unused = mimetypes.guess_type(resolved_filename)
-    is_image = bool(mime_type and mime_type.startswith("image/"))
-    is_audio = audio_service.is_audio_file(resolved_filename, mime_type)
+    media_kind = media_prep.classify_media(resolved_filename)
+    is_image = media_kind == "image"
+    is_audio = media_kind == "audio"
 
     agent_prompt = display_content
     files_payload = None
@@ -1082,14 +1083,10 @@ def prepare_message_with_file_web(
         extracted_text = result.get("text") or ""
         file_hash = result.get("file_hash", "n/a")
         if extracted_text:
-            agent_prompt = f"""{display_content}
-
-Attached File Content (OCR Extracted):
-The following text was extracted from attached files. Use this as context:
-
---- File: {resolved_filename} (hash: {file_hash}) ---
-{extracted_text}
-"""
+            extracted_text, _cut = media_prep.cap_text(extracted_text, media_prep.MAX_DOC_TEXT_CHARS)
+            agent_prompt = f"{display_content}\n\n" + media_prep.format_document_block(
+                resolved_filename, extracted_text, file_hash
+            )
 
     return {
         "success": True,
