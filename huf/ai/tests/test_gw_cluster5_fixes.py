@@ -269,28 +269,31 @@ class TestWhatsAppGetAccountInfoErrorHandling(unittest.TestCase):
 		mock.json.return_value = payload
 		return mock
 
+	@patch("huf.ai.tools.whatsapp._graph_root", return_value="https://graph.test/v1")
 	@patch("huf.ai.tools.whatsapp._get_whatsapp_credentials", return_value=("123456", "token"))
 	@patch("huf.ai.tools.whatsapp.requests.get")
-	def test_returns_failure_on_4xx(self, mock_get, _mock_creds):
+	def test_returns_failure_on_4xx(self, mock_get, _mock_creds, _mock_root):
 		mock_get.return_value = self._mock_response(
 			401, {"error": {"message": "Invalid OAuth access token"}}
 		)
-		out = json.loads(whatsapp._get_account_info({}))
+		out = json.loads(whatsapp._get_account_info({"gateway_name": "GW-TEST"}))
 		self.assertFalse(out["success"])
 		self.assertIn("Invalid OAuth access token", out["error"])
 
+	@patch("huf.ai.tools.whatsapp._graph_root", return_value="https://graph.test/v1")
 	@patch("huf.ai.tools.whatsapp._get_whatsapp_credentials", return_value=("123456", "token"))
 	@patch("huf.ai.tools.whatsapp.requests.get")
-	def test_returns_failure_on_5xx(self, mock_get, _mock_creds):
+	def test_returns_failure_on_5xx(self, mock_get, _mock_creds, _mock_root):
 		mock_get.return_value = self._mock_response(500, {"error": {"message": "Internal error"}})
-		out = json.loads(whatsapp._get_account_info({}))
+		out = json.loads(whatsapp._get_account_info({"gateway_name": "GW-TEST"}))
 		self.assertFalse(out["success"])
 
+	@patch("huf.ai.tools.whatsapp._graph_root", return_value="https://graph.test/v1")
 	@patch("huf.ai.tools.whatsapp._get_whatsapp_credentials", return_value=("123456", "token"))
 	@patch("huf.ai.tools.whatsapp.requests.get")
-	def test_returns_success_on_200(self, mock_get, _mock_creds):
+	def test_returns_success_on_200(self, mock_get, _mock_creds, _mock_root):
 		mock_get.return_value = self._mock_response(200, {"id": "123456", "name": "Test Account"})
-		out = json.loads(whatsapp._get_account_info({}))
+		out = json.loads(whatsapp._get_account_info({"gateway_name": "GW-TEST"}))
 		self.assertTrue(out["success"])
 		self.assertEqual(out["data"]["id"], "123456")
 

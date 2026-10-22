@@ -216,7 +216,9 @@ def run_automation_for_doc(trigger, doc, event_name, initiating_user=None, origi
 		files = []
 		file_attachments = trigger.get("file_attachments") or []
 		agent_name = frappe.db.get_value("Automation", trigger["automation"], "agent")
-		if file_attachments:
+		# Procedure-targeted automations have no Agent to run OCR/STT with and
+		# receive the structured doc in their run context instead.
+		if file_attachments and agent_name:
 			import mimetypes
 
 			from huf.ai.audio_service import is_audio_file
@@ -368,6 +370,9 @@ def run_automation_for_doc(trigger, doc, event_name, initiating_user=None, origi
 			"reference_name": doc_dict.get("name"),
 			"_doc_event_supplement": "\n\n".join(supplement_parts),
 		}
+		if not agent_name:
+			# Procedure targets have no prompt to carry the doc, so they get it structured.
+			trigger_context["doc"] = clean_doc
 
 		run_automation(
 			trigger["automation"],

@@ -90,7 +90,8 @@ class ProviderUnavailableError(Exception):
     exception or provider text (put that in ``log_message``). It is capped at 300 characters.
     """
 
-    def __init__(self, public_message: str, *, log_message: str | None = None):
+    def __init__(self, public_message: str, *, log_message: str | None = None,
+                 kind: str | None = None, status_code=None):
         public_message = public_message if isinstance(public_message, str) else str(public_message or "")
         self.public_message = (
             public_message if len(public_message) <= 300 else public_message[:299].rstrip() + "\u2026"
@@ -98,6 +99,11 @@ class ProviderUnavailableError(Exception):
         # str(e)/args carry only the capped, curated text; full detail lives in log_message.
         super().__init__(self.public_message)
         self.log_message = log_message or public_message
+        self.status_code = status_code
+        if kind is None:
+            from huf.ai.providers.errors import classify_text
+            kind = classify_text(f"{self.log_message} {public_message}")
+        self.kind = kind
 
 
 def _sanitize_provider_error_message(raw_message: str, normalized_model: str | None = None) -> str:

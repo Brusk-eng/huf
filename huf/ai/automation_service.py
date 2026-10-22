@@ -33,6 +33,8 @@ from frappe import _
 # beyond the required automation_name / agent / instruction.
 _CREATABLE_FIELDS = (
     "description",
+    "target_type",
+    "procedure",
     "model_override",
     "project",
     "run_as_user",
@@ -55,6 +57,8 @@ _UPDATABLE_FIELDS = (
     "automation_name",
     "description",
     "agent",
+    "target_type",
+    "procedure",
     "model_override",
     "project",
     "run_as_user",
@@ -75,6 +79,8 @@ _LIST_FIELDS = [
     "status",
     "disabled",
     "agent",
+    "target_type",
+    "procedure",
     "project",
     "conversation_mode",
     "last_execution",
@@ -85,7 +91,7 @@ _LIST_FIELDS = [
 ]
 
 
-def create_automation(automation_name: str, agent: str, instruction: str, **other_fields):
+def create_automation(automation_name: str, agent: str | None = None, instruction: str | None = None, **other_fields):
     """
     Create a new Automation. Always starts in Draft status regardless of
     any ``status`` passed in ``other_fields`` -- callers use
@@ -93,8 +99,9 @@ def create_automation(automation_name: str, agent: str, instruction: str, **othe
 
     Args:
         automation_name: unique human-readable name (required).
-        agent: Agent this automation runs as (required).
-        instruction: instruction text sent to the agent (required).
+        agent: Agent this automation runs as (required unless
+            ``target_type="Agent Procedure"``, in which case pass ``procedure``).
+        instruction: instruction text sent to the agent (required for Agent targets).
         **other_fields: any of ``_CREATABLE_FIELDS``; unknown keys are
             ignored rather than raising, so callers can pass through a
             client payload without pre-filtering it.
@@ -104,18 +111,24 @@ def create_automation(automation_name: str, agent: str, instruction: str, **othe
     """
     if not automation_name or not automation_name.strip():
         frappe.throw(_("Automation Name is required"))
-    if not agent:
-        frappe.throw(_("Agent is required"))
-    if not instruction or not instruction.strip():
-        frappe.throw(_("Instruction is required"))
+    procedure_target = other_fields.get("target_type") == "Agent Procedure"
+    if procedure_target:
+        if not other_fields.get("procedure"):
+            frappe.throw(_("Procedure is required"))
+    else:
+        if not agent:
+            frappe.throw(_("Agent is required"))
+        if not instruction or not instruction.strip():
+            frappe.throw(_("Instruction is required"))
 
     doc_fields = {
         "doctype": "Automation",
         "automation_name": automation_name.strip(),
-        "agent": agent,
-        "instruction": instruction,
         "status": "Draft",
     }
+    if not procedure_target:
+        doc_fields["agent"] = agent
+        doc_fields["instruction"] = instruction
     for fieldname in _CREATABLE_FIELDS:
         if fieldname in other_fields and other_fields[fieldname] is not None:
             doc_fields[fieldname] = other_fields[fieldname]
@@ -179,11 +192,15 @@ def validate_automation(automation_doc) -> None:
           since the lazy-creation path keys the conversation's external_id
           off it (``automation:{automation.name}``).
     """
-    if not automation_doc.agent:
-        frappe.throw(_("Automation must have an Agent configured."))
+    if (automation_doc.get("target_type") or "Agent") == "Agent Procedure":
+        if not automation_doc.get("procedure"):
+            frappe.throw(_("Automation must have a Procedure configured."))
+    else:
+        if not automation_doc.agent:
+            frappe.throw(_("Automation must have an Agent configured."))
 
-    if not automation_doc.instruction or not str(automation_doc.instruction).strip():
-        frappe.throw(_("Automation must have an Instruction."))
+        if not automation_doc.instruction or not str(automation_doc.instruction).strip():
+            frappe.throw(_("Automation must have an Instruction."))
 
     conversation_mode = automation_doc.conversation_mode or "New"
     if conversation_mode not in ("New", "Dedicated", "No-UI"):

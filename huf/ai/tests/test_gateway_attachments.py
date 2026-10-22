@@ -205,10 +205,12 @@ class TestGatewayServicePromptAttachmentNote(unittest.TestCase):
 
 
 class TestSupportsMediaReplyFlagAccuracy(unittest.TestCase):
-	"""GW-32: supports_media_reply must match send_reply's real (text-only) behavior."""
+	"""GW-32: supports_media_reply must match send_reply's real behavior (text-only except WhatsApp)."""
 
-	def test_whatsapp_flag_is_false(self):
-		self.assertFalse(WhatsAppGatewayAdapter.capabilities.supports_media_reply)
+	def test_whatsapp_flag_is_true(self):
+		# The WhatsApp adapter now implements send_media() and sends reply attachments,
+		# so the flag is True (the Messenger/Instagram adapters remain text-only).
+		self.assertTrue(WhatsAppGatewayAdapter.capabilities.supports_media_reply)
 
 	def test_messenger_flag_is_false(self):
 		self.assertFalse(MessengerGatewayAdapter.capabilities.supports_media_reply)

@@ -143,14 +143,28 @@ describe('flowSerializer', () => {
             configured: true,
             triggerConfig: {
               type: 'schedule',
-              intervalType: 'hours',
-              interval: 1,
+              cron: '0 * * * *',
             },
           },
         },
       ]);
       const serialized = serializeFlow(flow);
       expect(serialized.nodes[0].type).toBe('trigger.schedule');
+    });
+
+    it('emits only schema-allowed config keys for schedule and doc-event nodes', () => {
+      const mk = (id: string, triggerConfig: Record<string, unknown>) => ({
+        id, type: 'trigger', position: { x: 0, y: 0 },
+        data: { nodeType: 'trigger', label: id, icon: 'Clock', configured: true, triggerConfig },
+      });
+      const flow = createTestFlow([
+        mk('s', { type: 'schedule', cron: '0 * * * *', intervalType: 'hours', interval: 1, timezone: 'UTC' }),
+        mk('d', { type: 'doc-event', doctype: 'ToDo', event: 'on_update', trigger_bound: true }),
+      ] as never);
+      const out = serializeFlow(flow);
+      // graph_ir.schema.json: schedule = {cron}, doc-event = {doctype, event}, additionalProperties false
+      expect(out.nodes.find((n) => n.id === 's')!.config).toEqual({ cron: '0 * * * *' });
+      expect(out.nodes.find((n) => n.id === 'd')!.config).toEqual({ doctype: 'ToDo', event: 'on_update' });
     });
 
     it('maps trigger with doc-event type to trigger.doc-event', () => {
@@ -167,7 +181,7 @@ describe('flowSerializer', () => {
             triggerConfig: {
               type: 'doc-event',
               doctype: 'Task',
-              event: 'save',
+              event: 'on_update',
             },
           },
         },
@@ -356,8 +370,7 @@ describe('flowSerializer', () => {
             configured: true,
             triggerConfig: {
               type: 'schedule',
-              intervalType: 'days',
-              interval: 1,
+              cron: '0 0 * * *',
             },
           },
         },
@@ -445,9 +458,7 @@ describe('flowSerializer', () => {
           configured: true,
           triggerConfig: {
             type: 'schedule',
-            intervalType: 'hours',
-            interval: 2,
-            timezone: 'UTC',
+            cron: '0 */2 * * *',
           },
         },
       };
@@ -456,9 +467,7 @@ describe('flowSerializer', () => {
       const serialized = serializeFlow(flow);
 
       expect(serialized.nodes[0].config).not.toHaveProperty('type');
-      expect(serialized.nodes[0].config).toHaveProperty('intervalType', 'hours');
-      expect(serialized.nodes[0].config).toHaveProperty('interval', 2);
-      expect(serialized.nodes[0].config).toHaveProperty('timezone', 'UTC');
+      expect(serialized.nodes[0].config).toEqual({ cron: '0 */2 * * *' });
     });
   });
 
@@ -670,8 +679,8 @@ describe('flowSerializer', () => {
 
       // Unknown types should be mapped to 'action'
       expect(deserialized.nodes[0].type).toBe('action');
-      // ActionConfig type should map back to 'tool-call' (default)
-      expect(deserialized.nodes[0].data?.actionConfig?.type).toBe('tool-call');
+      // Unrecognised backend types are preserved, not coerced into a tool call
+      expect(deserialized.nodes[0].data?.actionConfig?.type).toBe('unknown');
     });
 
     it('derives labeled and unlabeled edges from node next/on_error/self-routing config', () => {
@@ -710,6 +719,41 @@ describe('flowSerializer', () => {
       expect(mapBackendStatusToFrontend('Active')).toBe('active');
       expect(mapBackendStatusToFrontend('Archived')).toBe('paused');
       expect(mapBackendStatusToFrontend('Unknown')).toBe('draft'); // falls back to draft
+    });
+  });
+
+  describe('trigger.unset and configured flag', () => {
+    it('serializes a trigger node with no chosen type to trigger.unset', () => {
+      const flow = createTestFlow([
+        {
+          id: 'empty_trigger',
+          type: 'trigger',
+          position: { x: 0, y: 0 },
+          data: { nodeType: 'trigger', label: 'Select trigger', configured: false },
+        },
+      ]);
+      const graph = serializeFlow(flow);
+      expect(graph.nodes[0].type).toBe('trigger.unset');
+      expect(graph.nodes[0].config).toEqual({});
+    });
+
+    it('round-trips trigger.unset as an unconfigured trigger', () => {
+      const graph = makeBackendGraph([{ id: 't', type: 'trigger.unset', config: {}, next: null }]);
+      const flow = deserializeFlow('f', 'F', 'Draft', graph);
+      expect(flow.nodes[0].type).toBe('trigger');
+      expect(flow.nodes[0].data.configured).toBe(false);
+      expect(serializeFlow(flow).nodes[0].type).toBe('trigger.unset');
+    });
+
+    it('computes configured from real config instead of hard-coding true', () => {
+      const graph = makeBackendGraph([
+        { id: 'a', type: 'agent.run', config: { agent: '', prompt: 'hi' }, next: 'b' },
+        { id: 'b', type: 'agent.run', config: { agent: 'X', prompt: 'hi' }, next: 'c' },
+        { id: 'c', type: 'trigger.webhook', config: { method: 'POST' }, next: null },
+        { id: 'd', type: 'output', config: {}, next: null },
+      ]);
+      const flow = deserializeFlow('f', 'F', 'Draft', graph);
+      expect(flow.nodes.map((n) => n.data.configured)).toEqual([false, true, true, true]);
     });
   });
 });
