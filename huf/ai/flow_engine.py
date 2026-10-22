@@ -1773,6 +1773,10 @@ def _exec_doc_create(flow_run, node: dict, config: dict, settings: dict) -> dict
 	max_writes = limits.get("max_writes") or 0
 	envelope = ((run_ctx.definition.get("contract") or {}).get("permission_envelope") or {}) if run_ctx is not None else {}
 	doctype = config["doctype"]
+	try:  # the site allow-list first: its message is the clearer one for an unsupported doctype
+		flow_create_doc.check_doctype(doctype, flow_create_doc.allowed_doctypes(frappe.conf))
+	except flow_create_doc.CreateDocError as exc:
+		return {"status": "failed", "error": f"doc.create: {exc}"}
 	if not isinstance(doctype, str) or not envelope_declares(envelope, ptype="create", doctype=doctype):
 		return {"status": "failed", "error": f"doc.create: contract permission_envelope.write does not grant {doctype!r}"}
 	done = ctx.data.get(_WRITES_KEY) or 0
