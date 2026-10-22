@@ -37,24 +37,28 @@ class TestCommitIfBackground(IntegrationTestCase):
     def test_no_commit_inside_request(self):
         from huf.ai.transaction import commit_if_background
 
-        setattr(frappe.local, "request", frappe._dict(method="GET"))
+        # Never delattr frappe.local.request: once deleted, later assignments no longer
+        # reach the frappe.request proxy and every following webhook test sees no request.
+        previous = getattr(frappe.local, "request", None)
+        frappe.local.request = frappe._dict(method="GET")
         try:
             with patch("huf.ai.transaction.safe_commit") as mock_commit:
                 commit_if_background()
                 mock_commit.assert_not_called()
         finally:
-            if hasattr(frappe.local, "request"):
-                delattr(frappe.local, "request")
+            frappe.local.request = previous
 
     def test_commit_outside_request(self):
         from huf.ai.transaction import commit_if_background
 
-        if hasattr(frappe.local, "request"):
-            delattr(frappe.local, "request")
-
-        with patch("huf.ai.transaction.safe_commit") as mock_commit:
-            commit_if_background()
-            mock_commit.assert_called_once()
+        previous = getattr(frappe.local, "request", None)
+        frappe.local.request = None
+        try:
+            with patch("huf.ai.transaction.safe_commit") as mock_commit:
+                commit_if_background()
+                mock_commit.assert_called_once()
+        finally:
+            frappe.local.request = previous
 
 
 class TestAudioServiceCommitGating(IntegrationTestCase):
@@ -63,7 +67,9 @@ class TestAudioServiceCommitGating(IntegrationTestCase):
     def test_create_audio_user_message_uses_commit_if_background(self):
         from huf.ai import audio_service
 
-        setattr(frappe.local, "request", frappe._dict(method="POST"))
+        _previous_request = getattr(frappe.local, "request", None)
+
+        frappe.local.request = frappe._dict(method="POST")
         try:
             file_doc = MagicMock(file_url="/files/audio.mp3")
             agent_doc = MagicMock(provider="openai", model="whisper-1")
@@ -95,8 +101,7 @@ class TestAudioServiceCommitGating(IntegrationTestCase):
                                 )
                 mock_commit.assert_called_once()
         finally:
-            if hasattr(frappe.local, "request"):
-                delattr(frappe.local, "request")
+            frappe.local.request = _previous_request
 
 
 class TestOrchestratorCommitGating(IntegrationTestCase):
@@ -118,7 +123,9 @@ class TestOrchestratorCommitGating(IntegrationTestCase):
         orch.agent_orchestration_plan = []
         orch.name = "ORCH-0001"
 
-        setattr(frappe.local, "request", frappe._dict(method="POST"))
+        _previous_request = getattr(frappe.local, "request", None)
+
+        frappe.local.request = frappe._dict(method="POST")
         try:
             with patch("frappe.get_doc", return_value=agent_doc):
                 with patch("frappe.new_doc", return_value=orch):
@@ -127,8 +134,7 @@ class TestOrchestratorCommitGating(IntegrationTestCase):
                             create_orchestration("test-agent", "hello")
                         mock_commit.assert_called_once()
         finally:
-            if hasattr(frappe.local, "request"):
-                delattr(frappe.local, "request")
+            frappe.local.request = _previous_request
 
 
 class TestSetUserRestoreGuards(IntegrationTestCase):

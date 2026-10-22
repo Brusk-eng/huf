@@ -1,4 +1,5 @@
 """Unit tests for huf.ai.run_control (mocked; no DB)."""
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -6,6 +7,27 @@ from unittest.mock import MagicMock, patch
 import frappe
 
 from huf.ai import run_control as rc
+
+
+@contextlib.contextmanager
+def _local_site(value):
+	"""Set ``frappe.local.site`` and put it back afterwards.
+
+	``patch.object(frappe.local, "site", ..., create=True)`` deletes the attribute on exit
+	(frappe.local keeps attributes in a context var, not ``__dict__``, so mock treats it as
+	newly created) which strips the site from every later test in the same process.
+	"""
+	missing = object()
+	previous = getattr(rc.frappe.local, "site", missing)
+	rc.frappe.local.site = value
+	try:
+		yield
+	finally:
+		if previous is missing:
+			if hasattr(rc.frappe.local, "site"):
+				del rc.frappe.local.site
+		else:
+			rc.frappe.local.site = previous
 
 
 class TestRunControl(unittest.TestCase):
@@ -740,9 +762,7 @@ class TestKeepRunAliveThread(unittest.TestCase):
 		logger = MagicMock()
 
 		async def body():
-			with patch.object(rc, "touch_run_alive"), patch.object(
-				rc.frappe.local, "site", "s.local", create=True
-			), patch.object(rc.frappe, "init", side_effect=RuntimeError("x")), patch.object(
+			with patch.object(rc, "touch_run_alive"), _local_site("s.local"), patch.object(rc.frappe, "init", side_effect=RuntimeError("x")), patch.object(
 				rc.frappe, "logger", return_value=logger
 			), patch.object(rc.frappe, "destroy") as destroy:
 				async with rc.keep_run_alive("R", interval=0.05) as k:
@@ -757,9 +777,7 @@ class TestKeepRunAliveThread(unittest.TestCase):
 
 	def test_destroy_called_in_finally_after_init(self):
 		async def body():
-			with patch.object(rc, "touch_run_alive"), patch.object(
-				rc.frappe.local, "site", "s.local", create=True
-			), patch.object(rc.frappe, "init"), patch.object(rc.frappe, "destroy") as destroy:
+			with patch.object(rc, "touch_run_alive"), _local_site("s.local"), patch.object(rc.frappe, "init"), patch.object(rc.frappe, "destroy") as destroy:
 				async with rc.keep_run_alive("R", interval=0.05) as k:
 					pass
 				k._thread.join(2)
