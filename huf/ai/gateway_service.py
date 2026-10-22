@@ -199,7 +199,9 @@ def _inbound_media_type(event) -> str | None:
     return None
 
 
-def _fail_event_for_agent_run(event, gateway, result, error_code: str, reason: str) -> dict:
+def _fail_event_for_agent_run(
+    event, gateway, result, error_code: str, reason: str, fallback_kind: str = "error"
+) -> dict:
     """Mark the event Failed for a failed agent run and send nothing (bar the default fallback reply)."""
     agent_run_id = result.get("agent_run_id") if isinstance(result, dict) else None
     message = f"{error_code}: {reason}"[:500]
@@ -208,7 +210,7 @@ def _fail_event_for_agent_run(event, gateway, result, error_code: str, reason: s
         values["agent_run"] = agent_run_id
     event.db_set(values)
     frappe.log_error(message, "Gateway agent run failed")
-    fallback_sent = _send_fallback_once(event, gateway, "error")
+    fallback_sent = _send_fallback_once(event, gateway, fallback_kind)
     return {
         "event_name": event.name,
         "status": "Failed",
@@ -2363,10 +2365,25 @@ def _process_gateway_event(event_name: str) -> dict:
                         + [f"[Attachment saved: {file_url}]" for file_url in saved_files]
                     )
             media_type = _inbound_media_type(event) if gateway.provider == "WhatsApp" else None
-            if media_type and not saved_files:
+            # The agent is the only responder for an unsaved attachment; the standalone note is sent
+            # only if the run fails or yields no reply.
+            attachment_unavailable = bool(media_type and not saved_files)
+            fallback_kind = "attachment" if attachment_unavailable else "error"
+            if attachment_unavailable:
                 attachment_note = "\n".join([attachment_note] * bool(attachment_note) + [ATTACHMENT_UNAVAILABLE_NOTE])
-                _send_fallback_once(event, gateway, "attachment")
-            prompt = f"{attachment_note}\n{event.message_text}" if attachment_note else event.message_text
+            media_files: list = []
+            media_prep_result = None
+            if saved_files:
+                from huf.ai import media_prep
+
+                media_prep_result = media_prep.prepare_media_for_agent(
+                    media_prep.resolve_event_files(event.name, saved_files), event.target_agent
+                )
+                media_files = media_prep_result.files
+            if media_prep_result:
+                prompt = media_prep.build_prompt(attachment_note, event.message_text, media_prep_result)
+            else:
+                prompt = f"{attachment_note}\n{event.message_text}" if attachment_note else event.message_text
 
             fallback_note = ""
             _maybe_mark_read_typing(event, gateway)
@@ -2380,11 +2397,15 @@ def _process_gateway_event(event_name: str) -> dict:
                 external_id=event.thread_id or event.conversation_id or event.sender_id,
                 now=True,
                 client_idempotency_key=f"gateway-event:{event.name}",
+                files=media_files or None,
             )
             failure = _agent_run_failure(result)
             if failure:
-                return _fail_event_for_agent_run(event, gateway, result, *failure)
+                return _fail_event_for_agent_run(event, gateway, result, *failure, fallback_kind=fallback_kind)
             response = result.get("response")
+            if attachment_unavailable and (_is_no_reply(response) or not str(response or "").strip()):
+                _send_fallback_once(event, gateway, "attachment")
+                return _suppress_reply(event, result.get("agent_run_id"), NO_REPLY_NOTE)
             if _is_no_reply(response):
                 return _suppress_reply(event, result.get("agent_run_id"), NO_REPLY_NOTE)
             if gateway.provider == "WhatsApp":
