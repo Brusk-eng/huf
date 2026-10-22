@@ -2554,8 +2554,41 @@ def _send_whatsapp_reply(event, gateway, agent_run_id, response: str) -> dict:
         event.db_set("agent_run", agent_run_id)
     if event.sender_id and is_opted_out(gateway, event.sender_id):
         return _suppress_reply(event, agent_run_id, "Recipient opted out: reply not sent")
+    from huf.ai import whatsapp_voice_reply as voice
+
+    mode = voice.reply_mode(event, gateway, response)
+    if mode == voice.VOICE_ONLY:
+        if event.reply_message_id or _send_voice_only(event, gateway, response):
+            return _finish_voice_only(event, gateway)
     parts = wf.split_body(wf.to_whatsapp(response)) or [response]
-    return _attempt_reply_parts(event, gateway, parts, 1)
+    result = _attempt_reply_parts(event, gateway, parts, 1)
+    if mode == voice.TEXT_AND_VOICE and result.get("status") == "Succeeded":
+        voice.send_voice_reply(event, gateway, response, quote=False, once=True)
+    return result
+
+
+def _send_voice_only(event, gateway, response: str) -> bool:
+    from huf.ai import whatsapp_voice_reply as voice
+
+    _throttle_outbound_send(gateway.name, _outbound_rate_cap(gateway.provider))
+    wamid = voice.send_voice_reply(event, gateway, response)
+    _record_reply_sent(event, wamid)
+    return bool(wamid)
+
+
+def _finish_voice_only(event, gateway) -> dict:
+    from huf.ai.gateway_webhook import touch_last_event
+
+    event.db_set({"status": "Succeeded", "delivery_error": ""})
+    touch_last_event(gateway)
+    return {
+        "event_name": event.name,
+        "status": "Succeeded",
+        "agent_run_id": event.agent_run,
+        "provider_message_id": event.reply_message_id,
+        "attempts": 1,
+        "voice": True,
+    }
 
 
 def _attempt_reply_parts(event, gateway, parts: list[str], attempt: int) -> dict:
