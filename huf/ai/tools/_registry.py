@@ -221,7 +221,7 @@ WHATSAPP_TOOLS = [
 		"tool_name": "whatsapp",
 		"description": (
 			"Manage WhatsApp Business messaging via the Meta Cloud API, always through the gateway this conversation belongs to "
-			"(it cannot be chosen). Actions: "
+			"(it cannot be chosen). The recipient 'to' is optional on every send_* action: leave it out to send to the person you are talking to in this conversation (the default; other numbers are refused unless the gateway allows them), so never ask the user for their phone number. Actions: "
 			"send_message (to/recipient/phone_number, message/text; free-form sends outside the "
 			"24h window may be refused), "
 			"send_media (to, kind image|document|audio|video|sticker, link or media_id or file_url/file_id of a Huf File from this conversation, caption, filename; same 24h window rules as send_message), "
@@ -250,7 +250,7 @@ WHATSAPP_TOOLS = [
 				"send_reaction|send_buttons|send_list|send_cta_url|send_template|list_messages|get_account_info|list_templates|"
 				"create_template|get_template_status"
 			),
-			_p("to", description="Recipient phone number (E.164). Alias: recipient, phone_number."),
+			_p("to", description="Optional recipient phone number (E.164). Omit it to send to the person in this conversation. Alias: recipient, phone_number."),
 			_p("recipient", description="Alias for 'to'."),
 			_p("phone_number", description="Alias for 'to'."),
 			_p("message", description="Message text for send_message. Alias: text."),
