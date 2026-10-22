@@ -18,6 +18,7 @@
   "approved_by",
   "approved_at",
   "revoked_at",
+  "revoked_by",
   "notes"
  ],
  "fields": [
@@ -95,6 +96,13 @@
    "fieldname": "revoked_at",
    "fieldtype": "Datetime",
    "label": "Revoked at",
+   "read_only": 1
+  },
+  {
+   "fieldname": "revoked_by",
+   "fieldtype": "Link",
+   "label": "Revoked by",
+   "options": "User",
    "read_only": 1
   },
   {

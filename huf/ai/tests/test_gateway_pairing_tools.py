@@ -58,9 +58,11 @@ class TestGatewayPairingTools(IntegrationTestCase):
         self.assertRegex(code, r"^PAIR-[A-Z2-9]{8}$")
 
         pending = list_pairing_requests(gw_name)
-        self.assertTrue(any(p["pairing_code"] == code for p in pending))
+        self.assertTrue(any(p["pairing_code"] == "*" * (len(code) - 2) + code[-2:] for p in pending))
+        self.assertFalse(any(p["pairing_code"] == code for p in pending))
+        entry_id = next(p["entry_id"] for p in pending if p["pairing_code"].endswith(code[-2:]))
 
-        approval = approve_pairing_code(code, notes="Approved during automated test", gateway_name=gw_name)
+        approval = approve_pairing_code(entry_id, notes="Approved during automated test", gateway_name=gw_name)
         self.assertTrue(approval["success"])
         self.assertEqual(approval["state"], "Approved")
 

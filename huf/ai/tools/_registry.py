@@ -220,21 +220,22 @@ WHATSAPP_TOOLS = [
 	{
 		"tool_name": "whatsapp",
 		"description": (
-			"Manage WhatsApp Business messaging via the Meta Cloud API. Actions: "
+			"Manage WhatsApp Business messaging via the Meta Cloud API, always through the gateway this conversation belongs to "
+			"(it cannot be chosen). The recipient 'to' is optional on every send_* action: leave it out to send to the person you are talking to in this conversation (the default; other numbers are refused unless the gateway allows them), so never ask the user for their phone number. Actions: "
 			"send_message (to/recipient/phone_number, message/text; free-form sends outside the "
 			"24h window may be refused), "
-			"send_media (to, kind image|document|audio|video|sticker, link or media_id, caption, filename; same 24h window rules as send_message), "
-			"send_image / send_video / send_audio / send_document / send_sticker (media actions with the kind preset: to, link or media_id; caption for image, video and document; filename for document; voice=true for an audio voice note), "
+			"send_media (to, kind image|document|audio|video|sticker, link or media_id or file_url/file_id of a Huf File from this conversation, caption, filename; same 24h window rules as send_message), "
+			"send_image / send_video / send_audio / send_document / send_sticker (media actions with the kind preset: to, link or media_id or file_url/file_id of a Huf File, e.g. from generate_image / generate_audio; caption for image, video and document; filename for document; voice=true for an audio voice note), "
 			"send_location (to, latitude, longitude, name, address), "
 			"send_contact (to, contact_name, contact_phone, contact_email, contact_org; or contacts as a JSON list), "
 			"send_reaction (to, message_id of the customer's message, emoji; remove=true removes the reaction), "
 			"send_buttons (to, body, buttons [{id, title}] up to 3, optional header and footer), "
 			"send_list (to, body, button_text, sections [{title, rows: [{id, title, description}]}] up to 10 rows, optional header and footer), "
 			"send_cta_url (to, body, display_text, url, optional header and footer). "
-			"All send_* media, location, contact, reaction and interactive actions are free-form: they need an open 24h window (or the server-side allow_proactive flag), are refused for contacts who opted out, and are validated against Meta's limits before sending; "
+			"All send_* media, location, contact, reaction and interactive actions are free-form: they need an open 24h window (or the gateway's proactive-send setting), are refused for contacts who opted out, and are validated against Meta's limits before sending; "
 			"send_template (to/recipient, template_name, language_code, parameters, header_params, button_params), "
-			"list_messages (to, from, limit), get_account_info, "
-			"list_templates (whatsapp_account, status; rows include review status and rejection reason), "
+			"list_messages (to: the contact, limit, cursor; newest first, each item has the wamid in message_id), get_account_info, "
+			"list_templates (status; rows include review status and rejection reason), "
 			"create_template (template_name, category, language_code, body, sample_values, optional header_type/header/sample, "
 			"footer, buttons; saves a DRAFT that a human must approve before it is submitted to Meta - returns "
 			"status pending_review and the draft name; may be refused by server policy), "
@@ -249,7 +250,7 @@ WHATSAPP_TOOLS = [
 				"send_reaction|send_buttons|send_list|send_cta_url|send_template|list_messages|get_account_info|list_templates|"
 				"create_template|get_template_status"
 			),
-			_p("to", description="Recipient phone number (E.164). Alias: recipient, phone_number."),
+			_p("to", description="Optional recipient phone number (E.164). Omit it to send to the person in this conversation. Alias: recipient, phone_number."),
 			_p("recipient", description="Alias for 'to'."),
 			_p("phone_number", description="Alias for 'to'."),
 			_p("message", description="Message text for send_message. Alias: text."),
@@ -274,7 +275,9 @@ WHATSAPP_TOOLS = [
 			_p("header_params", type="array", description="send_template header parameter: one text value, or one {type: image|document, link} object."),
 			_p("button_params", type="array", description="send_template URL button parameters: [{index: 0, sub_type: 'url', text: '<url suffix>'}]."),
 			_p("kind", description="Media kind for send_media: image, document, audio, video or sticker (the send_image/send_video/... actions set it for you)."),
-			_p("link", description="Public https URL of the media (send_media, send_image, send_video, send_audio, send_document, send_sticker). Give link or media_id, not both."),
+			_p("link", description="Public https URL of the media (send_media, send_image, send_video, send_audio, send_document, send_sticker). Give only one of link, media_id, file_url, file_id."),
+			_p("file_url", description="Media actions: file_url (/private/files/... or /files/...) of a Huf File created in this conversation (e.g. generate_image / generate_audio output) or uploaded by the user. Give exactly one of link, media_id, file_url, file_id. Other files are refused."),
+			_p("file_id", description="Media actions: name (id) of a Huf File, same rules as file_url. send_voice_note converts non-Ogg audio to Ogg/Opus when the server has ffmpeg."),
 			_p("media_id", description="Meta media id of already uploaded media, instead of link (media actions)."),
 			_p("caption", description="Caption for image, video and document (max 1024 characters). Not allowed for audio or stickers."),
 			_p("filename", description="Filename shown for a document (include the extension, e.g. report.pdf)."),
@@ -296,13 +299,10 @@ WHATSAPP_TOOLS = [
 			_p("display_text", description="send_cta_url: button label (max 20 characters)."),
 			_p("url", description="send_cta_url: the https:// address the button opens. Alias of link for media actions."),
 			_p("reply_to", description="Optional wamid of a message to quote in the reply (not for reactions)."),
-			_p("limit", type="integer", description="Max messages to return for list_messages (default 20)."),
-			_p("whatsapp_account", description="WhatsApp Account name to use for list_templates, create_template or send_message."),
+			_p("idempotency_key", description="Optional, any send action: the same key sends once (for 24h) and a repeat returns the original result with deduplicated=true. Without it, a retry of the same tool call is deduplicated automatically."),
+			_p("limit", type="integer", description="Max messages to return for list_messages (default 20, at most 50)."),
+			_p("cursor", description="list_messages: pass the next_cursor of the previous page to get older messages."),
 			_p("status", description="Filter for list_templates by approval status, e.g. APPROVED or PENDING."),
-			_p(
-				"gateway_name",
-				description="Gateway name for send_message; when the 24h customer-service window is open, free-form sends are allowed.",
-			),
 		],
 	},
 ]

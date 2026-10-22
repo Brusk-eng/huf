@@ -40,6 +40,7 @@ class FlowDefinition(Document):
 	def validate(self):
 		defn = self._validate_definition_json()
 		self._validate_activation(defn)
+		self._validate_gateway_authority(defn)
 		self.updated_by = frappe.session.user
 		self.updated_at = now_datetime()
 		system_records.guard_flag_tamper(self)
@@ -168,6 +169,19 @@ class FlowDefinition(Document):
 		# verbatim rather than re-deriving or defaulting it.
 		self.schema_version = defn.get("schema_version")
 		return defn
+
+	def _validate_gateway_authority(self, defn: dict):
+		"""A node may bind a WhatsApp gateway (``config.gateway``) only if the saving user can write to it."""
+		for node in (defn.get("nodes") or []) if isinstance(defn, dict) else []:
+			config = node.get("config") if isinstance(node, dict) else None
+			gateway = str((config or {}).get("gateway") or "").strip() if isinstance(config, dict) else ""
+			if not gateway or str(node.get("type")) != "tool.call":
+				continue
+			if not frappe.db.exists("Gateway", gateway) or not frappe.has_permission("Gateway", "write", doc=gateway):
+				frappe.throw(
+					_("Node {0}: you need write access to Gateway {1} to bind it.").format(node.get("id"), gateway),
+					frappe.PermissionError,
+				)
 
 	def _validate_activation(self, defn: dict):
 		"""Active flows must be runnable: Draft/Archived saves stay permissive. Reports

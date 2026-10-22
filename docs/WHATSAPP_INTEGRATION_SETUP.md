@@ -125,13 +125,7 @@ Create an **Integration Settings** record for service `whatsapp` and add these c
 
 The adapter refuses to start without `phone_number_id`, `access_token`, `webhook_verify_token` and `app_secret`.
 
-Optional privilege flags (also credential rows, value `1` to enable). They are read from the active `whatsapp` Integration Settings (`is_active = 1`). See section 6.
-
-| Key | Effect |
-|---|---|
-| `allow_proactive` | Allows free-form messages to numbers with no open 24h window |
-| `allow_whatsapp_management` | Allows the agent to draft templates, and also allows proactive sends |
-| `auto_submit_templates` | With `allow_whatsapp_management`, the agent submits templates to Meta directly instead of saving a draft |
+Agent privilege flags are Check fields on the Gateway itself (not credential rows); see section 6.
 
 ### 3.2 Gateway
 
@@ -374,31 +368,31 @@ Huf keeps its own review state for every template (`WhatsApp Template State`, on
 
 Actions: `send_message`, `send_media`, `send_template`, `list_messages`, `get_account_info`, `list_templates`, `create_template`.
 
-With `gateway_name` the tool uses only that Gateway's account (and its own integration credentials); a Gateway with no linked account never falls back to the default account. Without `gateway_name` (non-gateway use) it uses the default outgoing account. `list_templates` always needs an account, via `gateway_name`, `whatsapp_account` or the default; it never lists across accounts.
+The tool is bound to the gateway of the current run (the conversation channel `gateway:<name>`). `gateway_name` and `whatsapp_account` are not tool parameters and are discarded if supplied. A run that is not bound to an enabled WhatsApp gateway is refused (`gateway_context_required`); there is no default account. Sends need Gateway write authority for the run user; reads need read authority. `list_templates` lists only the gateway's own account.
 
-- `send_message` is a free-form text send. It is **proactive** unless `gateway_name` is passed and that gateway's window is open. Without `gateway_name`, every free-form send is treated as proactive. A proactive send needs `allow_proactive` or `allow_whatsapp_management`.
+- `list_messages` (`to` = the contact, `limit` 1-50, `cursor`) returns that contact's messages through the run gateway, newest first, with the wamid in `message_id` and a `next_cursor`.
+- `send_message` is a free-form text send. It is **proactive** unless the run gateway's window for that number is open. A proactive send needs the gateway's "Agent may send outside the 24-hour window" setting, and is refused for opted-out contacts.
 - `send_media` (`to`, `kind` image/document/audio/video, `link`, `caption`, `filename`) is a free-form send. It follows exactly the same proactive logic and flags as `send_message`.
 - `send_template` is always allowed. It accepts `parameters`, `header_params` and `button_params` (see section 4.4).
-- `create_template` needs `allow_whatsapp_management` (not `allow_proactive`), accepts the header, footer and button fields of section 4.4, and saves a **draft** for human approval (section 4.5). `get_template_status` reports the review status, rejection reason, quality and draft state of a template or draft; `list_templates` rows include status and rejection reason.
+- `create_template` needs the gateway setting "Agent may draft templates" (not the proactive one), accepts the header, footer and button fields of section 4.4, and saves a **draft** for human approval (section 4.5). `get_template_status` reports the review status, rejection reason, quality and draft state of a template or draft; `list_templates` rows include status and rejection reason.
 - The tool never uses `ignore_permissions` and never switches the session user.
-- `send_template`, `get_account_info` and the fallback path of `send_message` call the Graph API directly, using `phone_number_id` and `access_token` from the arguments or the Integration Settings. `send_message` logs to `WhatsApp Message` only when the bridge is not used and the app is installed.
+- `send_template`, `get_account_info` and the fallback path of `send_message` call the Graph API directly, using the `phone_number_id` and `access_token` of the run gateway's own integration. `send_message` logs to `WhatsApp Message` only when the bridge is not used and the app is installed.
 
 ---
 
 ## 6. Agent tool gating
 
-Two server-side flags control privileged behaviour. They are read from the active `whatsapp` Integration Settings credential rows. Both are off by default.
+Three per-gateway Check fields control privileged behaviour. They are read from the run gateway only and are off by default.
 
-| Credential row | Enables |
+| Gateway field | Enables |
 |---|---|
-| `allow_proactive` | Free-form `send_message` and `send_media` outside an open window |
-| `allow_whatsapp_management` | `create_template` (as a draft), and proactive sends |
-| `auto_submit_templates` | `create_template` submits straight to Meta (only together with `allow_whatsapp_management`) |
+| `agent_allow_proactive` | Free-form sends outside an open window |
+| `agent_allow_template_management` | `create_template` (as a draft); does not allow proactive sends |
+| `agent_auto_submit_templates` | `create_template` submits straight to Meta (only together with template management) |
 
 Rules:
 
-- A flag counts only when its value is `1`, `true` or `yes` (case-insensitive). `0`, `false`, empty or a missing row do not count.
-- Any error while reading the settings fails closed.
+- Any error while reading a flag fails closed.
 - The LLM cannot enable a flag. Any `allow_proactive`, `allow_whatsapp_management` or `auto_submit_templates` argument in a tool call is discarded.
 
 ---

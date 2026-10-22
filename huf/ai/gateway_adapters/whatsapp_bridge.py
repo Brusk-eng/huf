@@ -15,6 +15,7 @@ or no name is given: there is no default-account guess on gateway paths.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import hashlib
 import importlib
@@ -23,6 +24,7 @@ import mimetypes
 import os
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
@@ -30,6 +32,7 @@ from urllib.parse import quote, urljoin, urlparse
 import frappe
 import frappe.utils
 
+from huf.ai import whatsapp_outbound_policy as policy
 from huf.ai.gateway_adapters import whatsapp_messages as wm
 from huf.ai.gateway_adapters import whatsapp_templates as wt
 
@@ -147,8 +150,16 @@ def is_available() -> bool:
 		return False
 
 
+def is_bsuid(raw: Any) -> bool:
+	"""True for a business-scoped user id (``IN.4608...``): country-prefix dot form (``IN.123``, ``US.ENT.123``)."""
+	text = str(raw or "").strip()
+	return bool(re.match(r"^[A-Za-z]{2}\.[A-Za-z0-9.]+$", text))
+
+
 def normalize_phone(raw: Any) -> str:
-	"""Return digits only (no +, spaces, dashes, parens, leading ``00``)."""
+	"""Return digits only (no +, spaces, dashes, parens, leading ``00``); a BSUID is returned verbatim."""
+	if is_bsuid(raw):
+		return str(raw).strip()
 	digits = re.sub(r"\D", "", str(raw or ""))
 	if digits.startswith("00"):
 		digits = digits[2:]
@@ -204,6 +215,17 @@ def gateway_account(gateway_name: str) -> str:
 		return ""
 
 
+def account_business_id(account_name: Any) -> str:
+	"""``WhatsApp Account.business_id`` ('' when unlinked, unknown or the bridge is unavailable)."""
+	name = str(account_name or "").strip()
+	if not name or not is_available():
+		return ""
+	try:
+		return str(frappe.db.get_value("WhatsApp Account", name, "business_id") or "").strip()
+	except Exception:
+		return ""
+
+
 def accounts_for_waba(waba_id: Any) -> list[str]:
 	"""WhatsApp Accounts whose ``business_id`` is the given WABA id (payload ``entry[].id``)."""
 	waba = str(waba_id or "").strip()
@@ -213,6 +235,31 @@ def accounts_for_waba(waba_id: Any) -> list[str]:
 		return list(frappe.get_all("WhatsApp Account", filters={"business_id": waba}, pluck="name") or [])
 	except Exception:
 		return []
+
+
+_run_bound: contextvars.ContextVar = contextvars.ContextVar("huf_whatsapp_run_bound_send", default=False)
+
+
+@contextmanager
+def run_bound_send():
+	"""Server-side scope for the agent tool: the run's own gateway authorised the send, so the run user
+	needs no WhatsApp Message create permission. Skips permission checks only (``trusted`` also commits)."""
+	token = _run_bound.set(True)
+	try:
+		yield
+	finally:
+		_run_bound.reset(token)
+
+
+def _may_bypass(trusted: bool) -> bool:
+	return bool(trusted) or _run_bound.get()
+
+
+def _refuse_if_disconnected(acct: dict[str, Any]) -> None:
+	from huf.ai import whatsapp_account_events as _ae
+
+	if (refusal := _ae.send_refusal(acct.get("phone_id"))):
+		raise BridgeError(refusal)
 
 
 def _account_or_error(account_name: str | None) -> dict[str, Any]:
@@ -273,6 +320,32 @@ def is_reaction_payload(raw_payload: Any) -> bool:
 	return isinstance(message, dict) and message.get("type") == "reaction"
 
 
+def payload_kind(raw_payload: Any) -> str:
+	"""``kind`` of a stored Gateway Event ``raw_payload`` ("" when absent or unparsable)."""
+	if isinstance(raw_payload, (str, bytes)):
+		try:
+			raw_payload = json.loads(raw_payload)
+		except ValueError:
+			return ""
+	return str(raw_payload.get("kind") or "") if isinstance(raw_payload, dict) else ""
+
+
+def fallback_template_info(account_name: str, template_name: str, language: str | None = None) -> dict[str, Any] | None:
+	"""``{"status", "variables"}`` of the account's template row (None when unknown or unavailable).
+
+	``variables`` are the body variable tokens in order (``"1"`` or a NAMED token).
+	"""
+	if not is_available():
+		return None
+	try:
+		row = _template_row(_template_docname(account_name, template_name, language))
+	except Exception:
+		return None
+	if not row or (row.get("whatsapp_account") or "") != (account_name or ""):
+		return None
+	return {"status": str(row.get("status") or ""), "variables": wt.variables(row.get("template") or "")}
+
+
 def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> dict[str, Any]:
 	"""Compute the 24h customer-service window from signed Gateway Events only (A3).
 
@@ -298,10 +371,14 @@ def window_state(gateway_name: str, phone: str, now: datetime | None = None) -> 
 		order_by="received_at desc",
 		limit_page_length=50,
 	)
+	from huf.ai.gateway_adapters import whatsapp_inbound as inbound
+
 	last = None
 	for row in rows or []:
 		if not row.get("verified_sender"):
 			continue
+		if payload_kind(row.get("raw_payload")) in inbound.RECORD_ONLY_KINDS:
+			continue  # recorded edit/revoke/system/unknown events never open or extend the window
 		if is_reaction_payload(row.get("raw_payload")):
 			continue  # a reaction never opens or extends the customer-service window
 		ts = row.get("received_at")
@@ -387,6 +464,7 @@ def send_text(
 	:class:`BridgeError` (``.payload`` is the error dict) on failure.
 	"""
 	acct = _account_or_error(account_name)
+	_refuse_if_disconnected(acct)
 	if preview_url is not None and trusted:
 		return _send_text_direct(acct, to, text, reply_to, bool(preview_url), http_post)
 	values = {
@@ -402,7 +480,7 @@ def send_text(
 		values["reply_to_message_id"] = reply_to
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			# Gateway reply path runs in a background job: persist the outgoing row
 			# now so Meta's status webhook can match its wamid straight away.
@@ -637,6 +715,10 @@ def _graph_err(error: str, resp_or_exc: Any, **extra: Any) -> dict[str, Any]:
 
 def _graph_post_message(acct: dict[str, Any], data: dict[str, Any], http_post: Callable[..., Any] | None = None) -> str:
 	"""POST a ``/messages`` body with the account credentials; returns the wamid or raises BridgeError."""
+	from huf.ai import whatsapp_account_events as _ae
+
+	if (refusal := _ae.send_refusal(acct.get("phone_id"))):
+		raise BridgeError(refusal)
 	http_post = http_post or _default_post
 	url = f"{acct['url']}/{acct['version']}/{acct['phone_id']}/messages"
 	try:
@@ -670,7 +752,7 @@ def _template_row(docname: str) -> dict[str, Any] | None:
 		docname,
 		[
 			"template", "header_type", "header", "sample", "actual_name", "template_name", "language_code", "status",
-			"whatsapp_account",
+			"whatsapp_account", "category",
 		],
 		as_dict=True,
 	)
@@ -715,7 +797,7 @@ def _mirror_template_send(acct: dict[str, Any], docname: str, to: str, wamid: st
 	}
 	try:
 		doc = frappe.get_doc(doc_values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			frappe.db.commit()
 		return {"success": True, "name": doc.name, "message_id": wamid, "status": doc.get("status")}
@@ -837,8 +919,14 @@ def send_template(
 	language_code: str | None = None,
 	button_params: list | None = None,
 	http_post: Callable[..., Any] | None = None,
+	gateway_name: str | None = None,
 ) -> dict[str, Any]:
 	"""Send an approved template.
+
+	Goes through :mod:`huf.ai.whatsapp_outbound_policy` first: a STOPped contact, a BSUID recipient, a
+	template that is not APPROVED and marketing to a contact who stopped marketing are refused with a
+	``BridgeError`` whose ``error`` is the policy code. ``gateway_name`` scopes the checks; without it
+	every Gateway linked to the account is checked.
 
 	Plain body-only sends of POSITIONAL templates use an Outgoing ``WhatsApp Message``
 	(use_template=1), which frappe_whatsapp sends. Everything else (header or button parameters,
@@ -858,11 +946,17 @@ def send_template(
 	for NAMED mismatches, with the full ``errors`` list).
 	"""
 	acct = _account_or_error(account_name)
+	_refuse_if_disconnected(acct)
 	docname = _template_docname(account_name, template_name, language_code)
 	tpl = _template_row(docname)
 	if tpl and (tpl.get("whatsapp_account") or "") != (account_name or ""):
 		# the docname resolves to another account's template: never send it from this account
 		raise BridgeError(_err("template_not_found", message="That template does not belong to this WhatsApp account."))
+
+	try:
+		policy.enforce_template(account_name, to, tpl, gateway_name)
+	except policy.OutboundRefused as exc:
+		raise BridgeError(_err(exc.code, message=str(exc))) from exc
 
 	other_buttons, copy_comps, errors = split_copy_code_params(button_params)
 	view = _send_view(tpl) if tpl else _params_template_view(body_params, header_params)
@@ -898,7 +992,7 @@ def send_template(
 		body_map = {str(i + 1): p for i, p in enumerate(params)}
 
 	if named or any(c.get("type") in ("header", "button") for c in components) or (tpl and _has_dynamic_url(tpl)):
-		if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+		if not _may_bypass(trusted) and not frappe.has_permission("WhatsApp Message", "create"):
 			raise frappe.PermissionError("Not permitted to send WhatsApp messages")
 		template_payload: dict[str, Any] = {
 			"name": (tpl or {}).get("actual_name") or (tpl or {}).get("template_name") or template_name,
@@ -927,7 +1021,9 @@ def send_template(
 				mirror["template_header_parameters"] = str(hp.get("text"))
 			elif hp.get("type") in ("image", "video", "document"):
 				mirror["attach"] = (hp.get(hp["type"]) or {}).get("link")
-		return _mirror_template_send(acct, docname, to, wamid, mirror, trusted)
+		result = _mirror_template_send(acct, docname, to, wamid, mirror, trusted)
+		policy.note_template_sent(account_name, to, gateway_name)
+		return result
 
 	values: dict[str, Any] = {
 		"doctype": "WhatsApp Message",
@@ -943,7 +1039,7 @@ def send_template(
 	}
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			# Gateway reply path runs in a background job: persist the outgoing row
 			# now so Meta's status webhook can match its wamid straight away.
@@ -952,6 +1048,7 @@ def send_template(
 		raise
 	except Exception as exc:
 		raise BridgeError(_err("send_failed", message=_redact(exc))) from exc
+	policy.note_template_sent(account_name, to, gateway_name)
 	return _readback(doc)
 
 
@@ -1075,7 +1172,7 @@ def send_media(
 		values["reply_to_message_id"] = reply_to
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			frappe.db.commit()
 	except frappe.PermissionError:
@@ -1091,6 +1188,10 @@ def send_media(
 # ---------------------------------------------------------------------------
 def _post_typed_message(acct: dict[str, Any], data: dict[str, Any], http_post: Callable[..., Any] | None = None) -> str:
 	"""POST a ``/messages`` body; returns the wamid or raises BridgeError carrying the structured Graph error."""
+	from huf.ai import whatsapp_account_events as _ae
+
+	if (refusal := _ae.send_refusal(acct.get("phone_id"))):
+		raise BridgeError(refusal)
 	http_post = http_post or _default_post
 	url = f"{acct['url']}/{acct['version']}/{acct['phone_id']}/messages"
 	try:
@@ -1141,7 +1242,7 @@ def _mirror_direct_send(acct: dict[str, Any], payload: dict[str, Any], wamid: st
 		values["reply_to_message_id"] = payload["context"]["message_id"]
 	try:
 		doc = frappe.get_doc(values)
-		doc.insert(ignore_permissions=bool(trusted))
+		doc.insert(ignore_permissions=_may_bypass(trusted))
 		if trusted:
 			frappe.db.commit()
 		return {"success": True, "name": doc.name, "message_id": wamid, "status": doc.get("status")}
@@ -1154,7 +1255,7 @@ def _send_payload(
 	account_name: str, payload: dict[str, Any], trusted: bool = False, http_post: Callable[..., Any] | None = None
 ) -> dict[str, Any]:
 	acct = _account_or_error(account_name)
-	if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+	if not _may_bypass(trusted) and not frappe.has_permission("WhatsApp Message", "create"):
 		raise frappe.PermissionError("Not permitted to send WhatsApp messages")
 	wamid = _post_typed_message(acct, payload, http_post)
 	return _mirror_direct_send(acct, payload, wamid, trusted)
@@ -1275,7 +1376,7 @@ def upload_media(
 	16 MB, document 100 MB, sticker webp 100 KB static / 500 KB animated); a failing file never reaches Meta.
 	"""
 	acct = _account_or_error(account_name)
-	if not trusted and not frappe.has_permission("WhatsApp Message", "create"):
+	if not _may_bypass(trusted) and not frappe.has_permission("WhatsApp Message", "create"):
 		raise frappe.PermissionError("Not permitted to send WhatsApp messages")
 	mime = wm.normalize_mime(mime_type)
 	kind, errors = wm.validate_upload(mime_type, content, kind, bool(voice))
@@ -3371,6 +3472,79 @@ def media_limit_for_mime(mime: str) -> int:
 	return MEDIA_LIMITS_BY_KIND["document"]
 
 
+# Generic MIME types WhatsApp sends for files it cannot label (commonly .m4a documents).
+_GENERIC_MIMES = ("", "application/octet-stream")
+# Filename extension -> MIME, for inferring a generic declared type. Every value must already
+# pass DEFAULT_MIME_PREFIXES; anything absent here (svg, html, exe, sh, js, csv, ...) is refused.
+_EXTENSION_MIME = {
+	"m4a": "audio/mp4",
+	"mp3": "audio/mpeg",
+	"ogg": "audio/ogg",
+	"oga": "audio/ogg",
+	"opus": "audio/ogg",
+	"wav": "audio/wav",
+	"aac": "audio/aac",
+	"amr": "audio/amr",
+	"mp4": "video/mp4",
+	"3gp": "video/3gpp",
+	"pdf": "application/pdf",
+	"jpg": "image/jpeg",
+	"jpeg": "image/jpeg",
+	"png": "image/png",
+	"webp": "image/webp",
+	"txt": "text/plain",
+	"doc": "application/msword",
+	"docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"xls": "application/vnd.ms-excel",
+	"xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	"ppt": "application/vnd.ms-powerpoint",
+	"pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+_OLE_DOC_MIMES = ("application/msword", "application/vnd.ms-excel", "application/vnd.ms-powerpoint")
+
+
+def _mime_from_filename(name: str) -> str:
+	"""MIME type for a filename's extension, or "" when the extension is unknown or refused."""
+	base = str(name or "").replace("\\", "/").rsplit("/", 1)[-1]
+	if "." not in base:
+		return ""
+	return _EXTENSION_MIME.get(base.rsplit(".", 1)[-1].strip().lower(), "")
+
+
+def _signature_matches(mime: str, content: bytes) -> bool:
+	"""Check the payload's magic bytes against the inferred MIME. Unknown MIMEs never match."""
+	head = content[:16]
+	if mime in ("audio/mp4", "video/mp4", "video/3gpp"):
+		return head[4:8] == b"ftyp"
+	if mime in ("audio/mpeg", "audio/aac"):
+		if head.startswith(b"ID3"):
+			return True
+		if len(head) < 2 or head[0] != 0xFF:
+			return False
+		return (head[1] & 0xE0) == 0xE0 if mime == "audio/mpeg" else (head[1] & 0xF6) == 0xF0
+	if mime == "audio/ogg":
+		return head.startswith(b"OggS")
+	if mime == "audio/wav":
+		return head[:4] == b"RIFF" and head[8:12] == b"WAVE"
+	if mime == "audio/amr":
+		return head.startswith(b"#!AMR")
+	if mime == "image/jpeg":
+		return head.startswith(b"\xff\xd8\xff")
+	if mime == "image/png":
+		return head.startswith(b"\x89PNG\r\n\x1a\n")
+	if mime == "image/webp":
+		return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+	if mime == "application/pdf":
+		return head.startswith(b"%PDF")
+	if mime.startswith("application/vnd.openxmlformats-officedocument."):
+		return head.startswith(b"PK\x03\x04")
+	if mime in _OLE_DOC_MIMES:
+		return head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+	if mime == "text/plain":
+		return b"\x00" not in content
+	return False
+
+
 def download_media(
 	account_name: str,
 	media_id: str,
@@ -3379,12 +3553,18 @@ def download_media(
 	http_get: Callable[..., Any] | None = None,
 	credentials: dict[str, Any] | None = None,
 	kind: str | None = None,
+	filename: str | None = None,
 ) -> dict[str, Any]:
 	"""Fetch media by id at call time. Raises ValueError on caps/mime/failure.
 
 	The size cap is ``max_bytes`` when given, else Meta's per-kind limit (``kind``
 	when known, e.g. sticker, otherwise derived from the MIME type); declared and
 	streamed sizes are both enforced.
+
+	A generic declared type (empty or ``application/octet-stream``) is replaced by the
+	MIME inferred from ``filename`` (or Meta's filename). The inferred type must be in
+	the allow-list, and the payload's magic bytes must match it. Specific declared
+	types are never overridden by the extension.
 
 	``credentials`` (``token``, optional ``url``/``version``) serves direct-mode
 	gateways that have no WhatsApp Account; otherwise the account is resolved.
@@ -3409,13 +3589,16 @@ def download_media(
 	)
 	meta_resp.raise_for_status()
 	meta = meta_resp.json()
-	mime = str(meta.get("mime_type") or "").split(";")[0].strip().lower()
+	declared = str(meta.get("mime_type") or "").split(";")[0].strip().lower()
+	name_hint = str(filename or meta.get("filename") or "")
+	infer = declared in _GENERIC_MIMES
+	mime = _mime_from_filename(name_hint) if infer else declared
 	if (
 		not mime
 		or mime.startswith(_BLOCKED_MIME_PREFIXES)
 		or not any(mime.startswith(p) for p in allowed_mime_prefixes)
 	):
-		raise ValueError(f"mime_not_allowed: {mime or 'unknown'}")
+		raise ValueError(f"mime_not_allowed: {declared or 'unknown'}")
 	if max_bytes is None:
 		max_bytes = MEDIA_LIMITS_BY_KIND.get(str(kind or "").lower()) or media_limit_for_mime(mime)
 	declared = meta.get("file_size")
@@ -3444,7 +3627,9 @@ def download_media(
 		close = getattr(resp, "close", None)
 		if callable(close):
 			close()
-	filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(meta.get("filename") or media_id))[:100] or "media"
+	if infer and not _signature_matches(mime, content):
+		raise ValueError(f"mime_not_allowed: {declared or 'unknown'}")
+	filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(filename or meta.get("filename") or media_id))[:100] or "media"
 	return {"content": content, "mime_type": mime, "filename": filename}
 
 

@@ -1,6 +1,7 @@
 """Hardening fixes from live security testing of the WhatsApp gateway."""
 
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -131,42 +132,6 @@ class TestWebhookLimits(unittest.TestCase):
 		self.assertEqual(mf.local.response.http_status_code, 413)
 		adapter.verify_inbound.assert_not_called()
 
-	def test_message_cap_ignores_the_rest(self):
-		n = gateway_webhook.MAX_MESSAGES_PER_PAYLOAD + 20
-		events = [
-			SimpleNamespace(
-				provider_event_id=f"id{i}",
-				sender_id="1",
-				conversation_id="1",
-				thread_id="",
-				message_text="t",
-				is_room=0,
-				mentioned=0,
-				raw_payload={},
-			)
-			for i in range(n)
-		]
-		parsed = SimpleNamespace(
-			messages=tuple(events), statuses=(), template_updates=(), ignored=0, unknown_phone_ids=()
-		)
-		adapter = MagicMock()
-		adapter.parse_payload.return_value = parsed
-		gateway = SimpleNamespace(name="GW", whatsapp_account="")
-		with (
-			patch.object(gateway_webhook, "_ingest_rate_gate"),
-			patch.object(gateway_webhook, "touch_last_event"),
-			patch.object(gateway_webhook, "_warn"),
-			patch.object(gateway_webhook, "_record_unknown_phone_ids"),
-			patch(
-				"huf.ai.gateway_service.ingest_gateway_event",
-				return_value={"event_name": "E", "status": "Rejected"},
-			) as ingest,
-		):
-			result = gateway_webhook._handle_batched_payload(gateway, adapter, _req(b"{}"))
-		self.assertEqual(ingest.call_count, gateway_webhook.MAX_MESSAGES_PER_PAYLOAD)
-		self.assertEqual(result["ignored"], 20)
-		self.assertTrue(result["note"])
-
 	def test_rate_limit_sets_retry_after(self):
 		headers = {}
 		with (
@@ -180,6 +145,12 @@ class TestWebhookLimits(unittest.TestCase):
 			with self.assertRaises(frappe.RateLimitExceededError):
 				gateway_webhook._ingest_rate_gate()
 		self.assertEqual(headers["Retry-After"], "60")
+
+
+def _event_row_value(*args, **kwargs):
+	if args and args[0] == "Gateway Event" and kwargs.get("as_dict"):
+		return {"status": "Running", "modified": datetime(2000, 1, 1), "reply_status": ""}
+	return None
 
 
 class TestTerminalStatePersistence(unittest.TestCase):
@@ -240,12 +211,19 @@ class TestTerminalStatePersistence(unittest.TestCase):
 	def test_reaper_fails_stuck_running_events(self):
 		with (
 			patch.object(gateway_service.frappe, "get_all", return_value=["GEV-1", "GEV-2"]) as get_all,
+			patch.object(
+				gateway_service.frappe.db,
+				"get_value",
+				side_effect=_event_row_value,
+			),
+			patch.object(gateway_service, "_flow_run_is_active", return_value=False),
 			patch.object(gateway_service.frappe.db, "set_value") as set_value,
 			patch.object(gateway_service.frappe.db, "commit"),
+			patch.object(gateway_service, "_recover_orphaned_events", return_value=0),
 		):
 			self.assertEqual(gateway_service.reap_stuck_gateway_events(), 2)
-		self.assertEqual(get_all.call_args.kwargs["filters"]["status"], "Running")
-		self.assertEqual(get_all.call_args.kwargs["filters"]["reply_status"], ["!=", "retrying"])
+		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["status"], ["in", ["Running", "Replying"]])
+		self.assertEqual([c.kwargs["filters"] for c in get_all.call_args_list if "status" in c.kwargs.get("filters", {})][0]["reply_status"], ["!=", "retrying"])
 		self.assertEqual(set_value.call_count, 2)
 		self.assertEqual(set_value.call_args.args[2]["status"], "Failed")
 

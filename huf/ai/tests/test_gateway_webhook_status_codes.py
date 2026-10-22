@@ -48,18 +48,46 @@ class TestGatewayWebhookStatusCodes(unittest.TestCase):
         assert result == {"success": False, "error": "Unknown gateway"}
         assert mock_frappe.local.response.http_status_code == 404
 
+    @patch("huf.ai.gateway_webhook.get_gateway_adapter")
+    @patch("huf.ai.gateway_webhook._inbound_request")
     @patch("huf.ai.gateway_webhook.frappe")
-    def test_disabled_gateway_is_403(self, mock_frappe):
+    def test_disabled_gateway_is_403(self, mock_frappe, mock_request, mock_adapter):
         mock_frappe.request = SimpleNamespace(args={"gateway_name": "Support Slack"})
         mock_frappe.local = SimpleNamespace(response=FakeResponse())
+        mock_frappe.form_dict = {}
         mock_frappe.get_doc.return_value = SimpleNamespace(
             name="Support Slack", provider="Slack", is_enabled=0
         )
+        mock_request.return_value = SimpleNamespace(method="POST", body=b"{}")
+        mock_adapter.return_value = MagicMock(spec=[])
 
         result = gateway_webhook.handle_gateway_webhook()
 
         assert result == {"success": False, "error": "Gateway is disabled"}
         assert mock_frappe.local.response.http_status_code == 403
+
+    @patch("huf.ai.gateway_webhook._text_response")
+    @patch("huf.ai.gateway_webhook._ingest_rate_gate")
+    @patch("huf.ai.gateway_webhook.get_gateway_adapter")
+    @patch("huf.ai.gateway_webhook._inbound_request")
+    @patch("huf.ai.gateway_webhook.frappe")
+    def test_get_verification_works_on_a_disabled_gateway(
+        self, mock_frappe, mock_request, mock_adapter, _gate, mock_text
+    ):
+        """Meta verifies the callback when it is saved, before the gateway is enabled."""
+        mock_frappe.request = SimpleNamespace(args={"gateway_name": "G1"})
+        mock_frappe.local = SimpleNamespace(response=FakeResponse())
+        mock_frappe.form_dict = {}
+        mock_frappe.get_doc.return_value = SimpleNamespace(name="G1", provider="Slack", is_enabled=0)
+        mock_request.return_value = SimpleNamespace(method="GET", body=b"")
+        adapter = MagicMock()
+        adapter.verify_url.return_value = "challenge-123"
+        mock_adapter.return_value = adapter
+
+        gateway_webhook.handle_gateway_webhook()
+
+        mock_text.assert_called_once_with("challenge-123")
+        assert mock_frappe.local.response.http_status_code == 200
 
     @patch("huf.ai.gateway_webhook.get_gateway_adapter")
     @patch("huf.ai.gateway_webhook._inbound_request")

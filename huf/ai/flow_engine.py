@@ -292,6 +292,7 @@ def create_flow_run(
 	mode: str | None = None,
 	conversation_mode: str | None = None,
 	trigger_type: str = "Manual",
+	ignore_permissions: bool = False,
 ) -> "frappe.Document":
 	"""
 	Create a new FlowRun document from a FlowDefinition.
@@ -305,6 +306,7 @@ def create_flow_run(
 	    mode: Override mode (normal/agentic). If None, uses definition settings.
 	    conversation_mode: Override conversation_mode. If None, uses definition settings.
 	    trigger_type: Manual / Webhook / Schedule / Doc Event
+	    ignore_permissions: for trusted callers that already authorised the route (Gateway)
 
 	Returns:
 	    Flow Run document
@@ -353,7 +355,7 @@ def create_flow_run(
 	# Authenticated callers are already verified by the public API.
 	# Webhook triggers run as Guest after HMAC validation, so the internal
 	# Flow Run record must be created on behalf of the system.
-	if frappe.session.user == "Guest":
+	if ignore_permissions or frappe.session.user == "Guest":
 		flow_run.insert(ignore_permissions=True)
 	else:
 		if not frappe.has_permission("Flow Run", "create", doc=flow_run):
@@ -779,7 +781,7 @@ def _execute_loop(flow_run, nodes_map: dict, edges_list: list, settings: dict):
 		_fail_flow_run(flow_run, unhandled_failures[0])
 		return result
 
-	_complete_flow_run(flow_run)
+	_complete_flow_run(flow_run, reply_text=_flow_reply_text(flow_run, settings, result))
 	_publish_flow_event(flow_run, "flow_completed", {"node_id": result.node_id, "status": "Success"})
 	return result
 
@@ -921,6 +923,36 @@ def _exec_agent_run(flow_run, node: dict, config: dict, settings: dict) -> dict:
 		return {"status": "failed", "error": str(e)}
 
 
+def _bound_gateway(flow_run, config: dict, run_id: str = ""):
+	"""Trusted gateway for the WhatsApp tool: the gateway that started this flow, else the node's ``gateway``.
+
+	Model/tool arguments never select it; empty means the tool fails closed (gateway_context_required).
+	"""
+	from huf.ai.tools.whatsapp import trusted_gateway
+
+	gateway = ""
+	contact = ""
+	try:
+		payload = flow_run.get("trigger_payload")
+		payload = json.loads(payload) if isinstance(payload, str) else (payload or {})
+		event = payload.get("gateway_event") if isinstance(payload, dict) else None
+		if event:
+			row = frappe.db.get_value("Gateway Event", event, ["gateway", "sender_id"], as_dict=True) or {}
+			gateway = row.get("gateway") or ""
+			contact = row.get("sender_id") or ""
+	except Exception:
+		gateway, contact = "", ""
+	if not gateway:
+		# A node-configured gateway is the flow author's choice: they need write access to it.
+		gateway = str(config.get("gateway") or "")
+		author = getattr(flow_run, "owner", None)
+		if gateway and not (
+			author and frappe.db.exists("Gateway", gateway) and frappe.has_permission("Gateway", "write", doc=gateway, user=author)
+		):
+			gateway = ""  # fail closed: the tool reports gateway_context_required
+	return trusted_gateway(gateway, run_id=run_id, contact=contact)
+
+
 def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""Execute tool.call node - deterministic tool execution.
 
@@ -1031,7 +1063,7 @@ def _exec_tool_call(flow_run, node: dict, config: dict, settings: dict) -> dict:
 					"error": " ".join(t for t in texts if t) or "MCP tool reported an error" if is_error else "",
 				}
 		else:
-			with tool_run_context(invocation_ctx):
+			with tool_run_context(invocation_ctx), _bound_gateway(flow_run, config, getattr(run_doc, "name", "") or ""):
 				result = execute_tool(tool_name, args)
 
 		is_success = result.get("success", False) if isinstance(result, dict) else bool(result)
@@ -2181,16 +2213,46 @@ def _verify_approval_permission(waiting: dict):
 				)
 
 
-def _complete_flow_run(flow_run):
+def _flow_reply_text(flow_run, settings, result) -> str | None:
+	"""The text a Gateway-triggered run replies with: its final ``output`` node value (or ``reply`` in context)."""
+	try:
+		ctx = _context_of(flow_run, settings)
+		node_id = getattr(result, "node_id", None)
+		nodes = {n.get("id"): n for n in _pinned_version(flow_run).graph.get("nodes", [])}
+		value = None
+		if (nodes.get(node_id) or {}).get("type") == "output":
+			value = ctx.node_outputs.get(node_id)
+		if value is None:
+			value = ctx.data.get("reply")
+		if isinstance(value, dict):
+			value = value.get("reply") or value.get("text") or value.get("message")
+		return str(value) if isinstance(value, (str, int, float)) and str(value).strip() else None
+	except Exception:
+		return None
+
+
+def _sync_gateway_event(flow_run, status: str, reply_text: str | None = None, error: str = ""):
+	"""Gateway-triggered runs hand their outcome to the gateway reply pipeline."""
+	if getattr(flow_run, "trigger_type", None) != "Gateway":
+		return
+	from huf.ai.gateway_service import finish_flow_event
+
+	finish_flow_event(flow_run.name, status, reply_text, error)
+	commit_if_background()
+
+
+def _complete_flow_run(flow_run, reply_text: str | None = None):
 	"""Mark a flow run as successfully completed."""
 	flow_run.db_set({"status": "Success", "completed_at": now_datetime()})
 	commit_if_background()
+	_sync_gateway_event(flow_run, "Success", reply_text)
 
 
 def _fail_flow_run(flow_run, error_msg: str):
 	"""Mark a flow run as failed."""
 	flow_run.db_set({"status": "Failed", "last_error": error_msg, "completed_at": now_datetime()})
 	commit_if_background()
+	_sync_gateway_event(flow_run, "Failed", error=error_msg)
 	_publish_flow_event(flow_run, "flow_failed", {"error": error_msg})
 
 
