@@ -831,10 +831,6 @@ def handle_gateway_webhook() -> dict | None:
 	except frappe.DoesNotExistError:
 		frappe.local.response.http_status_code = 404
 		return {"success": False, "error": "Unknown gateway"}
-	if not gateway.is_enabled:
-		frappe.local.response.http_status_code = 403
-		return {"success": False, "error": "Gateway is disabled"}
-
 	declared = getattr(frappe.request, "content_length", None) if frappe.request is not None else None
 	if declared is not None and declared > MAX_BODY_BYTES:
 		frappe.local.response.http_status_code = 413
@@ -858,6 +854,11 @@ def handle_gateway_webhook() -> dict | None:
 			_record_webhook_signal(gateway, "last_verify_ok_at")
 		_text_response(challenge)
 		return None
+	# Only ingest is gated on is_enabled: Meta's callback verification (GET) runs when the
+	# callback is saved, normally before the gateway is enabled.
+	if not gateway.is_enabled:
+		frappe.local.response.http_status_code = 403
+		return {"success": False, "error": "Gateway is disabled"}
 	batched = _supports_batch_parse(adapter)
 	if not batched:
 		_ingest_rate_gate()
