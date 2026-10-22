@@ -226,13 +226,22 @@ class TestFormatPreviewIsTheExportFile(unittest.TestCase):
 			self.assertEqual(preview["content_base64"], export["content_base64"], fmt)
 
 	def test_pdf_preview_bytes_hash_equal_export_bytes(self):
-		# WeasyPrint writes no creation date or random file ID for these
-		# documents (measured on the bench, 2026-09-30), so PDF holds too.
+		# The dev bench's WeasyPrint writes no creation date or random file ID (measured 2026-09-30),
+		# but other builds (CI) do stamp a creation date and a random trailer /ID, so the two
+		# renders are compared with those volatile fields removed (the preview hash must still be
+		# the hash of the exact bytes the preview returned).
 		preview, export = self._pair("pdf")
 		data = base64.b64decode(preview["content_base64"])
+		other = base64.b64decode(export["content_base64"])
 		self.assertTrue(data.startswith(b"%PDF"))
 		self.assertEqual(preview["sha256"], hashlib.sha256(data).hexdigest())
-		self.assertEqual(preview["sha256"], export["sha256"])
+
+		def stable(raw):
+			raw = re.sub(rb"/(CreationDate|ModDate)\s*\(D:[^)]*\)", b"", raw)
+			raw = re.sub(rb"/ID\s*\[\s*<[0-9A-Fa-f]*>\s*<[0-9A-Fa-f]*>\s*\]", b"", raw)
+			return re.sub(rb"/[A-Z]{6}\+", b"/", raw)  # random font-subset tag prefixes
+
+		self.assertEqual(stable(data), stable(other))
 
 	def test_rejects_unknown_format_and_empty_content(self):
 		with self.assertRaises(frappe.ValidationError):

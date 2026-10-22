@@ -191,7 +191,8 @@ class TestDirectModeMessageLog(_Base):
 			self.make_event(self.gw, f"wamid.L{i}", i)
 		self.assertEqual(len(self.log(limit=0)["items"]), 1)  # clamped up to 1
 		self.assertEqual(len(self.log(limit=-5)["items"]), 1)
-		self.assertEqual(len(self.log(limit="x")["items"]), 3)  # falls back to the default
+		with self.assertRaises(frappe.exceptions.FrappeTypeError):  # `limit: int` is type-checked on the whitelisted API
+			self.log(limit="x")
 		self.assertEqual(len(self.log(limit=10_000)["items"]), 3)
 
 	def test_gateways_are_isolated(self):
