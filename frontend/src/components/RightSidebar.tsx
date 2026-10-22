@@ -8,6 +8,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { buildBranchOptionLabels, findUpstreamNodeIds } from '@/lib/flowBranchTargets';
 import { isInvalidJsonString } from '@/lib/flowHttpJson';
 import { Label } from './ui/label';
+import { FlowValueInput } from './FlowValueInput';
+import { TRANSFORM_OPS, getTransformOp } from '@/lib/flowTransformOps';
 import { Combobox } from './ui/combobox';
 import { Checkbox } from './ui/checkbox';
 import { linkRoutes } from '@/lib/link-routes';
@@ -1144,93 +1146,169 @@ export function RightSidebar({ onToggle, variant = 'panel' }: RightSidebarProps)
               }
 
               if (config.type === 'transform') {
-                const transformations = config.transformations || [];
+                const opSpec = getTransformOp(config.op);
+                const input = config.input ?? {};
                 return (
                   <div className="space-y-3">
                     <Label weight="semibold" className="mb-2 block">Transform data configuration</Label>
-                    <div className="text-xs text-muted-foreground p-2 bg-muted/30 rounded-md mb-2">
-                      Map, copy, or template data between context variables.
+                    <div>
+                      <Label htmlFor="transform-op" size="sm">Operation</Label>
+                      <Select
+                        value={config.op || ''}
+                        onValueChange={(v) => {
+                          handleUpdateActionConfigMany({ op: v, input: {} });
+                        }}
+                      >
+                        <SelectTrigger id="transform-op" size="sm">
+                          <SelectValue placeholder="Select operation" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {TRANSFORM_OPS.map((o) => (
+                            <SelectItem key={o.name} value={o.name}>
+                              {o.label} ({o.name})
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </div>
-                    {transformations.map((t, i: number) => (
+                    {opSpec?.params.map((param) => (
+                      <FlowValueInput
+                        key={`${opSpec.name}-${param}`}
+                        id={`transform-in-${param}`}
+                        label={param}
+                        optional={opSpec.optional?.includes(param)}
+                        value={input[param]}
+                        onChange={(v) => handleUpdateActionConfig('input', { ...input, [param]: v })}
+                      />
+                    ))}
+                  </div>
+                );
+              }
+
+              if (config.type === 'state-get' || config.type === 'state-set' || config.type === 'state-delete') {
+                return (
+                  <div className="space-y-3">
+                    <Label weight="semibold" className="mb-2 block">
+                      {config.type === 'state-get' ? 'Get state' : config.type === 'state-set' ? 'Set state' : 'Delete state'}
+                    </Label>
+                    <div className="text-xs text-muted-foreground p-2 bg-muted/30 rounded-md">
+                      State is scoped to this flow. Use a template to key by sender, e.g. cart:{'{sender}'}.
+                    </div>
+                    <FlowValueInput
+                      id="state-key"
+                      label="Key"
+                      value={config.key}
+                      onChange={(v) => handleUpdateActionConfig('key', v)}
+                    />
+                    {config.type === 'state-get' && (
+                      <FlowValueInput
+                        id="state-default"
+                        label="Default"
+                        optional
+                        value={config.default}
+                        onChange={(v) => handleUpdateActionConfig('default', v)}
+                      />
+                    )}
+                    {config.type === 'state-set' && (
+                      <>
+                        <FlowValueInput
+                          id="state-value"
+                          label="Value"
+                          value={config.value}
+                          onChange={(v) => handleUpdateActionConfig('value', v)}
+                        />
+                        <div>
+                          <Label htmlFor="state-ttl" size="sm">TTL seconds (optional, max 2592000)</Label>
+                          <Input
+                            id="state-ttl"
+                            type="number"
+                            min={1}
+                            max={2592000}
+                            value={typeof config.ttl_seconds === 'number' ? config.ttl_seconds : ''}
+                            onChange={(e) =>
+                              handleUpdateActionConfig('ttl_seconds', e.target.value === '' ? undefined : parseInt(e.target.value))
+                            }
+                            placeholder="default 86400"
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              }
+
+              if (config.type === 'doc-create') {
+                const fields = config.fields ?? {};
+                const entries = Object.entries(fields);
+                return (
+                  <div className="space-y-3">
+                    <Label weight="semibold" className="mb-2 block">Create document</Label>
+                    <div className="text-xs text-muted-foreground p-2 bg-muted/30 rounded-md">
+                      The DocType must be in the site allow-list (huf_flow_create_doc_doctypes).
+                    </div>
+                    <div>
+                      <Label htmlFor="doc-create-doctype" size="sm">DocType</Label>
+                      <Input
+                        id="doc-create-doctype"
+                        value={config.doctype || ''}
+                        onChange={(e) => handleUpdateActionConfig('doctype', e.target.value)}
+                        placeholder="e.g., ToDo"
+                      />
+                    </div>
+                    {entries.map(([name, val], i) => (
                       <div key={i} className="p-3 bg-muted/20 border rounded-md space-y-2">
-                        <div className="flex justify-between items-center">
-                          <span className="text-xs font-medium">Transformation #{i + 1}</span>
+                        <div className="flex items-end gap-2">
+                          <div className="flex-1">
+                            <Label htmlFor={`doc-field-${i}-name`} size="sm">Field name</Label>
+                            <Input
+                              id={`doc-field-${i}-name`}
+                              value={name}
+                              onChange={(e) => {
+                                const next = Object.fromEntries(
+                                  entries.map(([k, v], j) => (j === i ? [e.target.value, v] : [k, v]))
+                                );
+                                handleUpdateActionConfig('fields', next);
+                              }}
+                            />
+                          </div>
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="h-6 px-2 text-destructive"
-                            onClick={() => {
-                              const updated = [...transformations];
-                              updated.splice(i, 1);
-                              handleUpdateActionConfig('transformations', updated);
-                            }}
+                            className="h-8 px-2 text-destructive"
+                            onClick={() =>
+                              handleUpdateActionConfig('fields', Object.fromEntries(entries.filter((_, j) => j !== i)))
+                            }
                           >
                             ×
                           </Button>
                         </div>
-                        <div>
-                          <Label htmlFor={`transform-${i}-source`} size="sm">Source field</Label>
-                          <Input
-                            id={`transform-${i}-source`}
-                            value={t.source_field || ''}
-                            onChange={(e) => {
-                              const updated = [...transformations];
-                              updated[i] = { ...t, source_field: e.target.value };
-                              handleUpdateActionConfig('transformations', updated);
-                            }}
-                            placeholder="e.g., api_response.data"
-                            size="sm"
-                          />
-                        </div>
-                        <div>
-                          <Label htmlFor={`transform-${i}-target`} size="sm">Target field</Label>
-                          <Input
-                            id={`transform-${i}-target`}
-                            value={t.target_field || ''}
-                            onChange={(e) => {
-                              const updated = [...transformations];
-                              updated[i] = { ...t, target_field: e.target.value };
-                              handleUpdateActionConfig('transformations', updated);
-                            }}
-                            placeholder="e.g., processed_data"
-                            size="sm"
-                          />
-                        </div>
-                        <div>
-                          <Label htmlFor={`transform-${i}-operation`} size="sm">Operation</Label>
-                          <Select
-                            value={t.operation || 'copy'}
-                            onValueChange={(v) => {
-                              const updated = [...transformations];
-                              updated[i] = { ...t, operation: v as 'copy' | 'map' | 'template' };
-                              handleUpdateActionConfig('transformations', updated);
-                            }}
-                          >
-                            <SelectTrigger id={`transform-${i}-operation`} size="sm">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="copy">Copy</SelectItem>
-                              <SelectItem value="map">Map</SelectItem>
-                              <SelectItem value="template">Template</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        </div>
+                        <FlowValueInput
+                          id={`doc-field-${i}-value`}
+                          label="Value"
+                          value={val}
+                          onChange={(v) =>
+                            handleUpdateActionConfig('fields', Object.fromEntries(entries.map(([k, o], j) => (j === i ? [k, v] : [k, o]))))
+                          }
+                        />
                       </div>
                     ))}
                     <Button
                       variant="outline"
                       size="sm"
                       className="w-full"
-                      onClick={() => {
-                        handleUpdateActionConfig('transformations', [
-                          ...transformations,
-                          { source_field: '', target_field: '', operation: 'copy' }
-                        ]);
-                      }}
+                      onClick={() => handleUpdateActionConfig('fields', { ...fields, [`field_${entries.length + 1}`]: '' })}
                     >
-                      + Add Transformation
+                      + Add field
                     </Button>
+                  </div>
+                );
+              }
+
+              if (config.type === 'unknown') {
+                return (
+                  <div className="text-xs text-muted-foreground p-2 bg-muted/30 rounded-md">
+                    Node type <span className="font-mono">{config.backend_type}</span> has no editor in this
+                    builder. It is kept as-is and saved unchanged.
                   </div>
                 );
               }

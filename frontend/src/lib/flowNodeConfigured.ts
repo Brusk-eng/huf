@@ -28,7 +28,15 @@ export function actionHasConfiguredContent(data: Pick<FlowNodeData, 'actionConfi
     case 'http-request':
       return Boolean(config.url?.trim());
     case 'transform':
-      return Boolean(config.transformations && config.transformations.length > 0);
+      return Boolean(config.op?.trim());
+    case 'state-get':
+    case 'state-set':
+    case 'state-delete':
+      return Boolean(config.key !== undefined && config.key !== '' && config.key !== null);
+    case 'doc-create':
+      return Boolean(config.doctype?.trim());
+    case 'unknown':
+      return true;
     case 'loop':
       return Boolean(config.iterate_over?.trim());
     default:

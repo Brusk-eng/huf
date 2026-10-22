@@ -679,8 +679,8 @@ describe('flowSerializer', () => {
 
       // Unknown types should be mapped to 'action'
       expect(deserialized.nodes[0].type).toBe('action');
-      // ActionConfig type should map back to 'tool-call' (default)
-      expect(deserialized.nodes[0].data?.actionConfig?.type).toBe('tool-call');
+      // Unrecognised backend types are preserved, not coerced into a tool call
+      expect(deserialized.nodes[0].data?.actionConfig?.type).toBe('unknown');
     });
 
     it('derives labeled and unlabeled edges from node next/on_error/self-routing config', () => {

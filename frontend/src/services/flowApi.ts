@@ -52,7 +52,8 @@ export interface BackendFlowGraph {
 export type BackendNodeType =
     | 'trigger.webhook' | 'trigger.schedule' | 'trigger.doc-event' | 'trigger.unset'
     | 'agent.run' | 'tool.call' | 'router.llm' | 'human.approval'
-    | 'condition' | 'http_request' | 'transform' | 'loop' | 'output';
+    | 'condition' | 'http_request' | 'transform' | 'loop' | 'output'
+    | 'state.get' | 'state.set' | 'state.delete' | 'doc.create';
 
 export interface BackendNode {
     id: string;

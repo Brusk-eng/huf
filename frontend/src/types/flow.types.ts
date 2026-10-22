@@ -48,7 +48,11 @@ export type ActionType =
   | 'condition'
   | 'http-request'
   | 'transform'
-  | 'loop';
+  | 'loop'
+  | 'state-get'
+  | 'state-set'
+  | 'state-delete'
+  | 'doc-create';
 
 export interface WebhookTriggerConfig {
   type: 'webhook';
@@ -155,11 +159,9 @@ export interface HttpRequestActionConfig {
  */
 export interface TransformActionConfig {
   type: 'transform';
-  transformations?: Array<{
-    source_field: string;
-    target_field: string;
-    operation?: 'copy' | 'map' | 'template';
-  }>;
+  /** Backend transform op (see lib/flowTransformOps.ts) and its graph-IR `input` Values. */
+  op?: string;
+  input?: Record<string, unknown>;
 }
 
 /**
@@ -176,6 +178,42 @@ export interface LoopActionConfig {
   max_iterations?: number;
 }
 
+/** state.get / state.set / state.delete — graph-IR `Value`s (literal, $from ref or $template). */
+export interface StateGetActionConfig {
+  type: 'state-get';
+  key?: unknown;
+  default?: unknown;
+}
+
+export interface StateSetActionConfig {
+  type: 'state-set';
+  key?: unknown;
+  value?: unknown;
+  ttl_seconds?: unknown;
+}
+
+export interface StateDeleteActionConfig {
+  type: 'state-delete';
+  key?: unknown;
+}
+
+/** doc.create — doctype must be in the site allow-list; fields are graph-IR Values. */
+export interface DocCreateActionConfig {
+  type: 'doc-create';
+  doctype?: string;
+  fields?: Record<string, unknown>;
+}
+
+/**
+ * A backend node type this UI has no editor for. Kept verbatim (`backend_type` + its
+ * config) so it round-trips instead of being rewritten as a tool call.
+ */
+export interface UnknownActionConfig {
+  type: 'unknown';
+  backend_type: string;
+  [key: string]: unknown;
+}
+
 export type ActionConfig =
   | AgentRunActionConfig
   | ToolCallActionConfig
@@ -185,6 +223,11 @@ export type ActionConfig =
   | HttpRequestActionConfig
   | TransformActionConfig
   | LoopActionConfig
+  | StateGetActionConfig
+  | StateSetActionConfig
+  | StateDeleteActionConfig
+  | DocCreateActionConfig
+  | UnknownActionConfig
   | { type: undefined };
 
 export interface FlowEdgeData {

@@ -34,6 +34,9 @@ import {
   UserCheck,
   Wrench,
   Globe,
+  Save,
+  Trash2,
+  FilePlus,
   type LucideIcon
 } from 'lucide-react';
 import { triggerOptions } from '../../data/triggers';
@@ -75,7 +78,10 @@ const iconMap: Record<string, LucideIcon> = {
   UserCheck,
   Bot,
   Wrench,
-  Globe
+  Globe,
+  Save,
+  Trash2,
+  FilePlus
 };
 
 type MainTab = 'triggers' | 'actions';
@@ -224,7 +230,15 @@ export function NodeSelectionModal({
     } else if (actionId === 'http-request') {
       config = { type: 'http-request', url: '', method: 'GET', timeout: 30 };
     } else if (actionId === 'transform') {
-      config = { type: 'transform', transformations: [] };
+      config = { type: 'transform', op: 'lower', input: {} };
+    } else if (actionId === 'state-get') {
+      config = { type: 'state-get', key: '' };
+    } else if (actionId === 'state-set') {
+      config = { type: 'state-set', key: '', value: '' };
+    } else if (actionId === 'state-delete') {
+      config = { type: 'state-delete', key: '' };
+    } else if (actionId === 'doc-create') {
+      config = { type: 'doc-create', doctype: '', fields: {} };
     } else if (actionId === 'email') {
       config = { type: 'tool-call', tool_name: 'gmail_send_email', args: {}, output: { save_result_to_context: '' } };
     } else if (actionId === 'slack') {
@@ -616,7 +630,7 @@ export function NodeSelectionModal({
             {renderActionCategory('AI & Agents', agentActions)}
             {renderActionCategory('Tools', toolActions)}
             {renderActionCategory('Control Flow', controlActions)}
-            {renderActionCategory('Transform', transformActions)}
+            {renderActionCategory('Transform & State', transformActions)}
             {renderActionCategory('Utilities', utilityActions)}
             {renderActionCategory('Integrations', integrationActions)}
           </TabsContent>
