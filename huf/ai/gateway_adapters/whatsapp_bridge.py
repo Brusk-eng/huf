@@ -3472,6 +3472,79 @@ def media_limit_for_mime(mime: str) -> int:
 	return MEDIA_LIMITS_BY_KIND["document"]
 
 
+# Generic MIME types WhatsApp sends for files it cannot label (commonly .m4a documents).
+_GENERIC_MIMES = ("", "application/octet-stream")
+# Filename extension -> MIME, for inferring a generic declared type. Every value must already
+# pass DEFAULT_MIME_PREFIXES; anything absent here (svg, html, exe, sh, js, csv, ...) is refused.
+_EXTENSION_MIME = {
+	"m4a": "audio/mp4",
+	"mp3": "audio/mpeg",
+	"ogg": "audio/ogg",
+	"oga": "audio/ogg",
+	"opus": "audio/ogg",
+	"wav": "audio/wav",
+	"aac": "audio/aac",
+	"amr": "audio/amr",
+	"mp4": "video/mp4",
+	"3gp": "video/3gpp",
+	"pdf": "application/pdf",
+	"jpg": "image/jpeg",
+	"jpeg": "image/jpeg",
+	"png": "image/png",
+	"webp": "image/webp",
+	"txt": "text/plain",
+	"doc": "application/msword",
+	"docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"xls": "application/vnd.ms-excel",
+	"xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	"ppt": "application/vnd.ms-powerpoint",
+	"pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+_OLE_DOC_MIMES = ("application/msword", "application/vnd.ms-excel", "application/vnd.ms-powerpoint")
+
+
+def _mime_from_filename(name: str) -> str:
+	"""MIME type for a filename's extension, or "" when the extension is unknown or refused."""
+	base = str(name or "").replace("\\", "/").rsplit("/", 1)[-1]
+	if "." not in base:
+		return ""
+	return _EXTENSION_MIME.get(base.rsplit(".", 1)[-1].strip().lower(), "")
+
+
+def _signature_matches(mime: str, content: bytes) -> bool:
+	"""Check the payload's magic bytes against the inferred MIME. Unknown MIMEs never match."""
+	head = content[:16]
+	if mime in ("audio/mp4", "video/mp4", "video/3gpp"):
+		return head[4:8] == b"ftyp"
+	if mime in ("audio/mpeg", "audio/aac"):
+		if head.startswith(b"ID3"):
+			return True
+		if len(head) < 2 or head[0] != 0xFF:
+			return False
+		return (head[1] & 0xE0) == 0xE0 if mime == "audio/mpeg" else (head[1] & 0xF6) == 0xF0
+	if mime == "audio/ogg":
+		return head.startswith(b"OggS")
+	if mime == "audio/wav":
+		return head[:4] == b"RIFF" and head[8:12] == b"WAVE"
+	if mime == "audio/amr":
+		return head.startswith(b"#!AMR")
+	if mime == "image/jpeg":
+		return head.startswith(b"\xff\xd8\xff")
+	if mime == "image/png":
+		return head.startswith(b"\x89PNG\r\n\x1a\n")
+	if mime == "image/webp":
+		return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+	if mime == "application/pdf":
+		return head.startswith(b"%PDF")
+	if mime.startswith("application/vnd.openxmlformats-officedocument."):
+		return head.startswith(b"PK\x03\x04")
+	if mime in _OLE_DOC_MIMES:
+		return head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+	if mime == "text/plain":
+		return b"\x00" not in content
+	return False
+
+
 def download_media(
 	account_name: str,
 	media_id: str,
@@ -3480,12 +3553,18 @@ def download_media(
 	http_get: Callable[..., Any] | None = None,
 	credentials: dict[str, Any] | None = None,
 	kind: str | None = None,
+	filename: str | None = None,
 ) -> dict[str, Any]:
 	"""Fetch media by id at call time. Raises ValueError on caps/mime/failure.
 
 	The size cap is ``max_bytes`` when given, else Meta's per-kind limit (``kind``
 	when known, e.g. sticker, otherwise derived from the MIME type); declared and
 	streamed sizes are both enforced.
+
+	A generic declared type (empty or ``application/octet-stream``) is replaced by the
+	MIME inferred from ``filename`` (or Meta's filename). The inferred type must be in
+	the allow-list, and the payload's magic bytes must match it. Specific declared
+	types are never overridden by the extension.
 
 	``credentials`` (``token``, optional ``url``/``version``) serves direct-mode
 	gateways that have no WhatsApp Account; otherwise the account is resolved.
@@ -3510,13 +3589,16 @@ def download_media(
 	)
 	meta_resp.raise_for_status()
 	meta = meta_resp.json()
-	mime = str(meta.get("mime_type") or "").split(";")[0].strip().lower()
+	declared = str(meta.get("mime_type") or "").split(";")[0].strip().lower()
+	name_hint = str(filename or meta.get("filename") or "")
+	infer = declared in _GENERIC_MIMES
+	mime = _mime_from_filename(name_hint) if infer else declared
 	if (
 		not mime
 		or mime.startswith(_BLOCKED_MIME_PREFIXES)
 		or not any(mime.startswith(p) for p in allowed_mime_prefixes)
 	):
-		raise ValueError(f"mime_not_allowed: {mime or 'unknown'}")
+		raise ValueError(f"mime_not_allowed: {declared or 'unknown'}")
 	if max_bytes is None:
 		max_bytes = MEDIA_LIMITS_BY_KIND.get(str(kind or "").lower()) or media_limit_for_mime(mime)
 	declared = meta.get("file_size")
@@ -3545,7 +3627,9 @@ def download_media(
 		close = getattr(resp, "close", None)
 		if callable(close):
 			close()
-	filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(meta.get("filename") or media_id))[:100] or "media"
+	if infer and not _signature_matches(mime, content):
+		raise ValueError(f"mime_not_allowed: {declared or 'unknown'}")
+	filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(filename or meta.get("filename") or media_id))[:100] or "media"
 	return {"content": content, "mime_type": mime, "filename": filename}
 
 
