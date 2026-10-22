@@ -116,7 +116,8 @@ Handled at ingest by `_handle_consent_event` (`huf/ai/gateway_service.py`). What
 
 Gateway field **Voice note replies** (`voice_reply_mode`): `Off` (default), `Voice only` or `Text and voice`. It applies only when the customer's message was a voice note (audio with `voice: true`); anything else is answered with text as usual.
 
-- Needs `ffmpeg` on the server (converts the speech to Ogg/Opus mono). Install it on every worker host (`apt install ffmpeg`).
+- Needs `ffmpeg` on the server (converts the speech to Ogg/Opus mono). Install it on every worker host (`apt install ffmpeg`); it must include the `libopus` encoder (`ffmpeg -encoders | grep libopus`).
+- To check: the gateway health shows the warning `voice_reply_ffmpeg_missing` ("ffmpeg is missing, so replies go out as text") when voice replies are on and this host lacks ffmpeg or libopus. Saving the gateway shows the same warning. The check runs on the site host, so also verify on each worker host.
 - The speech comes from the agent's own TTS model and voice (Agent `tts_model` / `tts_voice`) using that model's provider key.
 - Replies longer than 1500 characters (markdown removed) are sent as text only.
 - The usual gates apply: STOP opt-out, the 24-hour window (closed window: the text fallback path, including the fallback template), BSUID refusal.

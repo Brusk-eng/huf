@@ -16,6 +16,7 @@ import mimetypes
 import re
 import shutil
 import subprocess
+import time
 from typing import Any
 from urllib.parse import unquote
 
@@ -27,6 +28,9 @@ from huf.ai.gateway_adapters import whatsapp_messages as wm
 _URL_PREFIXES = ("/private/files/", "/files/")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,139}$")
 _FFMPEG_TIMEOUT = 60
+_STATUS_TIMEOUT = 5
+_STATUS_TTL = 300
+_status_cache: dict[str, Any] = {"at": 0.0, "value": None}
 OGG_OPUS_MIME = "audio/ogg; codecs=opus"
 _RUN_PARENTS = ("Agent Conversation", "Agent Message", "Gateway Event")
 
@@ -131,6 +135,39 @@ def load_content(resolved: dict[str, Any]) -> bytes:
 # ------------------------------------------------------------------ audio
 def is_ogg_opus(content: bytes) -> bool:
 	return content[:4] == b"OggS" and b"OpusHead" in content[:256]
+
+
+def _ffmpeg_cache_clear() -> None:
+	_status_cache.update({"at": 0.0, "value": None})
+
+
+def ffmpeg_status() -> dict[str, Any]:
+	"""{available, has_libopus, version} for this host's ffmpeg, cached for a few minutes."""
+	now = time.monotonic()
+	cached = _status_cache["value"]
+	if cached is not None and now - _status_cache["at"] < _STATUS_TTL:
+		return dict(cached)
+	status: dict[str, Any] = {"available": False, "has_libopus": False, "version": ""}
+	ffmpeg = shutil.which("ffmpeg")
+	if ffmpeg:
+		def _out(args: list[str]) -> str | None:
+			try:
+				proc = subprocess.run(
+					[ffmpeg, *args], capture_output=True, timeout=_STATUS_TIMEOUT, shell=False, check=False
+				)
+			except (subprocess.SubprocessError, OSError):
+				return None
+			return proc.stdout.decode("utf-8", "replace") if proc.returncode == 0 else None
+
+		version_out = _out(["-version"])
+		if version_out is not None:
+			match = re.search(r"version\s+(\S+)", version_out)
+			status["available"] = True
+			status["version"] = match.group(1) if match else ""
+			encoders = _out(["-hide_banner", "-encoders"]) or ""
+			status["has_libopus"] = bool(re.search(r"\blibopus\b", encoders))
+	_status_cache.update({"at": now, "value": status})
+	return dict(status)
 
 
 def to_ogg_opus(content: bytes) -> bytes:

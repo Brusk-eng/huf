@@ -37,6 +37,7 @@ export const REASON_FALLBACK: Record<string, string> = {
 	delivery_failures: 'Some replies are failing to send.',
 	recent_error: 'The last message ran into an error.',
 	fallback_template_unavailable: 'Replies after 24 hours will fail until the fallback template is approved.',
+	voice_reply_ffmpeg_missing: 'Voice replies are on but ffmpeg is missing, so replies go out as text.',
 	no_events_yet:
 		"Meta hasn't sent us anything yet. Check the callback URL and that the messages field is subscribed.",
 };
