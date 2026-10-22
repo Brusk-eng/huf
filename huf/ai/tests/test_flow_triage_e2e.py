@@ -96,7 +96,7 @@ def triage_graph():
 			"input_schema": {"type": "object"},
 			"output_schema": {"type": "object"},
 			"applies_when": [],
-			"permission_envelope": {"read": [], "write": [], "http": "none", "code": "none"},
+			"permission_envelope": {"read": [], "write": [{"doctype": "ToDo"}], "http": "none", "code": "none"},
 			"limits": LIMITS,
 		},
 	}

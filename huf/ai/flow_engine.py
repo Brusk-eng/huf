@@ -45,6 +45,7 @@ from frappe.desk.doctype.notification_log.notification_log import enqueue_create
 from frappe.desk.doctype.notification_settings.notification_settings import is_email_notifications_enabled
 
 from huf.ai import flow_create_doc, flow_state
+from huf.ai.graph.permissions import envelope_declares
 from huf.ai.flow_eval import safe_eval_expression
 from huf.ai.flow_orchestrator import (
 	build_flow_context_system_message,
@@ -1770,6 +1771,14 @@ def _exec_doc_create(flow_run, node: dict, config: dict, settings: dict) -> dict
 	run_ctx = _run_context(settings)
 	limits = ((run_ctx.definition.get("contract") or {}).get("limits") or {}) if run_ctx is not None else {}
 	max_writes = limits.get("max_writes") or 0
+	envelope = ((run_ctx.definition.get("contract") or {}).get("permission_envelope") or {}) if run_ctx is not None else {}
+	doctype = config["doctype"]
+	try:  # the site allow-list first: its message is the clearer one for an unsupported doctype
+		flow_create_doc.check_doctype(doctype, flow_create_doc.allowed_doctypes(frappe.conf))
+	except flow_create_doc.CreateDocError as exc:
+		return {"status": "failed", "error": f"doc.create: {exc}"}
+	if not isinstance(doctype, str) or not envelope_declares(envelope, ptype="create", doctype=doctype):
+		return {"status": "failed", "error": f"doc.create: contract permission_envelope.write does not grant {doctype!r}"}
 	done = ctx.data.get(_WRITES_KEY) or 0
 	if done >= max_writes:
 		return {"status": "failed", "error": f"doc.create exceeds contract limits.max_writes ({max_writes})"}

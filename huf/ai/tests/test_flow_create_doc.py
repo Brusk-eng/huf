@@ -69,8 +69,12 @@ class _Run:
 	name = "FR-1"
 
 
-def _settings(data=None, max_writes=5):
-	graph = {"schema_version": "1.0.0", "profile": "flow", "entry": "n", "nodes": [], "contract": {"limits": {"max_writes": max_writes}}}
+def _settings(data=None, max_writes=5, write=({"doctype": "ToDo"},)):
+	envelope = {"read": [], "write": list(write), "http": "none", "code": "none"}
+	graph = {
+		"schema_version": "1.0.0", "profile": "flow", "entry": "n", "nodes": [],
+		"contract": {"limits": {"max_writes": max_writes}, "permission_envelope": envelope},
+	}
 	return flow_engine.FlowRunContext(context=GraphContext(data or {}), version=PinnedVersion.pin(graph))
 
 
@@ -133,6 +137,35 @@ class TestDocCreateNode(IntegrationTestCase):
 
 	def test_zero_max_writes_blocks(self):
 		self.assertEqual(_run({"doctype": "ToDo", "fields": {"description": self.marker}}, max_writes=0)["status"], "failed")
+
+	def test_envelope_write_grant_allows(self):
+		settings = _settings(write=[{"doctype": "ToDo"}])
+		self.assertEqual(_run({"doctype": "ToDo", "fields": {"description": self.marker}}, settings=settings)["status"], "success")
+
+	def test_envelope_without_write_denies_before_insert(self):
+		before = frappe.db.count("ToDo")
+		for write in ([], [{"doctype": "Note"}]):
+			r = _run({"doctype": "ToDo", "fields": {"description": self.marker}}, settings=_settings(write=write))
+			self.assertEqual(r["status"], "failed")
+			self.assertIn("permission_envelope", r["error"])
+		self.assertEqual(frappe.db.count("ToDo"), before)
+
+	def test_missing_envelope_denies(self):
+		settings = _settings()
+		del settings.version.graph["contract"]["permission_envelope"]
+		r = _run({"doctype": "ToDo", "fields": {"description": self.marker}}, settings=settings)
+		self.assertEqual(r["status"], "failed")
+		self.assertIn("permission_envelope", r["error"])
+
+	def test_allowlist_still_denies_when_envelope_grants(self):
+		r = _run({"doctype": "User", "fields": {"email": "a@b.c"}}, settings=_settings(write=[{"doctype": "User"}]))
+		self.assertEqual(r["status"], "failed")
+		self.assertIn("allow", r["error"])
+
+	def test_envelope_denied_does_not_consume_write_budget(self):
+		settings = _settings(max_writes=1, write=[])
+		_run({"doctype": "ToDo", "fields": {"description": self.marker}}, settings=settings)
+		self.assertFalse(settings.context.data.get(flow_engine._WRITES_KEY))
 
 	def test_runs_with_session_user_permissions_no_ignore(self):
 		# Flow Definition is allow-listed on purpose; a Huf User cannot create one, so the node must fail.
