@@ -1302,6 +1302,18 @@ def _exec_http_request(flow_run, node: dict, config: dict, settings: dict) -> di
 		return {"status": "failed", "error": str(e)}
 
 
+def _expression_context(ctx: GraphContext) -> dict:
+	"""The ``context`` seen by condition expressions and expression edges.
+
+	The flat run context, plus ``context["outputs"]`` -- earlier nodes' outputs by node id
+	(e.g. ``context["outputs"]["has_order"]``). A flat key literally named ``outputs`` wins. The
+	extra key is added to a copy only; it is never written back to the run context.
+	"""
+	merged = dict(ctx.as_dict())
+	merged.setdefault("outputs", dict(ctx.node_outputs))
+	return merged
+
+
 def _exec_condition(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""
 	Execute condition node - evaluates a boolean expression and routes to
@@ -1328,7 +1340,7 @@ def _exec_condition(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	ctx = _context_of(flow_run, settings)
 
 	try:
-		result = safe_eval_expression(expression, ctx.as_dict())
+		result = safe_eval_expression(expression, _expression_context(ctx))
 		chosen_node = true_node if result else false_node
 
 		if not chosen_node:
@@ -1877,7 +1889,7 @@ def _evaluate_edges(
 
 	outgoing.sort(key=lambda e: e.get("priority", 0), reverse=True)
 
-	ctx = context.as_dict() if context is not None else _load_context(flow_run)
+	ctx = _expression_context(context) if context is not None else _load_context(flow_run)
 	node_status = node_result.get("status", "success") if isinstance(node_result, dict) else "success"
 
 	for edge in outgoing:
