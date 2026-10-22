@@ -35,6 +35,55 @@ def _get_default_image_model(provider_name: str) -> str:
     return defaults.get(provider_name.lower())
 
 
+def _resolve_image_config(agent_doc) -> dict:
+    """Resolve image model, API key and LiteLLM name for image generation.
+
+    An explicit ``image_generation_model`` (AI Model link) uses that model's own
+    provider for the API key and name normalisation. Otherwise falls back to the
+    agent's provider default.
+
+    Raises:
+        ValueError: no model determinable, or the chosen provider has no API key.
+    """
+    from huf.ai.providers.litellm import _normalize_model_name
+
+    model_link = getattr(agent_doc, "image_generation_model", None)
+    if model_link:
+        model_doc = frappe.get_doc("AI Model", model_link)
+        if not model_doc.provider:
+            raise ValueError(
+                f"Image model '{model_link}' has no provider linked. "
+                "Please set a provider on the AI Model document."
+            )
+        provider_link = model_doc.provider
+        image_model = model_doc.model_name
+    else:
+        provider_link = agent_doc.provider
+        image_model = None
+
+    provider_doc = frappe.get_doc("AI Provider", provider_link)
+    if not image_model:
+        image_model = _get_default_image_model(provider_doc.provider_name.lower())
+        if not image_model:
+            raise ValueError(
+                f"Image generation not supported for provider '{provider_doc.provider_name}'. "
+                "Please configure an image_generation_model in agent settings."
+            )
+
+    api_key = provider_doc.get_password("api_key")
+    if not api_key:
+        raise ValueError(
+            f"API key is not configured for image provider '{provider_doc.provider_name}'. "
+            "Please add the API key to that AI Provider document."
+        )
+
+    return {
+        "model": _normalize_model_name(image_model, provider_link),
+        "api_key": api_key,
+        "provider_name": provider_doc.provider_name.lower(),
+    }
+
+
 @frappe.whitelist()
 async def handle_generate_image(
     prompt: str,
@@ -82,33 +131,12 @@ async def handle_generate_image(
             return {"success": False, "error": "Agent name not found in context"}
 
         agent_doc = frappe.get_doc("Agent", agent_name)
-        provider_doc = frappe.get_doc("AI Provider", agent_doc.provider)
-        api_key = provider_doc.get_password("api_key")
-
-        if not api_key:
-            return {"success": False, "error": "API key not configured for provider"}
-
-        # Determine image generation model
-        image_model = None
-
-        if hasattr(agent_doc, "image_generation_model") and agent_doc.image_generation_model:
-            # Use explicitly configured image model
-            model_doc = frappe.get_doc("AI Model", agent_doc.image_generation_model)
-            image_model = model_doc.model_name
-        else:
-            # Auto-detect suitable image model based on provider
-            provider_name = provider_doc.provider_name.lower()
-            image_model = _get_default_image_model(provider_name)
-
-        if not image_model:
-            return {
-                "success": False,
-                "error": f"Image generation not supported for provider '{provider_doc.provider_name}'. Please configure an image_generation_model in agent settings."
-            }
-
-        # Normalize to LiteLLM format
-        from huf.ai.providers.litellm import _normalize_model_name
-        normalized_model = _normalize_model_name(image_model, agent_doc.provider)
+        try:
+            image_cfg = _resolve_image_config(agent_doc)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        normalized_model = image_cfg["model"]
+        api_key = image_cfg["api_key"]
 
         # Call LiteLLM image generation
         import litellm
