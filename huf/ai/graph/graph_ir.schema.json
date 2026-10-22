@@ -976,6 +976,9 @@
         },
         {
           "$ref": "#/$defs/StateDeleteNode"
+        },
+        {
+          "$ref": "#/$defs/DocCreateNode"
         }
       ]
     },
@@ -1214,6 +1217,41 @@
               "properties": {
                 "key": {
                   "$ref": "#/$defs/Value"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "DocCreateNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/NodeCommon"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "doc.create"
+            },
+            "config": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "doctype",
+                "fields"
+              ],
+              "properties": {
+                "doctype": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Literal doctype; must be in the site allow-list (site config huf_flow_create_doc_doctypes, default [\"ToDo\"])."
+                },
+                "fields": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "$ref": "#/$defs/Value"
+                  }
                 }
               }
             }

@@ -44,7 +44,7 @@ from frappe.utils import now_datetime
 from frappe.desk.doctype.notification_log.notification_log import enqueue_create_notification
 from frappe.desk.doctype.notification_settings.notification_settings import is_email_notifications_enabled
 
-from huf.ai import flow_state
+from huf.ai import flow_create_doc, flow_state
 from huf.ai.flow_eval import safe_eval_expression
 from huf.ai.flow_orchestrator import (
 	build_flow_context_system_message,
@@ -1703,6 +1703,42 @@ def _exec_state_delete(flow_run, node: dict, config: dict, settings: dict) -> di
 	return _state_node(flow_run, node, config, settings, {"key"}, op)
 
 
+# ---------------------------------------------------------------------------
+# doc.create -- insert an allow-listed document as the run's user
+# ---------------------------------------------------------------------------
+
+_WRITES_KEY = "_doc_create_count"
+
+
+def _exec_doc_create(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""
+	``doc.create``: config ``doctype`` (literal) and ``fields`` (object of values / references).
+	Output ``{"doctype", "name"}`` so later nodes can use ``{"$from": "<node>.name"}``.
+
+	Policy lives in :mod:`huf.ai.flow_create_doc` (allow-list, field validation, no
+	``ignore_permissions``). Each created document also counts against the graph contract's
+	``limits.max_writes`` for the run (absent or 0 means no writes are allowed).
+	"""
+	unknown = sorted(set(config) - {"doctype", "fields"})
+	if unknown or "doctype" not in config or "fields" not in config:
+		return {"status": "failed", "error": "doc.create requires exactly doctype and fields (got unsupported keys: %s)" % unknown}
+	ctx = _context_of(flow_run, settings)
+	run_ctx = _run_context(settings)
+	limits = ((run_ctx.definition.get("contract") or {}).get("limits") or {}) if run_ctx is not None else {}
+	max_writes = limits.get("max_writes") or 0
+	done = ctx.data.get(_WRITES_KEY) or 0
+	if done >= max_writes:
+		return {"status": "failed", "error": f"doc.create exceeds contract limits.max_writes ({max_writes})"}
+	try:
+		result = flow_create_doc.create_document(config["doctype"], ctx.resolve(config["fields"]))
+	except flow_create_doc.CreateDocError as exc:
+		return {"status": "failed", "error": f"doc.create: {exc}"}
+	except frappe.PermissionError as exc:
+		return {"status": "failed", "error": f"doc.create: permission denied ({exc})"}
+	ctx.set(_WRITES_KEY, done + 1)
+	return {"status": "success", "result": result, "output": result}
+
+
 _NODE_EXECUTORS = {
 	"trigger.webhook": _exec_trigger_webhook,
 	"trigger.schedule": _exec_trigger_schedule,
@@ -1725,6 +1761,7 @@ _NODE_EXECUTORS = {
 	"state.get": _exec_state_get,
 	"state.set": _exec_state_set,
 	"state.delete": _exec_state_delete,
+	"doc.create": _exec_doc_create,
 }
 
 _NODE_TYPES = tuple(_NODE_EXECUTORS)

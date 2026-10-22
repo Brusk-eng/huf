@@ -76,7 +76,7 @@ def _settings(data=None, max_writes=5):
 
 def _run(config, data=None, max_writes=5, settings=None):
 	node = {"id": "n", "type": "doc.create", "config": config}
-	return flow_engine._exec_doc_create(_Run(), node, config, settings or _settings(data, max_writes))
+	return flow_engine._exec_doc_create(_Run(), node, config, settings if settings is not None else _settings(data, max_writes))
 
 
 class TestDocCreateNode(IntegrationTestCase):
