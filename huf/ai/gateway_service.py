@@ -2453,35 +2453,7 @@ def _process_gateway_event(event_name: str) -> dict:
             }
 
         if event.target_type == "Flow":
-<<<<<<< HEAD
-            from huf.ai.flow_engine import create_flow_run
-
-            # TODO(#473-followup): Gateway trigger_type is temporarily removed from
-            # Flow Run options because the feature is incomplete. Re-enable once
-            # docs/gateway-todo.md checklist is done and adapters are live.
-            flow_run = create_flow_run(
-                flow_id=event.target_flow,
-                payload={
-                    "gateway_event": event.name,
-                    "message": event.message_text,
-                    "gateway": event.gateway,
-                    "sender_id": event.sender_id,
-                    "conversation_id": event.conversation_id,
-                },
-                trigger_type="Gateway",
-            )
-            event.db_set({"flow_run": flow_run.name, "status": "Queued"})
-            frappe.enqueue(
-                "huf.ai.flow_engine.run_flow",
-                queue="default",
-                timeout=300,
-                flow_run_name=flow_run.name,
-                enqueue_after_commit=True,
-            )
-            return {"event_name": event.name, "status": "Queued", "flow_run_id": flow_run.name}
-=======
             return _start_flow_for_event(event, gateway)
->>>>>>> origin/pre-develop
 
         raise frappe.ValidationError(_("Gateway event has no valid target."))
     except ConversationBusy as busy:

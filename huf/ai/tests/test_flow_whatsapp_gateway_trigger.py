@@ -125,22 +125,8 @@ class TestFlowWhatsAppGatewayTrigger(fs.TestWhatsAppMultiGateway):
 		self.assertEqual(flow_run.flow_id, flow_id)
 		self.assertEqual(flow_run.trigger_type, "Gateway")
 		payload = json.loads(flow_run.trigger_payload)
-<<<<<<< HEAD
-		self.assertEqual(
-			payload,
-			{
-				"gateway_event": event.name,
-				"message": "start the flow",
-				"gateway": self.gateway_a.name,
-				"sender_id": event.sender_id,
-				"conversation_id": event.conversation_id,
-			},
-		)
-		self.assertTrue(payload["sender_id"])
-=======
 		self.assertEqual(payload["gateway_event"], event.name)
 		self.assertEqual(payload["message"], "start the flow")
->>>>>>> origin/pre-develop
 		self.assertEqual(self.agent_calls, [], "a Flow-routed event must not run an agent")
 
 	def test_flow_route_works_with_the_default_gateway_role(self):
