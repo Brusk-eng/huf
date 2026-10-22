@@ -223,6 +223,20 @@ def evaluate(facts: dict[str, Any], now: datetime | None = None) -> dict[str, An
 			)
 		)
 
+	ffmpeg = facts.get("ffmpeg_status") or {}
+	if (
+		facts.get("voice_reply_mode") in ("Voice only", "Text and voice")
+		and ffmpeg
+		and not (ffmpeg.get("available") and ffmpeg.get("has_libopus"))
+	):
+		reasons.append(
+			_reason(
+				"voice_reply_ffmpeg_missing",
+				"warning",
+				"Voice replies are on, but ffmpeg with Opus support is missing on this server, so replies are sent as text.",
+			)
+		)
+
 	if conn_state == "Disconnected":
 		reasons.append(_reason("gateway_disconnected", "error", conn_reason or "This WhatsApp account is disconnected. Sends are refused until it is reconnected."))
 	elif conn_state == "Degraded":
@@ -506,6 +520,17 @@ def build_health(
 		"fallback_template_approved": tpl["approved"],
 		"fallback_template_status": tpl["status"],
 	}
+	mode = gateway.get("voice_reply_mode")
+	if mode is None:
+		try:
+			mode = frappe.db.get_value("Gateway", name, "voice_reply_mode")
+		except Exception:
+			mode = None
+	facts["voice_reply_mode"] = mode or "Off"
+	if facts["voice_reply_mode"] != "Off":
+		from huf.ai.whatsapp_send_file import ffmpeg_status
+
+		facts["ffmpeg_status"] = ffmpeg_status()
 	result = evaluate(facts, now)
 	result.update(
 		{
