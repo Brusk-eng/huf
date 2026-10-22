@@ -819,6 +819,11 @@ def _exec_trigger_webhook(flow_run, node: dict, config: dict, settings: dict) ->
 	return {"status": "success", "output": ctx.as_dict()}
 
 
+def _exec_trigger_unset(flow_run, node: dict, config: dict, settings: dict) -> dict:
+	"""trigger.unset is a placeholder with no trigger configured; it is not runnable."""
+	return {"status": "failed", "error": "trigger.unset is not runnable: configure a trigger for this flow"}
+
+
 def _exec_trigger_schedule(flow_run, node: dict, config: dict, settings: dict) -> dict:
 	"""
 	Execute trigger.schedule node - passthrough for scheduled execution.
@@ -1701,6 +1706,7 @@ def _exec_state_delete(flow_run, node: dict, config: dict, settings: dict) -> di
 _NODE_EXECUTORS = {
 	"trigger.webhook": _exec_trigger_webhook,
 	"trigger.schedule": _exec_trigger_schedule,
+	"trigger.unset": _exec_trigger_unset,
 	"trigger.doc-event": _exec_trigger_doc_event,
 	"agent.run": _exec_agent_run,
 	"tool.call": _exec_tool_call,
