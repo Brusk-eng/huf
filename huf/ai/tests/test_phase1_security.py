@@ -245,7 +245,11 @@ class TestWebhookEndpointSecurity(IntegrationTestCase):
         )
 
         mock_request = frappe._dict(args={"doc": "BOT-001"}, headers={}, get_data=lambda **kw: b"{}")
-        frappe.request = mock_request
+        # patch.object restores the original frappe.request proxy; assigning None would leave every later
+        # test (and the webhook tests) without a request binding.
+        _request_patch = patch.object(frappe, "request", mock_request)
+        _request_patch.start()
+        self.addCleanup(_request_patch.stop)
         # @rate_limit needs a client identity; outside a real HTTP request there is none.
         had_ip = hasattr(frappe.local, "request_ip")
         original_ip = getattr(frappe.local, "request_ip", None)
@@ -258,7 +262,7 @@ class TestWebhookEndpointSecurity(IntegrationTestCase):
             self.assertFalse(result.get("success"))
             self.assertIn("secret", result.get("error", "").lower())
         finally:
-            frappe.request = None
+            pass
             if had_ip:
                 frappe.local.request_ip = original_ip
             else:
@@ -278,14 +282,18 @@ class TestWebhookEndpointSecurity(IntegrationTestCase):
             get_data=lambda **kw: b'{"type":"post_call_transcription"}',
             headers={"elevenlabs-signature": "invalid"},
         )
-        frappe.request = mock_request
+        # patch.object restores the original frappe.request proxy; assigning None would leave every later
+        # test (and the webhook tests) without a request binding.
+        _request_patch = patch.object(frappe, "request", mock_request)
+        _request_patch.start()
+        self.addCleanup(_request_patch.stop)
         try:
             with patch("frappe.get_single", return_value=settings):
                 result = handle_elevenlabs_webhook()
 
             self.assertEqual(result.get("status"), "forbidden")
         finally:
-            frappe.request = None
+            pass
 
     def test_flow_webhook_rejects_invalid_key(self):
         from huf.ai.flow_api import flow_webhook
@@ -296,14 +304,18 @@ class TestWebhookEndpointSecurity(IntegrationTestCase):
         )
 
         mock_request = frappe._dict(args={"webhook_key": "wrong-key"}, get_data=lambda **kw: b"{}")
-        frappe.request = mock_request
+        # patch.object restores the original frappe.request proxy; assigning None would leave every later
+        # test (and the webhook tests) without a request binding.
+        _request_patch = patch.object(frappe, "request", mock_request)
+        _request_patch.start()
+        self.addCleanup(_request_patch.stop)
         try:
             with patch("frappe.db.exists", return_value=True):
                 with patch("frappe.get_doc", return_value=defn_doc):
                     with self.assertRaises(frappe.AuthenticationError):
                         flow_webhook("flow-1", webhook_key="wrong-key")
         finally:
-            frappe.request = None
+            pass
 
     @unittest.skip("quarantined pending RegressionCI triage - see Tracks/RegressionCI/CONTEXT.md Quarantine backlog")
     def test_clean_flow_webhook_accepts_frappe_cloud_secret_header(self):
@@ -321,7 +333,11 @@ class TestWebhookEndpointSecurity(IntegrationTestCase):
             headers={"X-Webhook-Secret": "correct-key"},
             get_data=lambda **kw: b'{"event":"Site Status Update","site":"demo.frappe.cloud"}',
         )
-        frappe.request = mock_request
+        # patch.object restores the original frappe.request proxy; assigning None would leave every later
+        # test (and the webhook tests) without a request binding.
+        _request_patch = patch.object(frappe, "request", mock_request)
+        _request_patch.start()
+        self.addCleanup(_request_patch.stop)
         try:
             with patch("frappe.get_all", return_value=[{"name": "flow-1", "definition_json": definition_json}]):
                 with patch("frappe.db.exists", return_value=True):
@@ -338,7 +354,7 @@ class TestWebhookEndpointSecurity(IntegrationTestCase):
             self.assertEqual(mock_create_run.call_args.kwargs["payload"]["event"], "Site Status Update")
             mock_enqueue.assert_called_once()
         finally:
-            frappe.request = None
+            pass
 
     def test_clean_flow_webhook_rejects_ambiguous_key_without_flow_id(self):
         from huf.ai.flow_api import flow_webhook_clean
@@ -353,7 +369,11 @@ class TestWebhookEndpointSecurity(IntegrationTestCase):
             headers={"X-Webhook-Secret": "shared-key"},
             get_data=lambda **kw: b"{}",
         )
-        frappe.request = mock_request
+        # patch.object restores the original frappe.request proxy; assigning None would leave every later
+        # test (and the webhook tests) without a request binding.
+        _request_patch = patch.object(frappe, "request", mock_request)
+        _request_patch.start()
+        self.addCleanup(_request_patch.stop)
         try:
             with patch(
                 "frappe.get_all",
@@ -365,4 +385,4 @@ class TestWebhookEndpointSecurity(IntegrationTestCase):
                 with self.assertRaises(Exception):
                     flow_webhook_clean()
         finally:
-            frappe.request = None
+            pass
