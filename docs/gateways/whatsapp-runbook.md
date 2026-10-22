@@ -112,7 +112,19 @@ Handled at ingest by `_handle_consent_event` (`huf/ai/gateway_service.py`). What
   PAUSED or DISABLED. Check it in WhatsApp Manager.
 - Parameters: `fallback_template_params` if set, else each body variable gets the contact name or "there".
 
-## 8. Triage order
+## 8. Voice note replies
+
+Gateway field **Voice note replies** (`voice_reply_mode`): `Off` (default), `Voice only` or `Text and voice`. It applies only when the customer's message was a voice note (audio with `voice: true`); anything else is answered with text as usual.
+
+- Needs `ffmpeg` on the server (converts the speech to Ogg/Opus mono). Install it on every worker host (`apt install ffmpeg`).
+- The speech comes from the agent's own TTS model and voice (Agent `tts_model` / `tts_voice`) using that model's provider key.
+- Replies longer than 1500 characters (markdown removed) are sent as text only.
+- The usual gates apply: STOP opt-out, the 24-hour window (closed window: the text fallback path, including the fallback template), BSUID refusal.
+- `Voice only`: one voice note replaces the text. `Text and voice`: the text goes first, then the voice note (skipped if the text is still being retried).
+- Any failure (ffmpeg missing, no TTS model, provider error, send refused) is logged as a warning ("WhatsApp voice reply: ...") and the reply is sent as text. The reply is never lost.
+- A replayed or retried event never sends a second voice note.
+
+## 9. Triage order
 
 1. Read the gateway health reasons and next step.
 2. Run the token check with `force` if credentials are involved.
