@@ -59,7 +59,7 @@ def local_ip() -> str:
 
 def probe_nat() -> str:
 	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-	sock.bind(("0.0.0.0", 0))
+	sock.bind((local_ip(), 0))  # the interface that routes to the STUN servers, not every interface
 	lport = sock.getsockname()[1]
 	print(f"local {local_ip()}:{lport}")
 	maps = []
