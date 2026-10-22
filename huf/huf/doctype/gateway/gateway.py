@@ -318,6 +318,10 @@ class Gateway(Document):
         text = (self.get("error_reply_text") or "").strip()
         if len(text) > 1000:
             frappe.throw(_("Error reply text must be 1000 characters or fewer."))
+        if self.get("voice_reply_mode") not in (None, "", "Off", "Voice only", "Text and voice"):
+            frappe.throw(_("Voice note replies must be Off, Voice only or Text and voice."))
+        if self.get("voice_reply_mode") in ("Voice only", "Text and voice") and self.provider != "WhatsApp":
+            frappe.throw(_("Voice note replies are only available for WhatsApp gateways."))
         if self.get("preview_url") not in (None, "", "Default (off)", "On", "Off"):
             frappe.throw(_("Link previews must be Default (off), On or Off."))
 
